@@ -100,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 python build_zip.py
 ```
 
-然后在 Blender 中 `编辑 > 偏好设置 > 插件 > 安装…`，选择 `dist/bl_plugin_manager-1.0.1.zip`。
+然后在 Blender 中 `编辑 > 偏好设置 > 插件 > 安装…`，选择 `dist/bl_plugin_manager-<version>.zip`（例如 `dist/bl_plugin_manager-1.0.3.zip`）。
 
 ### 启用
 
