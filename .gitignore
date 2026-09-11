@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# Local Blender test and migration artifacts
+_mcp_test/
+_migrate/
+_test/
+
+# Generated release archives (the source tree is the canonical distribution)
+dist/*.zip
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
