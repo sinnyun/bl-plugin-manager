@@ -37,6 +37,12 @@ class CorruptDatabaseError(RuntimeError):
     """The metadata source is malformed and must not be overwritten."""
 
 
+_V2_RUNTIME_FIELDS = frozenset({
+    "module", "enabled", "missing", "load_state", "load_error", "last_error",
+    "restore_error", "residue", "compat", "compat_detail", "metadata_fingerprint",
+})
+
+
 def _file_signature(path: str):
     """Return replacement-sensitive metadata for a database file."""
     try:
@@ -98,10 +104,12 @@ class LibraryDB:
                 # 复制一份，避免调用方就地修改污染缓存
                 self.data = json.loads(json.dumps(hit, ensure_ascii=False))
                 self.loaded_signature = _file_signature(self.path)
+                self._hydrate_runtime()
                 self._fresh = True
                 return
         self._load_from_disk()
         self.loaded_signature = _file_signature(self.path)
+        self._hydrate_runtime()
         if self._use_cache:
             cache_store(self.path, self.data)
 
@@ -132,6 +140,7 @@ class LibraryDB:
     def save(self) -> None:
         if self.status == "CORRUPT":
             raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
+        runtime = self._split_runtime()
         self.data["updated"] = now_iso()
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), suffix=".tmp")
@@ -143,12 +152,47 @@ class LibraryDB:
             # 更新缓存，避免紧接着的读取又解析一遍
             if self._use_cache:
                 cache_store(self.path, self.data)
+            if runtime is not None:
+                self._save_runtime(runtime)
+                self.data["plugins"].update(runtime.get("_restore", {}))
         finally:
             if os.path.exists(tmp):
                 try:
                     os.remove(tmp)
                 except OSError:
                     pass
+
+    def _state_store(self):
+        from .storage.local_state import StateStore
+        env = os.environ.get("BL_PLUGIN_MANAGER_ENVIRONMENT")
+        if not env:
+            env = f"{os.name}-python-{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}"
+        return StateStore(str(self.data.get("library_id")), env)
+
+    def _hydrate_runtime(self) -> None:
+        if not self.data.get("library_id") or self.data.get("schema") != 2:
+            return
+        state = self._state_store().load()
+        for key, fields in state.get("plugins", {}).items():
+            if key in self.plugins and isinstance(fields, dict):
+                self.plugins[key].update(fields)
+
+    def _split_runtime(self):
+        if not self.data.get("library_id") or self.data.get("schema") != 2:
+            return None
+        runtime = {"plugins": {}, "_restore": {}}
+        for key, rec in self.plugins.items():
+            fields = {k: rec[k] for k in _V2_RUNTIME_FIELDS if k in rec}
+            if fields:
+                runtime["plugins"][key] = fields
+                runtime["_restore"][key] = fields
+                for field in fields:
+                    rec.pop(field, None)
+        return runtime
+
+    def _save_runtime(self, runtime) -> None:
+        payload = {"schema": 1, "plugins": runtime["plugins"]}
+        self._state_store().save(payload)
 
     # -- 记录访问 ----------------------------------------------------------
     @property
