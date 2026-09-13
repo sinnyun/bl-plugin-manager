@@ -211,6 +211,16 @@ class LibraryDB:
         self.plugins[key] = old
         return old
 
+    def merge_scan(self, entries: list[dict]) -> dict:
+        """Merge only portable scan fields for a schema 2 database."""
+        if self.data.get("schema") != 2 or not self.data.get("library_id"):
+            raise RuntimeError("portable scan merge requires schema 2 database")
+        from .services.sync_v2 import merge_scan
+        self.data["plugins"] = merge_scan(self.plugins, entries)
+        self.data["revision"] = int(self.data.get("revision", 0)) + 1
+        self.save()
+        return self.plugins
+
     def remove(self, key: str) -> None:
         self.plugins.pop(key, None)
 

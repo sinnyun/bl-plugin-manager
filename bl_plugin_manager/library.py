@@ -479,6 +479,29 @@ def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
     seen = set()
     stats = {"added": 0, "updated": 0, "unchanged": 0, "missing": 0}
 
+    if db.data.get("schema") == 2 and db.data.get("library_id"):
+        portable = []
+        for kind, base in ((C.KIND_ADDON, os.path.join(root, C.DIR_ADDONS)),
+                           (C.KIND_EXTENSION, os.path.join(root, C.DIR_EXTENSIONS))):
+            for entry in scan.scan_dir(base, kind_hint=kind):
+                if not entry["valid"]:
+                    continue
+                meta = entry["meta"] or {}
+                portable.append({
+                    "key": rel_key(root, entry["abs"]),
+                    "kind": kind,
+                    "rel": rel_key(root, entry["abs"]),
+                    "id": meta.get("id", ""),
+                    "name": meta.get("name") or entry.get("name", ""),
+                    "version": meta.get("version", ""),
+                })
+        old_keys = set(db.plugins)
+        new = db.merge_scan(portable)
+        stats["added"] = len(set(new) - old_keys)
+        stats["updated"] = len(set(new) & old_keys)
+        stats["missing"] = len(old_keys - set(new))
+        return stats
+
     # 一次性建立模块索引，供本函数内所有记录解析复用
     module_index = bridge._module_index()
 
