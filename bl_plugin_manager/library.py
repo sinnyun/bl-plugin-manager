@@ -12,6 +12,7 @@ from datetime import datetime
 
 from . import bridge, constants as C, scan
 from .db import LibraryDB, now_iso
+from .security.paths import UnsafeLibraryPathError, resolve_record_path
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +297,10 @@ def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = Fa
             if (rec.get("kind") == C.KIND_EXTENSION
                     and str(rec.get("id", "")).lower() == pkg_id.lower()
                     and not rec.get("missing")):
-                existing = os.path.join(root, rec["rel"].replace("/", os.sep))
+                try:
+                    existing = str(resolve_record_path(root, rec["rel"], rec.get("kind", "addon")))
+                except UnsafeLibraryPathError:
+                    continue
                 if os.path.isdir(existing):
                     return _refresh_existing(rec, plugin_dir, existing, root, db,
                                              meta, origin, origin_path, move, enable)
@@ -556,7 +560,10 @@ def remove_plugin(root: str, db: LibraryDB, key: str, to_trash: bool = True) -> 
     rec = db.get(key)
     if not rec:
         return None
-    plugin_dir = os.path.join(root, rec["rel"].replace("/", os.sep))
+    try:
+        plugin_dir = str(resolve_record_path(root, rec["rel"], rec.get("kind", "addon")))
+    except UnsafeLibraryPathError:
+        return None
     moved_to = None
     if os.path.isdir(plugin_dir):
         if to_trash:
@@ -642,7 +649,10 @@ def replace_from_zip(rec: dict, zip_path: str, root: str, db: LibraryDB,
     defer_refresh=True 时不在每次替换后立刻刷新 Blender（批量更新时用，
     由调用方在全部完成后统一刷新一次），可避免 N 次刷新造成的长时间卡顿。
     """
-    target = os.path.join(root, rec["rel"].replace("/", os.sep))
+    try:
+        target = str(resolve_record_path(root, rec["rel"], rec.get("kind", "addon")))
+    except UnsafeLibraryPathError as exc:
+        raise ValueError(f"不安全的插件路径: {rec.get('rel', '')}") from exc
     if not os.path.isdir(target):
         raise ValueError(f"库中找不到插件目录: {rec['rel']}")
 

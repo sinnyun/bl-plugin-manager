@@ -14,6 +14,7 @@ from bpy.types import Operator
 
 from . import bridge, constants as C, library, migrate, scan, store, updates, watcher
 from .db import LibraryDB, now_iso
+from .security.paths import UnsafeLibraryPathError, resolve_record_path
 
 
 # ---------------------------------------------------------------------------
@@ -1519,7 +1520,10 @@ class PM_OT_open_folder(Operator):
         rec = db.get(self.key or prefs.selected_key) if db else None
         if not rec:
             return _report(self, False, "未找到插件")
-        path = os.path.join(prefs.library_path, rec["rel"].replace("/", os.sep))
+        try:
+            path = str(resolve_record_path(prefs.library_path, rec["rel"], rec.get("kind", "addon")))
+        except UnsafeLibraryPathError:
+            return _report(self, False, "插件记录路径不安全，已阻止打开")
         if not os.path.isdir(path):
             return _report(self, False, "目录不存在")
         try:
