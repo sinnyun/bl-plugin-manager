@@ -37,18 +37,20 @@ class LegacyDbGuardTests(unittest.TestCase):
             self.assertEqual(signature[-1], 2)
 
     def test_save_refuses_to_overwrite_an_external_update(self):
-        mod = _module()
+        mod = __import__("tests.test_storage_v2", fromlist=["_storage_module"])._storage_module(
+            "bl_plugin_manager.storage.shared_db"
+        )
         with tempfile.TemporaryDirectory() as root:
-            first = mod.LibraryDB(root, use_cache=False)
-            first.upsert("addons/demo", {"name": "A"})
-            first.save()
-            stale = mod.LibraryDB(root, use_cache=False)
-            fresh = mod.LibraryDB(root, use_cache=False)
-            fresh.upsert("addons/demo", {"name": "B"})
-            fresh.save()
-            stale.upsert("addons/demo", {"name": "A2"})
+            first = mod.SharedDatabase(root)
+            first.initialize()
+            first.update_plugin("demo", {"name": "A"})
+            stale = mod.SharedDatabase(root)
+            stale.initialize()
+            fresh = mod.SharedDatabase(root)
+            fresh.initialize()
+            fresh.update_plugin("demo", {"name": "B"})
             with self.assertRaises(mod.DatabaseConflictError):
-                stale.save()
+                stale.update_plugin("demo", {"name": "A2"})
 
 
 if __name__ == "__main__":

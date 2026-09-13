@@ -36,12 +36,17 @@ class InvalidSharedFieldError(ValueError):
     pass
 
 
+class DatabaseConflictError(RuntimeError):
+    pass
+
+
 class SharedDatabase:
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root)
         self.path = self.root / ".pm" / DB_NAME
         self.data: dict = {}
         self.status = "MISSING"
+        self.loaded_signature = None
 
     @staticmethod
     def _empty() -> dict:
@@ -54,6 +59,9 @@ class SharedDatabase:
         }
 
     def _write_new(self) -> None:
+        current = self._signature()
+        if self.loaded_signature is not None and current != self.loaded_signature:
+            raise DatabaseConflictError(f"数据库已被外部更新: {self.path}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + f".{uuid.uuid4().hex}.tmp")
         payload = json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"
@@ -63,6 +71,7 @@ class SharedDatabase:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            self.loaded_signature = self._signature()
         finally:
             try:
                 tmp.unlink()
@@ -81,6 +90,13 @@ class SharedDatabase:
         os.replace(self.path, target)
         target.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
         return target
+
+    def _signature(self):
+        try:
+            st = self.path.stat()
+            return (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
 
     @staticmethod
     def _is_schema2(value: object) -> bool:
@@ -115,6 +131,7 @@ class SharedDatabase:
         if self._is_schema2(existing):
             self.data = existing
             self.status = "OK"
+            self.loaded_signature = self._signature()
             return InitializationReport("READY", self.path)
 
         archive = self._archive_existing()
@@ -130,6 +147,7 @@ class SharedDatabase:
             os.replace(archive, self.path)
             raise
         self.status = "OK"
+        self.loaded_signature = self._signature()
         return InitializationReport("ARCHIVED_AND_CREATED", self.path, archive)
 
     def update_plugin(self, key: str, changes: dict) -> dict:

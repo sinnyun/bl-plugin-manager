@@ -37,10 +37,6 @@ class CorruptDatabaseError(RuntimeError):
     """The metadata source is malformed and must not be overwritten."""
 
 
-class DatabaseConflictError(RuntimeError):
-    """The database changed on disk after this instance loaded it."""
-
-
 def _file_signature(path: str):
     """Return replacement-sensitive metadata for a database file."""
     try:
@@ -136,9 +132,6 @@ class LibraryDB:
     def save(self) -> None:
         if self.status == "CORRUPT":
             raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
-        current_signature = _file_signature(self.path)
-        if self.loaded_signature is not None and current_signature != self.loaded_signature:
-            raise DatabaseConflictError(f"数据库已被外部更新: {self.path}")
         self.data["updated"] = now_iso()
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), suffix=".tmp")
