@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import os
 
 from . import constants as C, scan
 from .db import LibraryDB
@@ -12,6 +13,14 @@ _LAST = {"t": 0.0, "sig": None}
 
 
 def _signature(prefs):
+    db_sig = None
+    if getattr(prefs, "library_path", ""):
+        path = os.path.join(prefs.library_path, C.DIR_META, C.DB_FILENAME)
+        try:
+            st = os.stat(path)
+            db_sig = (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size)
+        except OSError:
+            db_sig = None
     return (
         prefs.library_path,
         prefs.active_category,
@@ -20,14 +29,15 @@ def _signature(prefs):
         prefs.only_enabled,
         prefs.only_incompatible,
         prefs.search,
+        db_sig,
     )
 
 
 def maybe_rebuild(prefs, force: bool = False) -> None:
-    """在 draw 中调用：签名变化或超过 0.3 秒才真正重建。"""
+    """在 draw 中调用：只有筛选条件或数据库文件签名变化才重建。"""
     sig = _signature(prefs)
     now = time.time()
-    if not force and sig == _LAST["sig"] and (now - _LAST["t"]) < 0.3:
+    if not force and sig == _LAST["sig"]:
         return
     _LAST["sig"] = sig
     _LAST["t"] = now
