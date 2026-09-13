@@ -33,6 +33,10 @@ def _empty_db() -> dict:
 _CACHE: dict[str, tuple] = {}
 
 
+class CorruptDatabaseError(RuntimeError):
+    """The metadata source is malformed and must not be overwritten."""
+
+
 def cached_load(path: str):
     """按 (mtime, size) 复用已解析数据；文件变了才重新读。"""
     try:
@@ -72,6 +76,7 @@ class LibraryDB:
         self.path = os.path.join(root, C.DIR_META, C.DB_FILENAME)
         self._use_cache = use_cache
         self.data = _empty_db()
+        self.status = "MISSING"
         self.load()
 
     # -- 磁盘 IO -----------------------------------------------------------
@@ -96,10 +101,13 @@ class LibraryDB:
                 self.data.setdefault("plugins", {})
                 self.data.setdefault("categories", [])
                 self.data.setdefault("schema", C.DB_SCHEMA)
+                self.status = "OK"
                 return
+            self.status = "CORRUPT"
         except FileNotFoundError:
-            pass
+            self.status = "MISSING"
         except Exception:
+            self.status = "CORRUPT"
             # 损坏时保留原文件备份，避免用户数据被静默覆盖
             try:
                 if os.path.exists(self.path):
@@ -109,6 +117,8 @@ class LibraryDB:
         self.data = _empty_db()
 
     def save(self) -> None:
+        if self.status == "CORRUPT":
+            raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
         self.data["updated"] = now_iso()
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), suffix=".tmp")
