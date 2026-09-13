@@ -36,6 +36,20 @@ class LegacyDbGuardTests(unittest.TestCase):
             self.assertEqual(len(signature), 5)
             self.assertEqual(signature[-1], 2)
 
+    def test_save_refuses_to_overwrite_an_external_update(self):
+        mod = _module()
+        with tempfile.TemporaryDirectory() as root:
+            first = mod.LibraryDB(root, use_cache=False)
+            first.upsert("addons/demo", {"name": "A"})
+            first.save()
+            stale = mod.LibraryDB(root, use_cache=False)
+            fresh = mod.LibraryDB(root, use_cache=False)
+            fresh.upsert("addons/demo", {"name": "B"})
+            fresh.save()
+            stale.upsert("addons/demo", {"name": "A2"})
+            with self.assertRaises(mod.DatabaseConflictError):
+                stale.save()
+
 
 if __name__ == "__main__":
     unittest.main()

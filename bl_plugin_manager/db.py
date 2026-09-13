@@ -37,6 +37,10 @@ class CorruptDatabaseError(RuntimeError):
     """The metadata source is malformed and must not be overwritten."""
 
 
+class DatabaseConflictError(RuntimeError):
+    """The database changed on disk after this instance loaded it."""
+
+
 def _file_signature(path: str):
     """Return replacement-sensitive metadata for a database file."""
     try:
@@ -87,6 +91,7 @@ class LibraryDB:
         self._use_cache = use_cache
         self.data = _empty_db()
         self.status = "MISSING"
+        self.loaded_signature = None
         self.load()
 
     # -- 磁盘 IO -----------------------------------------------------------
@@ -96,9 +101,11 @@ class LibraryDB:
             if hit is not None:
                 # 复制一份，避免调用方就地修改污染缓存
                 self.data = json.loads(json.dumps(hit, ensure_ascii=False))
+                self.loaded_signature = _file_signature(self.path)
                 self._fresh = True
                 return
         self._load_from_disk()
+        self.loaded_signature = _file_signature(self.path)
         if self._use_cache:
             cache_store(self.path, self.data)
 
@@ -129,6 +136,9 @@ class LibraryDB:
     def save(self) -> None:
         if self.status == "CORRUPT":
             raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
+        current_signature = _file_signature(self.path)
+        if self.loaded_signature is not None and current_signature != self.loaded_signature:
+            raise DatabaseConflictError(f"数据库已被外部更新: {self.path}")
         self.data["updated"] = now_iso()
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), suffix=".tmp")
@@ -136,6 +146,7 @@ class LibraryDB:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(self.data, fh, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
+            self.loaded_signature = _file_signature(self.path)
             # 更新缓存，避免紧接着的读取又解析一遍
             if self._use_cache:
                 cache_store(self.path, self.data)
