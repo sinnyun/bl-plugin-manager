@@ -13,6 +13,7 @@ from datetime import datetime
 from . import bridge, constants as C, scan
 from .db import LibraryDB, now_iso
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
+from .security.archive import extract_archive
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +342,7 @@ def import_zip(zip_path: str, root: str, db: LibraryDB, enable: bool = False,
         raise ValueError("压缩包中没有可识别的插件（缺少 manifest 或 __init__.py）")
     tmp = tempfile.mkdtemp(prefix="pm_import_")
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmp)
+        extract_archive(zip_path, tmp)
         src = os.path.join(tmp, info["prefix"]) if info["prefix"] else tmp
         rec = import_plugin_dir(src, root, db, move=True, enable=enable,
                                 origin=origin, origin_path=origin_path)
@@ -669,8 +669,7 @@ def replace_from_zip(rec: dict, zip_path: str, root: str, db: LibraryDB,
 
     tmp = tempfile.mkdtemp(prefix="pm_replace_")
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmp)
+        extract_archive(zip_path, tmp)
         src = os.path.join(tmp, info["prefix"]) if info["prefix"] else tmp
 
         # 在临时目录中验证完整内容后再交换，失败时保留旧版本。
