@@ -32,13 +32,25 @@ foreach ($v in $versions) {
     New-Item -ItemType Directory -Force -Path $addons | Out-Null
     $dest = Join-Path $addons $pkgName
 
-    if (Test-Path $dest) {
-        Remove-Item -Recurse -Force $dest
+    $stage = Join-Path $addons ("." + $pkgName + ".stage." + [guid]::NewGuid().ToString("N"))
+    $previous = Join-Path $addons ($pkgName + ".previous")
+    try {
+        Copy-Item -Recurse -Force $source $stage
+        $compile = Get-Command python -ErrorAction SilentlyContinue
+        if ($compile) {
+            & $compile.Source -m compileall -q $stage
+            if ($LASTEXITCODE -ne 0) { throw "Python compile check failed" }
+        }
+        $stagePyc = Join-Path $stage "__pycache__"
+        if (Test-Path $stagePyc) { Remove-Item -Recurse -Force $stagePyc }
+        if (Test-Path $previous) { Remove-Item -Recurse -Force $previous }
+        if (Test-Path $dest) { Move-Item -Force $dest $previous }
+        Move-Item -Force $stage $dest
+    } catch {
+        if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+        if ((-not (Test-Path $dest)) -and (Test-Path $previous)) { Move-Item -Force $previous $dest }
+        throw "安装 Blender $($v.Name) 失败，已尝试回滚：$($_.Exception.Message)"
     }
-    Copy-Item -Recurse -Force $source $dest
-    # 清掉缓存，避免旧字节码生效
-    $pyc = Join-Path $dest "__pycache__"
-    if (Test-Path $pyc) { Remove-Item -Recurse -Force $pyc }
 
     Write-Host "已安装到 Blender $($v.Name): $dest"
 }

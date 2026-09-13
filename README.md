@@ -17,7 +17,7 @@
 
 ### 1. 所有插件集中到一个库文件夹
 
-默认库路径是 `~/BlenderPluginLibrary`（可在偏好设置里改）。库内部结构自动创建：
+插件库路径保存在每台电脑自己的本机配置中，不再随 Blender 同步偏好传播。库内部结构自动创建：
 
 ```
 BlenderPluginLibrary/
@@ -25,7 +25,7 @@ BlenderPluginLibrary/
 ├── extensions/    扩展插件   <库>/extensions/<插件id>
 ├── inbox/         投放区     把插件文件夹或 zip 丢这里
 ├── trash/         回收站     移除的插件移到这里
-└── .pm/           内部数据   library.json（分类/备注等）, backups/, processed.json
+└── .pm/           内部数据   schema 2 library.json, backups/, archive/
 ```
 
 ### 2. 挂载方式（关键：不依赖软链接）
@@ -54,8 +54,10 @@ Windows 上给目录建软链接需要管理员权限，容易失败。本插件
 
 ### 4. 元数据与 Blender 版本解耦
 
-分类、备注、别名、标签、收藏、来源都写在 `<库>/.pm/library.json` 里，
-和 Blender 安装版本无关，**升级后只要库路径不变，这些信息一条都不会丢**。
+分类、备注、别名、标签、收藏、自启和便携插件身份写在 `<库>/.pm/library.json` 的 schema 2 数据库中，
+和 Blender 安装版本无关。启用状态、模块名、兼容性和错误保存在本机状态目录，不会同步覆盖其它电脑。
+
+2.0.0 不迁移旧版数据库。首次遇到旧 `library.json` 时会先原样归档到 `.pm/archive/` 并设为只读，再创建全新数据库。
 
 ### 5. 两套插件体系统一识别
 Blender 4.2+ 同时存在两种插件：
@@ -100,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 python build_zip.py
 ```
 
-然后在 Blender 中 `编辑 > 偏好设置 > 插件 > 安装…`，选择 `dist/bl_plugin_manager-<version>.zip`（例如 `dist/bl_plugin_manager-1.0.3.zip`）。
+然后在 Blender 中 `编辑 > 偏好设置 > 插件 > 安装…`，选择 `dist/bl_plugin_manager-<version>.zip`。
 
 ### 启用
 
