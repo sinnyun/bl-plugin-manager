@@ -18,6 +18,7 @@ bl_info = {
 import importlib
 import os
 
+_PM_WAS_IMPORTED = "bpy" in globals()
 import bpy
 
 from . import constants as C
@@ -38,7 +39,7 @@ from . import (
 )
 
 # 支持在 Blender 文本编辑器中热重载
-if "bpy" in locals():  # pragma: no cover
+if _PM_WAS_IMPORTED:  # pragma: no cover
     for _mod in (C, scan, db, bridge, library, store, updates, migrate, watcher,
                  items, preferences, operators, ui):
         importlib.reload(_mod)
