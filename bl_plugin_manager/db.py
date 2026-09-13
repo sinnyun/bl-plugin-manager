@@ -184,6 +184,12 @@ class LibraryDB:
         需要时可用「采用自带分类」单独取用。
         """
         cats = self.data.setdefault("categories", [])
+        # schema 2 stores stable category ids and labels; expose labels to the
+        # legacy UI API while preserving the portable on-disk shape.
+        if cats and isinstance(cats[0], dict):
+            if not any(c.get("id") == "uncategorized" for c in cats):
+                cats.insert(0, {"id": "uncategorized", "name": C.DEFAULT_CATEGORY, "order": 0})
+            return [str(c.get("name") or C.DEFAULT_CATEGORY) for c in cats]
         if C.DEFAULT_CATEGORY not in cats:
             cats.insert(0, C.DEFAULT_CATEGORY)
         return cats
@@ -192,21 +198,34 @@ class LibraryDB:
         """确保某个分类存在于列表中（用户把插件归入该分类时调用）。"""
         name = (name or "").strip()
         if name and name not in self.categories:
-            self.categories.append(name)
+            cats = self.data.setdefault("categories", [])
+            if cats and isinstance(cats[0], dict):
+                cats.append({"id": name, "name": name, "order": len(cats)})
+            else:
+                cats.append(name)
 
     def add_category(self, name: str) -> bool:
         name = (name or "").strip()
         if not name or name in self.categories:
             return False
-        self.categories.append(name)
+        cats = self.data.setdefault("categories", [])
+        if cats and isinstance(cats[0], dict):
+            cats.append({"id": name, "name": name, "order": len(cats)})
+        else:
+            cats.append(name)
         return True
 
     def rename_category(self, old: str, new: str) -> None:
         new = (new or "").strip()
         if not new:
             return
-        cats = self.categories
-        if old in cats:
+        cats = self.data.setdefault("categories", [])
+        if cats and isinstance(cats[0], dict):
+            for item in cats:
+                if item.get("name") == old:
+                    item["name"] = new
+                    item["id"] = new
+        elif old in cats:
             cats[cats.index(old)] = new
         for rec in self.plugins.values():
             if rec.get("category") == old:
@@ -214,8 +233,11 @@ class LibraryDB:
 
     def delete_category(self, name: str) -> None:
         """删除分类，其下插件回到「未分类」（不会删除插件）。"""
-        cats = self.categories
-        if name in cats and name != C.DEFAULT_CATEGORY:
+        cats = self.data.setdefault("categories", [])
+        if cats and isinstance(cats[0], dict):
+            if name != C.DEFAULT_CATEGORY:
+                cats[:] = [c for c in cats if c.get("name") != name]
+        elif name in cats and name != C.DEFAULT_CATEGORY:
             cats.remove(name)
         for rec in self.plugins.values():
             if rec.get("category") == name:
@@ -241,7 +263,15 @@ class LibraryDB:
             if (rec.get("category") or "").strip()
             and (rec.get("category") or "").strip() != C.DEFAULT_CATEGORY
         }
-        self.data["categories"] = [C.DEFAULT_CATEGORY] + sorted(remaining)
+        if self.data.get("categories") and isinstance(self.data["categories"][0], dict):
+            self.data["categories"] = [
+                {"id": "uncategorized", "name": C.DEFAULT_CATEGORY, "order": 0}
+            ] + [
+                {"id": name, "name": name, "order": i + 1}
+                for i, name in enumerate(sorted(remaining))
+            ]
+        else:
+            self.data["categories"] = [C.DEFAULT_CATEGORY] + sorted(remaining)
         return {"moved": moved, "categories_left": len(self.data["categories"])}
 
     def category_counts(self) -> dict:
