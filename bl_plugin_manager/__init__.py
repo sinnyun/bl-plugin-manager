@@ -107,12 +107,25 @@ def _bootstrap_prefs():
 
 
 def register():
-    for mod in _modules:
-        for cls in getattr(mod, "classes", ()):
-            bpy.utils.register_class(cls)
-            _registered.append(cls)
-    _bootstrap_prefs()
-    header.register()
+    try:
+        for mod in _modules:
+            for cls in getattr(mod, "classes", ()):
+                bpy.utils.register_class(cls)
+                _registered.append(cls)
+        _bootstrap_prefs()
+        header.register()
+    except Exception:
+        try:
+            header.unregister()
+        except Exception:
+            pass
+        for cls in reversed(_registered):
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+        _registered.clear()
+        raise
     # 启动同步：延迟执行，等 Blender 初始化完成（仅当偏好开启时生效）
     try:
         bpy.app.timers.unregister(_apply_startup_on_launch)
