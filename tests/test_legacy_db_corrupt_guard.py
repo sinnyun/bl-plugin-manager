@@ -27,6 +27,15 @@ class LegacyDbGuardTests(unittest.TestCase):
                 db.save()
             self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
 
+    def test_file_signature_contains_identity_and_creation_change_markers(self):
+        mod = _module()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "library.json"
+            path.write_text("{}", encoding="utf-8")
+            signature = mod._file_signature(path)
+            self.assertEqual(len(signature), 5)
+            self.assertEqual(signature[-1], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

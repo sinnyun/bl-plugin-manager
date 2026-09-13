@@ -37,12 +37,20 @@ class CorruptDatabaseError(RuntimeError):
     """The metadata source is malformed and must not be overwritten."""
 
 
-def cached_load(path: str):
-    """按 (mtime, size) 复用已解析数据；文件变了才重新读。"""
+def _file_signature(path: str):
+    """Return replacement-sensitive metadata for a database file."""
     try:
         st = os.stat(path)
-        stamp = (st.st_mtime_ns, st.st_size)
+        return (getattr(st, "st_dev", 0), getattr(st, "st_ino", 0),
+                st.st_ctime_ns, st.st_mtime_ns, st.st_size)
     except OSError:
+        return None
+
+
+def cached_load(path: str):
+    """按替换敏感签名复用已解析数据；文件变了才重新读。"""
+    stamp = _file_signature(path)
+    if stamp is None:
         return None
     hit = _CACHE.get(path)
     if hit and hit[0] == stamp:
@@ -52,11 +60,13 @@ def cached_load(path: str):
 
 def cache_store(path: str, data) -> None:
     try:
-        st = os.stat(path)
+        stamp = _file_signature(path)
+        if stamp is None:
+            return
         # Never retain a live LibraryDB.data object in the process cache.  Callers
         # routinely keep mutating it after save(); a deep snapshot prevents those
         # unsaved mutations leaking into later LibraryDB instances.
-        _CACHE[path] = ((st.st_mtime_ns, st.st_size), copy.deepcopy(data))
+        _CACHE[path] = (stamp, copy.deepcopy(data))
     except OSError:
         pass
 
