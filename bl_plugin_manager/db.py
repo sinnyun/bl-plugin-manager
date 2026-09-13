@@ -154,7 +154,9 @@ class LibraryDB:
                 cache_store(self.path, self.data)
             if runtime is not None:
                 self._save_runtime(runtime)
-                self.data["plugins"].update(runtime.get("_restore", {}))
+                for key, fields in runtime.get("_restore", {}).items():
+                    if key in self.data["plugins"]:
+                        self.data["plugins"][key].update(fields)
         finally:
             if os.path.exists(tmp):
                 try:
@@ -216,7 +218,12 @@ class LibraryDB:
         if self.data.get("schema") != 2 or not self.data.get("library_id"):
             raise RuntimeError("portable scan merge requires schema 2 database")
         from .services.sync_v2 import merge_scan
-        self.data["plugins"] = merge_scan(self.plugins, entries)
+        old = self.plugins
+        merged = merge_scan(old, entries)
+        for key, record in merged.items():
+            if key in old:
+                record.update({field: old[key][field] for field in _V2_RUNTIME_FIELDS if field in old[key]})
+        self.data["plugins"] = merged
         self.data["revision"] = int(self.data.get("revision", 0)) + 1
         self.save()
         return self.plugins

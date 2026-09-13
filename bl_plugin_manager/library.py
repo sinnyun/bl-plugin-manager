@@ -493,6 +493,7 @@ def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
                     "rel": rel_key(root, entry["abs"]),
                     "id": meta.get("id", ""),
                     "name": meta.get("name") or entry.get("name", ""),
+                    "folder_name": entry.get("name", ""),
                     "version": meta.get("version", ""),
                 })
         old_keys = set(db.plugins)

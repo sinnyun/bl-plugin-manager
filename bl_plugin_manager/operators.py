@@ -15,6 +15,7 @@ from bpy.types import Operator
 from . import bridge, constants as C, library, migrate, scan, store, updates, watcher
 from .db import LibraryDB, now_iso
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
+from .storage.shared_db import SharedDatabase
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,14 @@ def _report(self, ok: bool, msg: str, kind: str = "INFO"):
     return {"CANCELLED"}
 
 
+def _initialize_schema2(root: str) -> LibraryDB:
+    """Archive non-schema-2 metadata, then open the clean shared database."""
+    report = SharedDatabase(root).initialize()
+    if report.status == "CORRUPT":
+        raise RuntimeError("插件库元数据已损坏，已保持只读，未覆盖原文件")
+    return LibraryDB(root, use_cache=False)
+
+
 class _PMBase(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
@@ -77,8 +86,9 @@ class PM_OT_setup_library(_PMBase):
             return _report(self, False, res["error"])
         _status("插件库：正在挂载并扫描…")
         try:
+            db = _initialize_schema2(prefs.library_path)
             state = bridge.register_library(prefs.library_path, save=True)
-            library.sync_library(prefs.library_path, LibraryDB(prefs.library_path))
+            library.sync_library(prefs.library_path, db)
         finally:
             _clear_status()
         if not (state["script_dir"] and state["repo"]):
@@ -204,6 +214,10 @@ class PM_OT_pick_library_path(_PMBase):
         if res.get("error"):
             return _report(self, False, res["error"])
 
+        try:
+            db = _initialize_schema2(path)
+        except RuntimeError as exc:
+            return _report(self, False, str(exc))
         info = res["info"]
         prefs.library_path = path            # 触发 _on_library_path_update
         state = bridge.register_library(path, save=True)

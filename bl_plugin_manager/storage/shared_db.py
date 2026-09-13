@@ -20,8 +20,8 @@ SCHEMA = 2
 DB_NAME = "library.json"
 DEFAULT_CATEGORY = {"id": "uncategorized", "name": "未分类", "order": 0}
 SHARED_PLUGIN_FIELDS = frozenset({
-    "key", "kind", "rel", "id", "name", "version",
-    "display_name", "category_id", "tags", "note", "favorite", "startup",
+    "key", "kind", "rel", "id", "name", "folder_name", "version",
+    "display_name", "category_id", "category", "tags", "note", "favorite", "startup",
 })
 
 
