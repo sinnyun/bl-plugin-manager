@@ -99,10 +99,15 @@ def _bootstrap_prefs():
         return
     try:
         bridge.ensure_library_dirs(prefs.library_path)
-        library.sync_library(prefs.library_path, db.LibraryDB(prefs.library_path))
+        from .storage.shared_db import SharedDatabase
+        report = SharedDatabase(prefs.library_path).initialize()
+        if report.status == "CORRUPT":
+            print("[插件库] 元数据损坏，已保持只读，跳过自动扫描")
+            return
         if not bridge.is_registered(prefs.library_path):
             bridge.register_library(prefs.library_path, save=True)
             print("[插件库] 已自动挂载插件库")
+        library.sync_library(prefs.library_path, db.LibraryDB(prefs.library_path, use_cache=False))
     except Exception as exc:
         print("[插件库] 初始化库失败:", exc)
 
