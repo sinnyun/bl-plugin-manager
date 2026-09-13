@@ -166,3 +166,13 @@ class SharedDatabase:
         self.data["revision"] = int(self.data.get("revision", 0)) + 1
         self._write_new()
         return dict(record)
+
+    def merge_scan(self, entries: list[dict]) -> dict:
+        """Replace portable plugin identities while retaining user metadata."""
+        if self.status != "OK":
+            raise RuntimeError(f"database is not writable: {self.status}")
+        from ..services.sync_v2 import merge_scan
+        self.data["plugins"] = merge_scan(self.data.get("plugins", {}), entries)
+        self.data["revision"] = int(self.data.get("revision", 0)) + 1
+        self._write_new()
+        return dict(self.data["plugins"])
