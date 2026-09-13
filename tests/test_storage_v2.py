@@ -74,6 +74,17 @@ class StorageV2Tests(unittest.TestCase):
             with self.assertRaises(mod.InvalidSharedFieldError):
                 db.update_plugin("demo", {"display_name": "Demo", "enabled": True})
 
+    def test_schema_two_legacy_shape_is_archived(self):
+        mod = _storage_module("bl_plugin_manager.storage.shared_db")
+        with tempfile.TemporaryDirectory() as root:
+            pm = Path(root) / ".pm"
+            pm.mkdir()
+            old = pm / "library.json"
+            old.write_text('{"schema": 2, "categories": [], "plugins": {}}', encoding="utf-8")
+            db = mod.SharedDatabase(root)
+            report = db.initialize()
+            self.assertEqual(report.status, "ARCHIVED_AND_CREATED")
+
 
 if __name__ == "__main__":
     unittest.main()

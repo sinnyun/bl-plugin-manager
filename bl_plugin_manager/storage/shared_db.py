@@ -82,6 +82,21 @@ class SharedDatabase:
         target.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
         return target
 
+    @staticmethod
+    def _is_schema2(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if value.get("schema") != SCHEMA or not isinstance(value.get("library_id"), str):
+            return False
+        if not isinstance(value.get("revision"), int) or not isinstance(value.get("plugins"), dict):
+            return False
+        categories = value.get("categories")
+        return isinstance(categories, list) and all(
+            isinstance(item, dict) and set(item) <= {"id", "name", "order"}
+            and isinstance(item.get("id"), str) and isinstance(item.get("name"), str)
+            for item in categories
+        )
+
     def initialize(self) -> InitializationReport:
         if not self.path.exists():
             self.data = self._empty()
@@ -97,7 +112,7 @@ class SharedDatabase:
             self.status = "CORRUPT"
             return InitializationReport("CORRUPT", self.path)
 
-        if isinstance(existing, dict) and existing.get("schema") == SCHEMA:
+        if self._is_schema2(existing):
             self.data = existing
             self.status = "OK"
             return InitializationReport("READY", self.path)
