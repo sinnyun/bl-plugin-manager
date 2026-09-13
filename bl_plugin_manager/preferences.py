@@ -15,6 +15,8 @@ from bpy.types import AddonPreferences, Operator, PropertyGroup
 
 from . import bridge, constants as C
 
+_LOADING_MACHINE_PATH = False
+
 
 # ---------------------------------------------------------------------------
 # 列表项 / 分类项
@@ -82,17 +84,15 @@ def _on_filter_update(self, context):
 
 
 def _on_library_path_update(self, context):
-    """路径变化时：目录已存在则同步；不存在则等用户点『启用/修复插件库』再创建。"""
-    from . import items, library
-
-    if self.library_path and os.path.isdir(self.library_path):
-        try:
-            bridge.ensure_library_dirs(self.library_path)
-            from .db import LibraryDB
-
-            library.sync_library(self.library_path, LibraryDB(self.library_path))
-        except Exception as exc:
-            print("[插件库] 初始化库目录失败:", exc)
+    """Persist only the machine-local path; activation owns scanning/mounting."""
+    if _LOADING_MACHINE_PATH:
+        return
+    try:
+        from .storage import machine_config
+        machine_config.save({"library_path": self.library_path or None})
+    except Exception as exc:
+        print("[插件库] 保存本机插件库路径失败:", exc)
+    from . import items
     items.maybe_rebuild(self, force=True)
 
 
@@ -106,7 +106,8 @@ class PMAddonPreferences(AddonPreferences):
         name="插件库路径",
         description="所有插件集中存放的根目录；内部会自动建立 addons / extensions / inbox",
         subtype="DIR_PATH",
-        default=os.path.join(os.path.expanduser("~"), "BlenderPluginLibrary"),
+        default="",
+        options={"SKIP_SAVE"},
         update=_on_library_path_update,
     )
     # 界面状态

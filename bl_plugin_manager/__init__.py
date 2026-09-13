@@ -79,6 +79,19 @@ def _bootstrap_prefs():
     启用本插件时，自动把库重新注册为脚本目录与扩展仓库，无需手动点击。
     """
     prefs = bridge.get_prefs()
+    if prefs:
+        try:
+            from .storage import machine_config
+            local = machine_config.load()
+            path = local.get("library_path")
+            if path:
+                preferences._LOADING_MACHINE_PATH = True
+                try:
+                    prefs.library_path = path
+                finally:
+                    preferences._LOADING_MACHINE_PATH = False
+        except Exception as exc:
+            print("[插件库] 读取本机插件库路径失败:", exc)
     if not prefs or not prefs.library_path:
         return
     if not os.path.isdir(prefs.library_path):
