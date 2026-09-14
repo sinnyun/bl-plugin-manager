@@ -12,6 +12,13 @@ import bpy
 from . import constants as C
 
 
+# This add-on owns at most one mounted library per Blender process.  Keeping
+# the root here lets all exit paths (path clearing, library switching and
+# add-on disabling) remove the exact script-directory/repository entries that
+# made Blender discover the managed plug-ins.
+_MANAGED_LIBRARY_ROOT = ""
+
+
 # ---------------------------------------------------------------------------
 # 偏好与目录
 # ---------------------------------------------------------------------------
@@ -276,6 +283,11 @@ def is_registered(root: str) -> bool:
     return state["script_dir"] and state["repo"]
 
 
+def managed_library_root() -> str:
+    """Return the library root currently mounted by this add-on."""
+    return _MANAGED_LIBRARY_ROOT
+
+
 # ---------------------------------------------------------------------------
 # 注册 / 注销
 # ---------------------------------------------------------------------------
@@ -285,7 +297,10 @@ def register_library(root: str, save: bool = True) -> dict:
     普通挂载只使用本插件自己的本地 pmlib 仓库，不会隐式改写 Blender
     官方商店仓库；需要让官方商店与库共用目录时，使用显式的「统一商店」操作。
     """
+    global _MANAGED_LIBRARY_ROOT
     dirs = ensure_library_dirs(root)
+    if _MANAGED_LIBRARY_ROOT and _norm(_MANAGED_LIBRARY_ROOT) != _norm(dirs["root"]):
+        unregister_library(_MANAGED_LIBRARY_ROOT, save=False)
     os.makedirs(dirs["extensions"], exist_ok=True)
 
     si, _ = find_script_dir(dirs["root"])
@@ -319,7 +334,10 @@ def register_library(root: str, save: bool = True) -> dict:
     refresh_blender()
     if save:
         save_prefs()
-    return library_state(dirs["root"])
+    state = library_state(dirs["root"])
+    if state["script_dir"] and state["repo"]:
+        _MANAGED_LIBRARY_ROOT = dirs["root"]
+    return state
 
 
 def unregister_library(root: str, save: bool = True) -> None:
@@ -341,8 +359,17 @@ def unregister_library(root: str, save: bool = True) -> None:
     if not ok:
         print("[插件库]", err)
     refresh_blender()
+    global _MANAGED_LIBRARY_ROOT
+    if _MANAGED_LIBRARY_ROOT and _norm(_MANAGED_LIBRARY_ROOT) == _norm(dirs["root"]):
+        _MANAGED_LIBRARY_ROOT = ""
     if save:
         save_prefs()
+
+
+def unregister_managed_library(save: bool = True) -> None:
+    """Remove the mounts owned by the current manager session, if any."""
+    if _MANAGED_LIBRARY_ROOT:
+        unregister_library(_MANAGED_LIBRARY_ROOT, save=save)
 
 
 def save_prefs() -> None:

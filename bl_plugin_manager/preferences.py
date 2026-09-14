@@ -87,6 +87,13 @@ def _on_library_path_update(self, context):
     """Persist only the machine-local path; activation owns scanning/mounting."""
     if _LOADING_MACHINE_PATH:
         return
+    # A blank or changed path means this computer is no longer using the
+    # previous library.  Remove its Blender discovery entries immediately so
+    # disabled library plugins do not keep appearing in Preferences.
+    previous = bridge.managed_library_root()
+    if previous and os.path.normcase(os.path.abspath(previous)) != os.path.normcase(
+            os.path.abspath(self.library_path or "")):
+        bridge.unregister_managed_library(save=True)
     try:
         from .storage import machine_config
         machine_config.save({"library_path": self.library_path or None})

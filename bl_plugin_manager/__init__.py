@@ -149,6 +149,18 @@ def unregister():
         bpy.app.timers.unregister(_apply_startup_on_launch)
     except Exception:
         pass
+    # Disabling the manager must restore Blender's native discovery state.
+    # Otherwise the old script directory and pmlib repository keep exposing
+    # every library plugin in Blender's own Preferences panel.
+    try:
+        root = bridge.managed_library_root()
+        if not root:
+            prefs = bridge.get_prefs()
+            root = getattr(prefs, "library_path", "") if prefs else ""
+        if root:
+            bridge.unregister_library(root, save=True)
+    except Exception as exc:
+        print("[插件库] 撤销插件库挂载失败:", exc)
     header.unregister()
     for cls in reversed(_registered):
         try:
