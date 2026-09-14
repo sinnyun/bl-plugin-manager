@@ -94,8 +94,10 @@ def _bootstrap_prefs():
         except Exception as exc:
             print("[插件库] 读取本机插件库路径失败:", exc)
     if not prefs or not prefs.library_path:
+        bridge.cleanup_orphaned_mounts(save=True)
         return
     if not os.path.isdir(prefs.library_path):
+        bridge.cleanup_orphaned_mounts(save=True)
         return
     try:
         bridge.ensure_library_dirs(prefs.library_path)

@@ -372,6 +372,35 @@ def unregister_managed_library(save: bool = True) -> None:
         unregister_library(_MANAGED_LIBRARY_ROOT, save=save)
 
 
+def cleanup_orphaned_mounts(save: bool = True) -> None:
+    """Remove mounts left by an older manager session with no local path.
+
+    Only entries with this add-on's script-directory naming convention and
+    its reserved ``pmlib`` repository module are touched.  Native Blender and
+    user-created script directories/repositories remain untouched.
+    """
+    global _MANAGED_LIBRARY_ROOT
+    prefix = f"{C.ADDON_NAME} - "
+    roots = []
+    try:
+        roots = [item.directory for item in _script_dirs()
+                 if getattr(item, "name", "").startswith(prefix) and getattr(item, "directory", "")]
+    except Exception:
+        pass
+    for root in roots:
+        unregister_library(root, save=False)
+    try:
+        for repo in list(bpy.context.preferences.extensions.repos):
+            if getattr(repo, "module", "") == C.REPO_MODULE:
+                bpy.context.preferences.extensions.repos.remove(repo)
+    except Exception:
+        pass
+    _MANAGED_LIBRARY_ROOT = ""
+    refresh_blender()
+    if save:
+        save_prefs()
+
+
 def save_prefs() -> None:
     try:
         bpy.ops.wm.save_userpref()
