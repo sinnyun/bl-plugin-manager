@@ -40,6 +40,8 @@ class CorruptDatabaseError(RuntimeError):
 _V2_RUNTIME_FIELDS = frozenset({
     "module", "enabled", "missing", "load_state", "load_error", "last_error",
     "restore_error", "residue", "compat", "compat_detail", "metadata_fingerprint",
+    "last_checked", "update_available", "latest_version", "latest_url",
+    "latest_hash", "latest_size", "latest_website",
 })
 
 
@@ -182,14 +184,21 @@ class LibraryDB:
     def _split_runtime(self):
         if not self.data.get("library_id") or self.data.get("schema") != 2:
             return None
+        from .storage.shared_db import SHARED_PLUGIN_FIELDS
         runtime = {"plugins": {}, "_restore": {}}
-        for key, rec in self.plugins.items():
+        for key, rec in list(self.plugins.items()):
             fields = {k: rec[k] for k in _V2_RUNTIME_FIELDS if k in rec}
             if fields:
                 runtime["plugins"][key] = fields
                 runtime["_restore"][key] = fields
-                for field in fields:
-                    rec.pop(field, None)
+            # The shared file is the synchronization contract.  A number of
+            # older call sites build richer in-memory records (including
+            # source paths); retain only explicitly portable fields before it
+            # is written so a local path can never escape into synced data.
+            self.plugins[key] = {
+                field: value for field, value in rec.items()
+                if field in SHARED_PLUGIN_FIELDS
+            }
         return runtime
 
     def _save_runtime(self, runtime) -> None:

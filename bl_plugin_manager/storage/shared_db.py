@@ -22,6 +22,11 @@ DEFAULT_CATEGORY = {"id": "uncategorized", "name": "未分类", "order": 0}
 SHARED_PLUGIN_FIELDS = frozenset({
     "key", "kind", "rel", "id", "name", "folder_name", "version",
     "display_name", "category_id", "category", "tags", "note", "favorite", "startup",
+    # Immutable metadata read from the plugin package is portable too.  Keep
+    # it in the library database so another computer can render the same
+    # plugin details before it has performed a local scan.
+    "pkg_id", "blender_min", "blender_max", "pkg_type", "author",
+    "description", "auto_category", "auto_tags", "doc_url", "location",
 })
 
 

@@ -286,15 +286,14 @@ bl_plugin_manager/
 项目自带隔离环境的端到端测试（在临时 Blender 用户目录中运行，不动你的真实配置）：
 
 ```bash
-bash _test/run_e2e.sh          # 43 项功能测试
-python _test/check_ui.py       # UI 与操作符一致性静态检查
-# _test/test_ui_smoke.py       # 面板 draw 冒烟测试（在隔离环境中运行）
-# _test/diagnose_real.py       # 只读扫描真实环境，报告识别率
+python -m unittest discover -s tests -p 'test_*_v2.py' -q  # 架构与数据隔离测试
+powershell -ExecutionPolicy Bypass -File _test/run_regressions.ps1
+powershell -ExecutionPolicy Bypass -File _test/run_e2e.ps1
 ```
 
-涵盖：库挂载/卸载往返、inbox 手动扫描导入（目录/zip）、两种插件识别与版本解析、
-中文名/emoji 插件、启停、元数据持久化、更新检测、同名去重、坏插件容错、移除到回收站等。
-在本机真实插件目录上的只读扫描结果为 **56/56 全部正确识别**。
+测试在隔离 Blender 配置中运行，不会修改当前实际插件库或 Blender 偏好。覆盖：多电脑
+数据隔离、库挂载/卸载往返、inbox 手动扫描导入（目录/zip）、两种插件识别与版本解析、
+中文名/emoji 插件、启停、元数据持久化、更新检测、同名去重、坏插件容错与回收站移除。
 
 ## 注意事项
 

@@ -227,6 +227,12 @@ def library_state(root: str, force: bool = False) -> dict:
     """
     if not root:
         return {"script_dir": False, "repo": False, "official": False}
+    # A stale Blender preference can still contain our old script/repository
+    # entries after a synced drive is disconnected or a library is moved.
+    # Treat that state as offline instead of presenting a false "connected"
+    # status in the manager UI.
+    if not os.path.isdir(root):
+        return {"script_dir": False, "repo": False, "official": False}
 
     try:
         script_sig = tuple(sorted(
