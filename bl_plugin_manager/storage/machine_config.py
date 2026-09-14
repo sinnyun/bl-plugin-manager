@@ -6,11 +6,13 @@ import json
 import os
 import tempfile
 import uuid
+import socket
 from pathlib import Path
 
 
 SCHEMA = 1
-_ALLOWED = {"schema", "device_id", "library_path"}
+_ALLOWED = {"schema", "device_id", "device_name", "library_path",
+            "management_enabled"}
 
 
 def config_path() -> Path:
@@ -24,7 +26,9 @@ def config_path() -> Path:
 
 
 def _defaults() -> dict:
-    return {"schema": SCHEMA, "device_id": str(uuid.uuid4()), "library_path": None}
+    return {"schema": SCHEMA, "device_id": str(uuid.uuid4()),
+            "device_name": socket.gethostname(), "library_path": None,
+            "management_enabled": False}
 
 
 def load() -> dict:
@@ -40,6 +44,10 @@ def load() -> dict:
             raise ValueError("library_path must be a string or null")
         if not isinstance(result["device_id"], str) or not result["device_id"]:
             raise ValueError("device_id must be non-empty")
+        if not isinstance(result["device_name"], str) or not result["device_name"].strip():
+            raise ValueError("device_name must be non-empty")
+        if not isinstance(result["management_enabled"], bool):
+            raise ValueError("management_enabled must be boolean")
         return result
     except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError):
         return _defaults()
@@ -47,11 +55,15 @@ def load() -> dict:
 
 def save(data: dict) -> None:
     path = config_path()
-    current = _defaults()
+    current = load()
     current.update({k: data[k] for k in _ALLOWED if k in data})
     current["schema"] = SCHEMA
+    if not isinstance(current['device_name'], str) or not current['device_name'].strip():
+        raise ValueError('device_name must be non-empty')
     if current["library_path"] is not None and not isinstance(current["library_path"], str):
         raise ValueError("library_path must be a string or null")
+    if not isinstance(current["management_enabled"], bool):
+        raise ValueError("management_enabled must be boolean")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix="machine.", suffix=".tmp", dir=path.parent)
     tmp = Path(name)
@@ -67,4 +79,3 @@ def save(data: dict) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
-

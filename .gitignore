@@ -4,7 +4,11 @@ __pycache__/
 # Local Blender test and migration artifacts
 _mcp_test/
 _migrate/
-_test/
+_test/*
+!_test/run_e2e.ps1
+!_test/run_regressions.ps1
+!_test/test_e2e.py
+!_test/test_regressions.py
 
 # Generated release archives (the source tree is the canonical distribution)
 dist/*.zip

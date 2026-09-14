@@ -155,8 +155,6 @@ class PM_MT_library(Menu):
         layout.operator("plugin_manager.refresh", icon="FILE_REFRESH", text="刷新列表")
         layout.operator("plugin_manager.show_warnings", icon="INFO", text="诊断信息")
         layout.separator()
-        layout.operator("plugin_manager.unify_store", icon="URL",
-                        text="让官方商店使用本插件库")
         layout.operator("plugin_manager.clear_updates", icon="X", text="清除更新标记")
         layout.separator()
         layout.operator("plugin_manager.unmount_library", icon="UNLINKED", text="卸载挂载")
@@ -268,12 +266,22 @@ class PM_PT_main(Panel):
         row = box.row(align=True)
         if prefs.library_path:
             state = bridge.library_state(prefs.library_path)
-            mounted = state["script_dir"] and state["repo"]
+            try:
+                from .storage import machine_config
+                local = machine_config.load()
+                managed = bool(local.get("management_enabled"))
+            except Exception:
+                local, managed = {}, False
+            mounted = managed and state["script_dir"] and state["repo"]
             name = os.path.basename(prefs.library_path.rstrip("\\/")) or prefs.library_path
             row.label(text=name, icon="CHECKMARK" if mounted else "ERROR")
             row.operator("plugin_manager.pick_library_path", text="", icon="FILEBROWSER")
             row.operator("plugin_manager.setup_library", text="", icon="LINKED")
             row.menu("PM_MT_library", text="", icon="DOWNARROW_HLT")
+            device_row = box.row(align=True)
+            device_row.prop(prefs, "device_name", text="设备")
+            if local.get("device_id"):
+                device_row.label(text=local["device_id"][:8])
         else:
             row.label(text="未设置插件库位置", icon="ERROR")
             row.operator("plugin_manager.pick_library_path", text="选择目录",
@@ -551,16 +559,19 @@ class PM_PT_tools(Panel):
 
         layout.separator()
         col = layout.column(align=True)
-        col.label(text="启动控制:", icon="RECOVER_LAST")
-        stats = _startup_stats(prefs)
-        col.label(text=f"自启 {stats['startup']} / 非自启 {stats['not_startup']}")
-        col.operator("plugin_manager.apply_startup", icon="PLAY", text="立即同步自启状态")
+        col.label(text="设备启用配置:", icon="RECOVER_LAST")
+        try:
+            from .storage import machine_config
+            from .storage.device_profiles import DeviceProfileStore
+            local = machine_config.load()
+            profile = DeviceProfileStore(prefs.library_path).load(local["device_id"])
+            device_count = len(DeviceProfileStore(prefs.library_path).list_devices())
+            col.label(text=f"本设备启用 {len(profile['enabled_plugins'])} 个；同步设备 {device_count} 台")
+        except Exception:
+            col.label(text="设备配置尚未创建")
         col.operator("plugin_manager.verify_compat", icon="CHECKMARK", text="一键测试插件支持")
         col.operator("plugin_manager.cleanup_residue", icon="TRASH",
                      text="清理失败插件残留")
-        col.prop(prefs, "sync_startup_on_launch")
-        if prefs.sync_startup_on_launch:
-            col.prop(prefs, "startup_disable_unmarked")
 
 
 # ---------------------------------------------------------------------------

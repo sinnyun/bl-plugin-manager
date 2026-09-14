@@ -12,7 +12,8 @@ from bpy.props import (
 )
 from bpy.types import Operator
 
-from . import bridge, constants as C, library, migrate, scan, store, updates, watcher
+from . import (bridge, constants as C, library, migrate, scan,
+               scoped_management, store, updates, watcher)
 from .db import LibraryDB, now_iso
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
 from .storage.shared_db import SharedDatabase
@@ -47,6 +48,14 @@ def _report(self, ok: bool, msg: str, kind: str = "INFO"):
         return {"FINISHED"}
     self.report({"ERROR"}, msg)
     return {"CANCELLED"}
+
+
+def _sync_device_config(prefs) -> str:
+    try:
+        scoped_management.sync_to_profile(prefs.library_path)
+        return ""
+    except Exception as exc:
+        return str(exc)
 
 
 def _initialize_schema2(root: str) -> LibraryDB:
@@ -87,12 +96,13 @@ class PM_OT_setup_library(_PMBase):
         _status("插件库：正在挂载并扫描…")
         try:
             db = _initialize_schema2(prefs.library_path)
-            state = bridge.register_library(prefs.library_path, save=True)
             library.sync_library(prefs.library_path, db)
+            result = scoped_management.activate(prefs.library_path)
+            state = bridge.library_state(prefs.library_path, force=True)
         finally:
             _clear_status()
-        if not (state["script_dir"] and state["repo"]):
-            return _report(self, False, "注册未完整完成，请检查控制台输出")
+        if result["state"] == "ERROR":
+            return _report(self, False, f"启用未完整完成: {result['failures'][:3]}")
         n = len(res["imported"])
         if res["created"]:
             return _report(self, True, f"已创建空插件库并挂载: {prefs.library_path}")
@@ -103,9 +113,9 @@ class PM_OT_setup_library(_PMBase):
 
 class PM_OT_unify_store(_PMBase):
     bl_idname = "plugin_manager.unify_store"
-    bl_label = "让官方商店使用本插件库"
-    bl_description = ("把 Blender 官方扩展商店的目录指向本插件库，并把官方目录中已装的\n"
-                      "扩展迁移进库。之后在官方商店面板下载/更新，都直接进入插件库管理")
+    bl_label = "迁移原官方扩展"
+    bl_description = ("把启用管理前位于 Blender 官方目录中的扩展安全迁移进插件库；\n"
+                      "只移动确认导入成功的条目，失败项保留在原处")
 
     move: BoolProperty(name="迁移官方目录中的扩展到库（移动）", default=True)
 
@@ -128,7 +138,9 @@ class PM_OT_unify_store(_PMBase):
             if os.path.normcase(os.path.abspath(src_dir)) == os.path.normcase(
                     os.path.abspath(os.path.join(root, C.DIR_EXTENSIONS))):
                 res = bridge.unify_store_with_library(root)
-                bridge.save_prefs()
+                error = _sync_device_config(prefs)
+                if error:
+                    return _report(self, False, f"商店已切换，但设备配置保存失败: {error}")
                 return _report(self, True, "官方商店已在使用本插件库目录")
 
         # 2) 把官方目录里的扩展迁移进库
@@ -146,25 +158,14 @@ class PM_OT_unify_store(_PMBase):
                     if "已存在" in str(exc) or "exists" in str(exc):
                         continue
                     failed.append(f"{e.name}: {exc}")
-            # 迁移后清理空的官方目录内容
-            if self.move:
-                for e in os.scandir(src_dir):
-                    if e.name.startswith("."):
-                        continue
-                    p = e.path
-                    try:
-                        if e.is_dir():
-                            import shutil as _sh
-                            _sh.rmtree(p, ignore_errors=True)
-                        elif not e.name.lower().endswith((".json",)):
-                            os.remove(p)
-                    except OSError:
-                        pass
+            # import_plugin_dir(move=True) only moves a successfully imported
+            # source.  Never sweep the remaining directory: failed or unknown
+            # entries belong to the user and must stay recoverable.
 
-        # 3) 官方商店仓库指向库 + 开启联网
+        # 3) 官方商店仓库指向库；联网权限仍由用户在 Blender 系统设置中控制
         res = bridge.unify_store_with_library(root)
         library.sync_library(root, db)
-        bridge.save_prefs()
+        sync_error = _sync_device_config(prefs)
         from . import items as _items
 
         _items.rebuild_items(prefs)
@@ -173,6 +174,8 @@ class PM_OT_unify_store(_PMBase):
         if failed:
             msg += f"，{len(failed)} 个失败"
         msg += "；官方商店已指向插件库"
+        if sync_error:
+            msg += f"；设备配置保存失败: {sync_error}"
         if not res.get("online"):
             msg += "（请到 偏好设置>系统 手动开启「允许联网访问」）"
         for f_ in failed[:8]:
@@ -220,8 +223,6 @@ class PM_OT_pick_library_path(_PMBase):
             return _report(self, False, str(exc))
         info = res["info"]
         prefs.library_path = path            # 触发 _on_library_path_update
-        state = bridge.register_library(path, save=True)
-
         if info["is_library"]:
             library.sync_library(path, db)
             msg = (f"已切换插件库: 原有 {info['addon_count']} 传统 + "
@@ -236,10 +237,13 @@ class PM_OT_pick_library_path(_PMBase):
             library.sync_library(path, db)
             msg = "已挂载插件库"
 
+        result = scoped_management.activate(path)
+        state = bridge.library_state(path, force=True)
+
         if res["failed"]:
             msg += f"（{len(res['failed'])} 个收编失败，详见控制台）"
-        if not (state["script_dir"] and state["repo"]):
-            return _report(self, False, "挂载未完整完成，请检查控制台")
+        if result["state"] == "ERROR":
+            return _report(self, False, f"启用未完整完成: {result['failures'][:3]}")
         from . import items
 
         items.rebuild_items(prefs)
@@ -258,7 +262,9 @@ class PM_OT_unmount_library(_PMBase):
         prefs = _prefs(context)
         if not prefs or not prefs.library_path:
             return _report(self, False, "插件库未就绪")
-        bridge.unregister_library(prefs.library_path, save=True)
+        result = scoped_management.deactivate(prefs.library_path)
+        if result["state"] == "ERROR":
+            return _report(self, False, f"停止管理时存在失败: {result['failures'][:3]}")
         if bridge.is_registered(prefs.library_path):
             return _report(self, False, "撤销挂载未完全生效")
         return _report(self, True, "已撤销挂载（插件文件保留在库中）")
@@ -328,6 +334,10 @@ class PM_OT_toggle(_PMBase):
         rec["last_error"] = "" if ok else (err or "未知错误")
         db.save()
         if ok:
+            try:
+                scoped_management.record_activation(prefs.library_path, key, self.enable)
+            except Exception as exc:
+                return _report(self, False, f"插件状态已改变，但设备启用清单保存失败: {exc}")
             verb = "已启用" if self.enable else "已停用"
             return _report(self, True, f"{verb}: {library.effective_name(rec)}")
         return _report(self, False, f"操作失败: {err}")
@@ -579,6 +589,7 @@ class PM_OT_apply_startup(_PMBase):
                                           disable_unmarked=self.disable_unmarked)
         finally:
             _clear_status()
+        sync_error = _sync_device_config(prefs)
         from . import items
 
         items.rebuild_items(prefs)
@@ -588,7 +599,9 @@ class PM_OT_apply_startup(_PMBase):
         if stats["failed"]:
             bpy.ops.plugin_manager.show_report()
             msg += f"，{len(stats['failed'])} 个失败（见报告）"
-        return _report(self, not stats["failed"], msg)
+        if sync_error:
+            msg += f"；设备配置保存失败: {sync_error}"
+        return _report(self, not stats["failed"] and not sync_error, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -713,12 +726,16 @@ class PM_OT_batch_enable(_PMBase):
             ok_n += 1 if ok else 0
             fail_n += 0 if ok else 1
         db.save()
+        sync_error = _sync_device_config(prefs)
         from . import items
 
         items.rebuild_items(prefs)
         verb = "启用" if self.value else "停用"
         _redraw()
-        return _report(self, True, f"已批量{verb} {ok_n} 个" + (f"，{fail_n} 个失败" if fail_n else ""))
+        msg = f"已批量{verb} {ok_n} 个" + (f"，{fail_n} 个失败" if fail_n else "")
+        if sync_error:
+            return _report(self, False, msg + f"；设备配置保存失败: {sync_error}")
+        return _report(self, True, msg)
 
 
 class PM_OT_batch_set_category(_PMBase):
@@ -808,7 +825,9 @@ class PM_OT_enable_pack(_PMBase):
             count += 1 if ok else 0
             fail += 0 if ok else 1
         db.save()
-        return _report(self, True, f"已启用 {count} 个插件" + (f"，{fail} 个失败" if fail else ""))
+        sync_error = _sync_device_config(prefs)
+        msg = f"已启用 {count} 个插件" + (f"，{fail} 个失败" if fail else "")
+        return _report(self, not sync_error, msg + (f"；设备配置保存失败: {sync_error}" if sync_error else ""))
 
 
 class PM_OT_disable_pack(_PMBase):
@@ -830,7 +849,9 @@ class PM_OT_disable_pack(_PMBase):
             rec["enabled"] = bridge.is_module_enabled(rec.get("module", ""))
             count += 1 if ok else 0
         db.save()
-        return _report(self, True, f"已停用 {count} 个插件")
+        sync_error = _sync_device_config(prefs)
+        msg = f"已停用 {count} 个插件"
+        return _report(self, not sync_error, msg + (f"；设备配置保存失败: {sync_error}" if sync_error else ""))
 
 
 # ---------------------------------------------------------------------------

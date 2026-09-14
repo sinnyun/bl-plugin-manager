@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import json
 import sys
 
 import addon_utils
@@ -87,67 +86,6 @@ def _repo_directory(repo) -> str:
     return getattr(repo, "custom_directory", "") or getattr(repo, "directory", "")
 
 
-def _repo_attrs(repo) -> dict:
-    """Capture user-visible repository settings before an explicit rewire."""
-    attrs = {"module": getattr(repo, "module", ""),
-             "name": getattr(repo, "name", ""),
-             "directory": getattr(repo, "directory", ""),
-             "custom_directory": getattr(repo, "custom_directory", ""),
-             "remote_url": getattr(repo, "remote_url", ""),
-             "enabled": bool(getattr(repo, "enabled", True)),
-             "use_custom_directory": bool(getattr(repo, "use_custom_directory", False)),
-             "use_remote_url": bool(getattr(repo, "use_remote_url", False))}
-    return attrs
-
-
-def _official_snapshot_path(root: str) -> str:
-    return os.path.join(library_dirs(root)["meta"], "official_repo_backup.json")
-
-
-def capture_official_repo_state(root: str) -> dict:
-    """Persist the official repository configuration for a reversible unification."""
-    _idx, repo = find_official_repo()
-    state = {"exists": repo is not None,
-             "repo": _repo_attrs(repo) if repo is not None else None}
-    os.makedirs(library_dirs(root)["meta"], exist_ok=True)
-    path = _official_snapshot_path(root)
-    if not os.path.isfile(path):
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, ensure_ascii=False, indent=2)
-    return state
-
-
-def restore_official_repo_state(root: str) -> tuple[bool, str]:
-    """Restore an official repository snapshot created by explicit unification."""
-    path = _official_snapshot_path(root)
-    if not os.path.isfile(path):
-        return True, ""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
-        _idx, current = find_official_repo()
-        target = os.path.join(os.path.abspath(root), C.DIR_EXTENSIONS)
-        current_points_here = current is not None and _norm(_repo_directory(current)) == _norm(target)
-        if not current_points_here:
-            return True, ""
-        original = state.get("repo") if state.get("exists") else None
-        if original is None:
-            if current is not None:
-                bpy.context.preferences.extensions.repos.remove(current)
-        else:
-            for key in ("name", "directory", "custom_directory", "remote_url",
-                        "enabled", "use_custom_directory", "use_remote_url"):
-                if key in original:
-                    try:
-                        setattr(current, key, original[key])
-                    except Exception:
-                        pass
-        os.remove(path)
-        return True, ""
-    except Exception as exc:
-        return False, f"恢复官方仓库配置失败: {exc}"
-
-
 # 官方商店仓库的模块名（Blender 内置，指向 extensions.blender.org）
 OFFICIAL_REPO_MODULE = "blender_org"
 OFFICIAL_SOURCE_URL = "https://extensions.blender.org/api/v1/extensions/"
@@ -170,14 +108,9 @@ def unify_store_with_library(root: str) -> dict:
     os.makedirs(ext_dir, exist_ok=True)
     out = {"official": False, "removed_pmlib": False, "online": False}
 
-    # 1) 官方商店仓库指向库的 extensions. 这是显式操作，先保存原配置。
+    # 1) 官方商店仓库指向库的 extensions. 停用时按版本默认值重置，
+    # 不创建易过期、也可能误恢复其它设置的全局偏好快照。
     idx, repo = find_official_repo()
-    target = _norm(ext_dir)
-    if repo is None or _norm(_repo_directory(repo)) != target:
-        try:
-            capture_official_repo_state(root)
-        except Exception as exc:
-            print("[插件库] 保存官方仓库配置失败:", exc)
     if repo is not None:
         try:
             repo.enabled = True
@@ -211,12 +144,12 @@ def unify_store_with_library(root: str) -> dict:
             except Exception:
                 pass
 
-    # 3) 开启"允许联网访问"（安装/更新扩展所需）
+    # 3) Read online status for reporting only.  It belongs to Blender's
+    # system settings and is outside the manager's three permitted scopes.
     try:
-        bpy.context.preferences.system.use_online_access = True
         out["online"] = bool(bpy.context.preferences.system.use_online_access)
-    except Exception as exc:
-        print("[插件库] 开启联网访问失败:", exc)
+    except Exception:
+        out["online"] = False
 
     refresh_blender()
     return out
@@ -288,124 +221,105 @@ def managed_library_root() -> str:
     return _MANAGED_LIBRARY_ROOT
 
 
-# ---------------------------------------------------------------------------
-# 注册 / 注销
-# ---------------------------------------------------------------------------
-def register_library(root: str, save: bool = True) -> dict:
-    """把插件库挂到 Blender 上：库根作为脚本目录，extensions 作为扩展仓库。
+def set_managed_library_root(root: str) -> None:
+    global _MANAGED_LIBRARY_ROOT
+    _MANAGED_LIBRARY_ROOT = os.path.abspath(root) if root else ""
+    invalidate_state_cache()
 
-    普通挂载只使用本插件自己的本地 pmlib 仓库，不会隐式改写 Blender
-    官方商店仓库；需要让官方商店与库共用目录时，使用显式的「统一商店」操作。
+
+_SCOPED_REPO_ATTRS = (
+    "name", "module", "remote_url", "custom_directory", "enabled",
+    "use_custom_directory", "use_remote_url",
+)
+
+
+def capture_scoped_configuration() -> dict:
+    """Read only the repository and custom-script-directory scopes we own."""
+    repositories = []
+    for repo in bpy.context.preferences.extensions.repos:
+        repositories.append({key: getattr(repo, key, "") for key in _SCOPED_REPO_ATTRS})
+    script_directories = [
+        {"name": getattr(item, "name", ""),
+         "directory": getattr(item, "directory", "")}
+        for item in _script_dirs()
+    ]
+    return {"repositories": repositories, "script_directories": script_directories}
+
+
+def apply_scoped_configuration(config: dict) -> None:
+    """Replace only repositories and custom script directories from a profile."""
+    repos = bpy.context.preferences.extensions.repos
+    for repo in list(repos):
+        if getattr(repo, "module", "") not in C.BUILTIN_REPO_MODULES:
+            repos.remove(repo)
+    for record in config.get("repositories", []):
+        module = record.get("module", "")
+        _idx, repo = find_repo(module=module) if module in C.BUILTIN_REPO_MODULES else (-1, None)
+        if repo is None:
+            repo = repos.new(name=record.get("name", ""), module=module)
+        for key in _SCOPED_REPO_ATTRS:
+            if key in {"name", "module"} or key not in record:
+                continue
+            try:
+                setattr(repo, key, record[key])
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+    scripts = _script_dirs()
+    for item in list(scripts):
+        scripts.remove(item)
+    for record in config.get("script_directories", []):
+        item = scripts.new()
+        item.name = record.get("name", "")
+        item.directory = record.get("directory", "")
+    invalidate_state_cache()
+    refresh_blender()
+
+
+def reset_scoped_configuration() -> None:
+    """Restore Blender defaults only inside the three managed preference scopes.
+
+    Repository entries owned by Blender are preserved.  The official repository
+    is reset to its factory URL/directory behavior; custom repositories and all
+    custom script directories are removed.  Online access and every unrelated
+    preference category are deliberately untouched.
     """
-    global _MANAGED_LIBRARY_ROOT
-    dirs = ensure_library_dirs(root)
-    if _MANAGED_LIBRARY_ROOT and _norm(_MANAGED_LIBRARY_ROOT) != _norm(dirs["root"]):
-        unregister_library(_MANAGED_LIBRARY_ROOT, save=False)
-    os.makedirs(dirs["extensions"], exist_ok=True)
-
-    si, _ = find_script_dir(dirs["root"])
-    if si < 0:
-        item = _script_dirs().new()
-        item.name = f"{C.ADDON_NAME} - {os.path.basename(dirs['root'])}"
-        item.directory = dirs["root"]
-
-    # 普通挂载不得隐式接管官方商店。复用已经指向本库的仓库，
-    # 否则使用/创建本插件自己的 pmlib 仓库。
-    ri, repo = find_repo(module="", directory=dirs["extensions"])
-    if ri < 0:
-        _, repo = find_repo(module=C.REPO_MODULE)
-    if repo is None:
-        repo = bpy.context.preferences.extensions.repos.new(
-            name=C.REPO_NAME, module=C.REPO_MODULE
-        )
-    repo_module = getattr(repo, "module", "")
-    if repo_module == C.REPO_MODULE:
-        repo.enabled = True
-        repo.use_custom_directory = True
-        repo.custom_directory = dirs["extensions"]
-        # The pmlib repository is a local index used for module discovery.
-        # Do not give it the official remote URL: Blender's global sync then
-        # tries to refresh an uninitialized local cache and reports a
-        # misleading "not a known repo" error.  The explicit Store/Unify
-        # actions own the official remote repository instead.
-        repo.use_remote_url = False
-        repo.remote_url = ""
-
-    refresh_blender()
-    if save:
-        save_prefs()
-    state = library_state(dirs["root"])
-    if state["script_dir"] and state["repo"]:
-        _MANAGED_LIBRARY_ROOT = dirs["root"]
-    return state
-
-
-def unregister_library(root: str, save: bool = True) -> None:
-    """从 Blender 撤销挂载（注意：这两个集合的 remove 接收条目对象，不是索引）。"""
-    dirs = library_dirs(root)
-    _, sd_item = find_script_dir(dirs["root"])
-    if sd_item is not None:
+    repos = bpy.context.preferences.extensions.repos
+    for repo in list(repos):
+        if getattr(repo, "module", "") not in C.BUILTIN_REPO_MODULES:
+            repos.remove(repo)
+    _idx, official = find_official_repo()
+    if official is None:
+        official = repos.new(name="extensions.blender.org", module=OFFICIAL_REPO_MODULE)
+    defaults = {
+        "name": "extensions.blender.org",
+        "use_custom_directory": False,
+        "use_remote_url": True,
+        "remote_url": OFFICIAL_SOURCE_URL,
+        "custom_directory": "",
+        "enabled": True,
+    }
+    for key, value in defaults.items():
         try:
-            _script_dirs().remove(sd_item)
-        except Exception as exc:
-            print("[插件库] 移除脚本目录失败:", exc)
-    _, repo = find_repo(module=C.REPO_MODULE)
-    if repo is not None and _norm(_repo_directory(repo)) == _norm(dirs["extensions"]):
-        try:
-            bpy.context.preferences.extensions.repos.remove(repo)
-        except Exception as exc:
-            print("[插件库] 移除扩展仓库失败:", exc)
-    ok, err = restore_official_repo_state(root)
-    if not ok:
-        print("[插件库]", err)
+            setattr(official, key, value)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    scripts = _script_dirs()
+    for item in list(scripts):
+        scripts.remove(item)
+    invalidate_state_cache()
     refresh_blender()
-    global _MANAGED_LIBRARY_ROOT
-    if _MANAGED_LIBRARY_ROOT and _norm(_MANAGED_LIBRARY_ROOT) == _norm(dirs["root"]):
-        _MANAGED_LIBRARY_ROOT = ""
-    if save:
-        save_prefs()
-
-
-def unregister_managed_library(save: bool = True) -> None:
-    """Remove the mounts owned by the current manager session, if any."""
-    if _MANAGED_LIBRARY_ROOT:
-        unregister_library(_MANAGED_LIBRARY_ROOT, save=save)
-
-
-def cleanup_orphaned_mounts(save: bool = True) -> None:
-    """Remove mounts left by an older manager session with no local path.
-
-    Only entries with this add-on's script-directory naming convention and
-    its reserved ``pmlib`` repository module are touched.  Native Blender and
-    user-created script directories/repositories remain untouched.
-    """
-    global _MANAGED_LIBRARY_ROOT
-    prefix = f"{C.ADDON_NAME} - "
-    roots = []
-    try:
-        roots = [item.directory for item in _script_dirs()
-                 if getattr(item, "name", "").startswith(prefix) and getattr(item, "directory", "")]
-    except Exception:
-        pass
-    for root in roots:
-        unregister_library(root, save=False)
-    try:
-        for repo in list(bpy.context.preferences.extensions.repos):
-            if getattr(repo, "module", "") == C.REPO_MODULE:
-                bpy.context.preferences.extensions.repos.remove(repo)
-    except Exception:
-        pass
-    _MANAGED_LIBRARY_ROOT = ""
-    refresh_blender()
-    if save:
-        save_prefs()
 
 
 def save_prefs() -> None:
-    try:
-        bpy.ops.wm.save_userpref()
-    except Exception:
-        pass
+    """Compatibility hook; scoped management never saves global preferences.
+
+    Blender serializes every preference category through ``save_userpref``.
+    Calling it from this add-on would make repository/path maintenance capable
+    of persisting unrelated UI, keymap and system changes.  The user may save
+    preferences through Blender itself when desired.
+    """
+    return None
 
 
 def refresh_blender(full: bool = True, deep: bool = False) -> None:

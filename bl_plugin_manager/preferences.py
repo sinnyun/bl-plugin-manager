@@ -87,20 +87,42 @@ def _on_library_path_update(self, context):
     """Persist only the machine-local path; activation owns scanning/mounting."""
     if _LOADING_MACHINE_PATH:
         return
-    # A blank or changed path means this computer is no longer using the
-    # previous library.  Remove its Blender discovery entries immediately so
-    # disabled library plugins do not keep appearing in Preferences.
-    previous = bridge.managed_library_root()
-    if previous and os.path.normcase(os.path.abspath(previous)) != os.path.normcase(
-            os.path.abspath(self.library_path or "")):
-        bridge.unregister_managed_library(save=True)
     try:
         from .storage import machine_config
-        machine_config.save({"library_path": self.library_path or None})
+        local = machine_config.load()
+        previous = local.get("library_path")
+        changed = previous and os.path.normcase(os.path.abspath(previous)) != os.path.normcase(
+            os.path.abspath(self.library_path or ""))
+        if changed and local.get("management_enabled"):
+            from . import scoped_management
+            scoped_management.deactivate(previous)
+        machine_config.save({"library_path": self.library_path or None,
+                             "management_enabled": False if changed else local.get("management_enabled", False)})
     except Exception as exc:
         print("[插件库] 保存本机插件库路径失败:", exc)
     from . import items
     items.maybe_rebuild(self, force=True)
+
+
+def _on_device_name_update(self, context):
+    if _LOADING_MACHINE_PATH or not self.device_name.strip():
+        return
+    try:
+        from .storage import machine_config
+        from .storage.device_profiles import DeviceProfileStore
+        local = machine_config.load()
+        machine_config.save({"device_name": self.device_name.strip()})
+        root = local.get("library_path")
+        if root and os.path.isdir(root):
+            store = DeviceProfileStore(root)
+            if store.exists(local["device_id"]):
+                profile = store.load(local["device_id"])
+                store.save(local["device_id"], self.device_name.strip(),
+                           profile["enabled_plugins"],
+                           repositories=profile["repositories"],
+                           script_directories=profile["script_directories"])
+    except Exception as exc:
+        print("[插件库] 保存设备名称失败:", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +138,13 @@ class PMAddonPreferences(AddonPreferences):
         default="",
         options={"SKIP_SAVE"},
         update=_on_library_path_update,
+    )
+    device_name: StringProperty(
+        name="设备名称",
+        description="此电脑在同步插件库中的显示名称；启用插件清单按设备分别保存",
+        default="",
+        options={"SKIP_SAVE"},
+        update=_on_device_name_update,
     )
     # 界面状态
     selected_key: StringProperty(default="")
@@ -163,6 +192,12 @@ class PMAddonPreferences(AddonPreferences):
     def draw(self, context):
         layout = self.layout
         col = layout.column()
+        col.prop(self, "device_name")
+        try:
+            from .storage import machine_config
+            col.label(text=f"设备 ID: {machine_config.load()['device_id'][:12]}")
+        except Exception:
+            pass
         col.prop(self, "library_path")
         row = col.row(align=True)
         row.operator("plugin_manager.setup_library", icon="LINKED")

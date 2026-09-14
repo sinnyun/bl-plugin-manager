@@ -31,6 +31,7 @@ from . import (
     migrate,
     operators,
     preferences,
+    scoped_management,
     scan,
     store,
     ui,
@@ -40,7 +41,7 @@ from . import (
 
 # 支持在 Blender 文本编辑器中热重载
 if _PM_WAS_IMPORTED:  # pragma: no cover
-    for _mod in (C, scan, db, bridge, library, store, updates, migrate, watcher,
+    for _mod in (C, scan, db, bridge, scoped_management, library, store, updates, migrate, watcher,
                  items, preferences, operators, ui):
         importlib.reload(_mod)
 
@@ -48,56 +49,43 @@ _modules = (preferences, operators, ui)
 _registered = []
 
 
-def _apply_startup_on_launch():
-    """启动时按「自启」标记同步（仅在偏好里开启时执行）。
-
-    默认只启用标记为自启的插件，不主动停用其它插件，避免误关。
-    作为定时器延迟执行，等 Blender 初始化完成后再动插件状态。
-    """
-    prefs = bridge.get_prefs()
-    if not prefs or not prefs.library_path:
-        return None
-    if not getattr(prefs, "sync_startup_on_launch", False):
-        return None
+def _sync_manager_state():
+    """Mirror native-panel changes into the active device profile."""
     try:
-        lib_db = db.LibraryDB(prefs.library_path)
-        stats = library.apply_startup(
-            prefs.library_path, lib_db,
-            enable_marked=True,
-            disable_unmarked=bool(getattr(prefs, "startup_disable_unmarked", False)),
-        )
-        print(f"[插件库] 启动同步自启: 启用 {stats['enabled']}，"
-              f"停用 {stats['disabled']}，失败 {len(stats['failed'])}")
+        from .storage import machine_config
+        local = machine_config.load()
+        root = local.get("library_path")
+        if local.get("management_enabled") and root and os.path.isdir(root):
+            scoped_management.sync_to_profile(root)
     except Exception as exc:
-        print("[插件库] 启动同步失败:", exc)
-    return None
+        print("[插件库] 同步原生配置失败:", exc)
+    return 2.0
 
 
 def _bootstrap_prefs():
-    """库目录已存在时自动同步并重新挂载。
-
-    库目录存在即代表用户已确认使用该库，因此在（例如升级 Blender 后的）新版本里
-    启用本插件时，自动把库重新注册为脚本目录与扩展仓库，无需手动点击。
-    """
+    """Load machine-local identity and resume only an explicitly active library."""
     prefs = bridge.get_prefs()
+    local = None
     if prefs:
         try:
             from .storage import machine_config
             local = machine_config.load()
             path = local.get("library_path")
-            if path:
-                preferences._LOADING_MACHINE_PATH = True
-                try:
+            preferences._LOADING_MACHINE_PATH = True
+            try:
+                prefs.device_name = local.get("device_name", "")
+                if path:
                     prefs.library_path = path
-                finally:
-                    preferences._LOADING_MACHINE_PATH = False
+            finally:
+                preferences._LOADING_MACHINE_PATH = False
         except Exception as exc:
             print("[插件库] 读取本机插件库路径失败:", exc)
-    if not prefs or not prefs.library_path:
-        bridge.cleanup_orphaned_mounts(save=True)
+    if not prefs or not local or not local.get("management_enabled"):
         return
     if not os.path.isdir(prefs.library_path):
-        bridge.cleanup_orphaned_mounts(save=True)
+        bridge.reset_scoped_configuration()
+        machine_config.save({"management_enabled": False})
+        print("[插件库] 已配置的库不可用；仅将受管仓库和脚本路径恢复为默认")
         return
     try:
         bridge.ensure_library_dirs(prefs.library_path)
@@ -106,9 +94,9 @@ def _bootstrap_prefs():
         if report.status == "CORRUPT":
             print("[插件库] 元数据损坏，已保持只读，跳过自动扫描")
             return
-        if not bridge.is_registered(prefs.library_path):
-            bridge.register_library(prefs.library_path, save=True)
-            print("[插件库] 已自动挂载插件库")
+        result = scoped_management.activate(prefs.library_path)
+        if result["state"] == "ERROR":
+            print("[插件库] 恢复设备配置时存在失败:", result["failures"])
         library.sync_library(prefs.library_path, db.LibraryDB(prefs.library_path, use_cache=False))
     except Exception as exc:
         print("[插件库] 初始化库失败:", exc)
@@ -136,11 +124,11 @@ def register():
         raise
     # 启动同步：延迟执行，等 Blender 初始化完成（仅当偏好开启时生效）
     try:
-        bpy.app.timers.unregister(_apply_startup_on_launch)
+        bpy.app.timers.unregister(_sync_manager_state)
     except Exception:
         pass
     try:
-        bpy.app.timers.register(_apply_startup_on_launch, first_interval=2.0)
+        bpy.app.timers.register(_sync_manager_state, first_interval=2.0, persistent=True)
     except Exception:
         pass
     print(f"[插件库] 已启用 v{C.ADDON_VERSION_STR}（投放区为手动扫描）")
@@ -148,19 +136,17 @@ def register():
 
 def unregister():
     try:
-        bpy.app.timers.unregister(_apply_startup_on_launch)
+        bpy.app.timers.unregister(_sync_manager_state)
     except Exception:
         pass
-    # Disabling the manager must restore Blender's native discovery state.
-    # Otherwise the old script directory and pmlib repository keep exposing
-    # every library plugin in Blender's own Preferences panel.
     try:
-        root = bridge.managed_library_root()
-        if not root:
-            prefs = bridge.get_prefs()
-            root = getattr(prefs, "library_path", "") if prefs else ""
-        if root:
-            bridge.unregister_library(root, save=True)
+        from .storage import machine_config
+        local = machine_config.load()
+        root = local.get("library_path")
+        if local.get("management_enabled") and root:
+            result = scoped_management.deactivate(root)
+            if result["state"] == "ERROR":
+                print("[插件库] 停用时存在失败:", result["failures"])
     except Exception as exc:
         print("[插件库] 撤销插件库挂载失败:", exc)
     header.unregister()

@@ -15,6 +15,20 @@ def _module():
 
 
 class MachineConfigTests(unittest.TestCase):
+    def test_path_and_name_changes_preserve_device_identity(self):
+        from unittest.mock import patch
+        mod = _module()
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            'BL_PLUGIN_MANAGER_MACHINE_CONFIG': str(Path(root) / 'machine.json'),
+        }):
+            mod.save({'library_path': 'D:/library'})
+            identity = mod.load()['device_id']
+            mod.save({'library_path': 'E:/library', 'device_name': '工作站',
+                      'management_enabled': True})
+            self.assertEqual(identity, mod.load()['device_id'])
+            self.assertEqual('工作站', mod.load()['device_name'])
+            self.assertTrue(mod.load()['management_enabled'])
+
     def test_round_trip_and_only_allowed_fields(self):
         mod = _module()
         with tempfile.TemporaryDirectory() as root:
@@ -32,6 +46,7 @@ class MachineConfigTests(unittest.TestCase):
             self.assertEqual(loaded["library_path"], "\\\\server\\共享\\插件")
             self.assertNotIn("unexpected", loaded)
             self.assertTrue(loaded["device_id"])
+            self.assertFalse(loaded["management_enabled"])
 
     def test_corrupt_config_returns_unconfigured_without_overwriting(self):
         mod = _module()
