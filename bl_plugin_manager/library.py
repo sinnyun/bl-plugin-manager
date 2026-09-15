@@ -481,14 +481,24 @@ def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
 
     if db.data.get("schema") == 2 and db.data.get("library_id"):
         portable = []
+        runtime_modules = {}
+        module_index = bridge._module_index()
+        active_repo = bridge._active_repo_module()
         for kind, base in ((C.KIND_ADDON, os.path.join(root, C.DIR_ADDONS)),
                            (C.KIND_EXTENSION, os.path.join(root, C.DIR_EXTENSIONS))):
             for entry in scan.scan_dir(base, kind_hint=kind):
                 if not entry["valid"]:
                     continue
                 meta = entry["meta"] or {}
+                key = rel_key(root, entry["abs"])
+                module = module_index.get(bridge._norm(entry["abs"]))
+                if not module:
+                    folder = os.path.basename(os.path.normpath(entry["abs"]))
+                    module = (f"bl_ext.{active_repo}.{folder}"
+                              if kind == C.KIND_EXTENSION else folder)
+                runtime_modules[key] = module
                 portable.append({
-                    "key": rel_key(root, entry["abs"]),
+                    "key": key,
                     "kind": kind,
                     "rel": rel_key(root, entry["abs"]),
                     "id": meta.get("id", ""),
@@ -501,6 +511,18 @@ def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
         stats["added"] = len(set(new) - old_keys)
         stats["updated"] = len(set(new) & old_keys)
         stats["missing"] = len(old_keys - set(new))
+        for key, record in db.plugins.items():
+            module = runtime_modules.get(key)
+            if module:
+                record["module"] = module
+                record["enabled"] = bridge.is_module_enabled(module)
+                record["missing"] = False
+            else:
+                record["missing"] = True
+        # merge_scan writes portable metadata first; this second save splits
+        # the derived fields into the environment-local state file while
+        # keeping the shared library database machine-independent.
+        db.save()
         return stats
 
     # 一次性建立模块索引，供本函数内所有记录解析复用

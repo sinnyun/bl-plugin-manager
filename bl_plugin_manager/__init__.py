@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 0, 0),
+    "version": (2, 0, 1),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",

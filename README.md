@@ -47,7 +47,7 @@ BlenderPluginLibrary/
 python build_zip.py
 ```
 
-在 Blender 中打开“编辑 → 偏好设置 → 插件 → 从磁盘安装”，选择 `dist/bl_plugin_manager-2.0.0.zip`。
+在 Blender 中打开“编辑 → 偏好设置 → 插件 → 从磁盘安装”，选择最新的 `dist/bl_plugin_manager-<版本>.zip`。
 
 本机开发安装前先关闭所有 Blender 窗口，再运行：
 
@@ -125,11 +125,12 @@ powershell -ExecutionPolicy Bypass -File _test/run_e2e.ps1
 
 详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-14-scoped-management-design.md` 和 `docs/superpowers/plans/2026-09-14-scoped-management.md`。
 
-## 2.0.0 交付状态（2026-09-15）
+## 2.0.1 修复状态（2026-09-15）
 
 - Python 单元测试：40 项通过，1 项按运行条件跳过。
-- Blender 隔离回归：16/16 通过。
+- Blender 隔离回归：18/18 通过，新增 schema 2 模块解析与共享字段隔离检查。
 - Blender 隔离端到端：166/166 通过。
 - 测试前后真实 Blender 5.2 `userpref.blend` SHA-256 均为 `6015931B9E7BF51E647A18CECD921C6A79FE33063EA224BF814EB751E631B5ED`。
-- 已事务式安装至本机 Blender 4.5 和 5.2；两处安装的 29 个发行文件与源码逐文件一致。
-- 安装包：`dist/bl_plugin_manager-2.0.0.zip`，SHA-256 为 `B12ACCD17A6CFC7FEA878A379B5764BD2874F7C58DA4E79C45C00C82904071FF`。
+- 2.0.1 安装包包含 29 个发行文件，已验证不含缓存或编译产物。
+- 2.0.1 修复了全新 schema 2 数据库扫描后本机模块名未落盘、单独启用插件提示“无法解析插件模块名”的问题。
+- 安装包：`dist/bl_plugin_manager-2.0.1.zip`，SHA-256 为 `139709E09416F1FF99FC408F94135F67BBE7B0933078F8DE61AD9F4005E5D6C5`。

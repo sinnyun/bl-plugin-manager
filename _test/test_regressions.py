@@ -21,6 +21,7 @@ import bpy  # type: ignore
 
 from bl_plugin_manager import bridge, constants as C, library, ui
 from bl_plugin_manager.db import LibraryDB
+from bl_plugin_manager.storage.shared_db import SharedDatabase
 
 
 def _assert_isolated_runtime() -> None:
@@ -156,6 +157,25 @@ def case_cache_isolation(root: str) -> None:
           str(loaded))
 
 
+def case_schema2_scan_persists_local_module(root: str) -> None:
+    """A fresh schema-2 scan must resolve module names into local state."""
+    schema_root = root + "_schema2"
+    SharedDatabase(schema_root).initialize()
+    plugin = os.path.join(schema_root, C.DIR_ADDONS, "blender_mcp")
+    _write_legacy(plugin, "MCP for Blender", (1, 6))
+
+    library.sync_library(schema_root, LibraryDB(schema_root, use_cache=False))
+    record = LibraryDB(schema_root, use_cache=False).get("addons/blender_mcp")
+    check("schema2 scan resolves MCP module locally",
+          record is not None and record.get("module") == "blender_mcp", str(record))
+
+    with open(os.path.join(schema_root, C.DIR_META, C.DB_FILENAME),
+              "r", encoding="utf-8") as fh:
+        shared_record = json.load(fh)["plugins"]["addons/blender_mcp"]
+    check("schema2 shared record excludes machine module",
+          "module" not in shared_record, str(shared_record))
+
+
 def case_mount_state_signature(root: str) -> None:
     """Changing registered paths without changing collection sizes invalidates state."""
     if not hasattr(bpy.context.preferences, "extensions"):
@@ -285,6 +305,7 @@ def main() -> int:
         ("failed trash move", case_failed_trash_move),
         ("same-version metadata", case_same_version_metadata_refresh),
         ("cache isolation", case_cache_isolation),
+        ("schema2 local module", case_schema2_scan_persists_local_module),
         ("mount state signature", case_mount_state_signature),
         ("repository target", case_repository_target_selection),
         ("list compatibility display", case_list_compatibility_display),
