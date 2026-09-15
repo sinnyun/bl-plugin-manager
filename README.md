@@ -124,3 +124,12 @@ powershell -ExecutionPolicy Bypass -File _test/run_e2e.ps1
 ```
 
 详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-14-scoped-management-design.md` 和 `docs/superpowers/plans/2026-09-14-scoped-management.md`。
+
+## 2.0.0 交付状态（2026-09-15）
+
+- Python 单元测试：40 项通过，1 项按运行条件跳过。
+- Blender 隔离回归：16/16 通过。
+- Blender 隔离端到端：166/166 通过。
+- 测试前后真实 Blender 5.2 `userpref.blend` SHA-256 均为 `6015931B9E7BF51E647A18CECD921C6A79FE33063EA224BF814EB751E631B5ED`。
+- 已事务式安装至本机 Blender 4.5 和 5.2；两处安装的 29 个发行文件与源码逐文件一致。
+- 安装包：`dist/bl_plugin_manager-2.0.0.zip`，SHA-256 为 `B12ACCD17A6CFC7FEA878A379B5764BD2874F7C58DA4E79C45C00C82904071FF`。
