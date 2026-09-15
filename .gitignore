@@ -1,8 +1,10 @@
 __pycache__/
 *.py[cod]
 
-# Local Blender migration artifacts
-_migrate/
+# Local Blender migration runtime artifacts
+_migrate/backups/
+_migrate/*.json
+_migrate/*.txt
 
 # Generated release archives (the source tree is the canonical distribution)
 dist/
