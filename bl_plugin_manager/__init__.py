@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 0, 1),
+    "version": (2, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -24,8 +24,8 @@ import bpy
 from . import constants as C
 from . import (
     bridge,
+    compat_task,
     db,
-    header,
     items,
     library,
     migrate,
@@ -42,7 +42,7 @@ from . import (
 # 支持在 Blender 文本编辑器中热重载
 if _PM_WAS_IMPORTED:  # pragma: no cover
     for _mod in (C, scan, db, bridge, scoped_management, library, store, updates, migrate, watcher,
-                 items, preferences, operators, ui):
+                 items, compat_task, preferences, operators, ui):
         importlib.reload(_mod)
 
 _modules = (preferences, operators, ui)
@@ -102,6 +102,22 @@ def _bootstrap_prefs():
         print("[插件库] 初始化库失败:", exc)
 
 
+def _apply_launch_sync():
+    """仅当偏好开启时，按库内「自启」标记同步一次插件启用状态。"""
+    prefs = bridge.get_prefs()
+    if not prefs or not prefs.sync_startup_on_launch or not prefs.library_path:
+        return
+    try:
+        from .db import LibraryDB
+        library.apply_startup(prefs.library_path, LibraryDB(prefs.library_path),
+                              enable_marked=True,
+                              disable_unmarked=prefs.startup_disable_unmarked)
+        from . import items
+        items.rebuild_items(prefs)
+    except Exception as exc:
+        print("[插件库] 启动同步自启状态失败:", exc)
+
+
 def register():
     try:
         for mod in _modules:
@@ -109,10 +125,9 @@ def register():
                 bpy.utils.register_class(cls)
                 _registered.append(cls)
         _bootstrap_prefs()
-        header.register()
     except Exception:
         try:
-            header.unregister()
+            operators.shutdown_compat_task()
         except Exception:
             pass
         for cls in reversed(_registered):
@@ -131,6 +146,15 @@ def register():
         bpy.app.timers.register(_sync_manager_state, first_interval=2.0, persistent=True)
     except Exception:
         pass
+    # 启动同步策略：等 Blender 与库加载就绪后执行一次（仅当偏好开启时生效）
+    try:
+        bpy.app.timers.unregister(_apply_launch_sync)
+    except Exception:
+        pass
+    try:
+        bpy.app.timers.register(_apply_launch_sync, first_interval=2.5)
+    except Exception:
+        pass
     print(f"[插件库] 已启用 v{C.ADDON_VERSION_STR}（投放区为手动扫描）")
 
 
@@ -139,6 +163,14 @@ def unregister():
         bpy.app.timers.unregister(_sync_manager_state)
     except Exception:
         pass
+    try:
+        bpy.app.timers.unregister(_apply_launch_sync)
+    except Exception:
+        pass
+    try:
+        operators.shutdown_compat_task()
+    except Exception as exc:
+        print("[插件库] 关闭兼容性测试任务失败:", exc)
     try:
         from .storage import machine_config
         local = machine_config.load()
@@ -149,7 +181,6 @@ def unregister():
                 print("[插件库] 停用时存在失败:", result["failures"])
     except Exception as exc:
         print("[插件库] 撤销插件库挂载失败:", exc)
-    header.unregister()
     for cls in reversed(_registered):
         try:
             bpy.utils.unregister_class(cls)

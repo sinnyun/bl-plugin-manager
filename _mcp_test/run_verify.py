@@ -9,7 +9,7 @@ import bpy
 import bl_plugin_manager as PM
 
 for n in ("scan", "db", "bridge", "library", "store", "updates", "migrate",
-          "watcher", "items", "preferences", "operators", "ui", "header"):
+          "watcher", "items", "preferences", "operators", "ui"):
     try:
         importlib.reload(getattr(PM, n))
     except Exception:
@@ -30,11 +30,6 @@ try:
                 bpy.utils.register_class(cls)
             except Exception:
                 pass
-    try:
-        PM.header.unregister()
-    except Exception:
-        pass
-    PM.header.register()
 finally:
     sys.stdout, sys.stderr = _o2, _e2
 

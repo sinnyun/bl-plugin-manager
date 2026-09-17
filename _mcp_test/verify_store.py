@@ -13,7 +13,7 @@ out = {}
 import importlib
 import bl_plugin_manager as PM
 for name in ("constants", "scan", "db", "bridge", "library", "store", "updates",
-             "migrate", "watcher", "items", "preferences", "operators", "ui", "header"):
+             "migrate", "watcher", "items", "preferences", "operators", "ui"):
     mod = getattr(PM, name, None)
     if mod is None:
         try:
@@ -41,11 +41,6 @@ try:
                 bpy.utils.register_class(cls)
             except Exception:
                 pass
-    try:
-        PM.header.unregister()
-    except Exception:
-        pass
-    PM.header.register()
     out["reregister"] = "ok"
 except Exception as e:
     out["reregister"] = f"ERR {e}"

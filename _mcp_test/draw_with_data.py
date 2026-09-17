@@ -7,9 +7,8 @@ import bpy
 
 import bl_plugin_manager.ui as ui
 
-calls = {"panel": 0, "tools": 0, "list": 0, "list_error": 0}
+calls = {"panel": 0, "list": 0, "list_error": 0}
 orig_panel = ui.PM_PT_main.draw
-orig_tools = ui.PM_PT_tools.draw
 orig_item = ui.PM_UL_plugins.draw_item
 captured = []
 
@@ -18,10 +17,6 @@ def w_panel(self, context):
     calls["panel"] += 1
     return orig_panel(self, context)
 
-
-def w_tools(self, context):
-    calls["tools"] += 1
-    return orig_tools(self, context)
 
 
 def w_item(self, context, layout, data, item, icon, active_data, active_propname, index=0, flt_flag=0):
@@ -35,7 +30,6 @@ def w_item(self, context, layout, data, item, icon, active_data, active_propname
 
 
 ui.PM_PT_main.draw = w_panel
-ui.PM_PT_tools.draw = w_tools
 ui.PM_UL_plugins.draw_item = w_item
 
 # 让列表有内容并展开侧边栏
@@ -71,7 +65,6 @@ finally:
     sys.stdout = old_out
     sys.stderr = old_err
     ui.PM_PT_main.draw = orig_panel
-    ui.PM_PT_tools.draw = orig_tools
     ui.PM_UL_plugins.draw_item = orig_item
 
 text = buf.getvalue()

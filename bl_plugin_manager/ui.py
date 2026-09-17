@@ -46,6 +46,14 @@ def _compat_display(item) -> tuple[str, str, bool]:
     return label, maximum, alert
 
 
+def _progress_bar(layout, factor, text):
+    """画进度条；不支持 progress 的布局回退为文本，保证进度始终可读。"""
+    try:
+        layout.progress(factor=max(0.0, min(1.0, float(factor))), text=text)
+    except Exception:
+        layout.label(text=text)
+
+
 class PM_UL_plugins(UIList):
     bl_idname = "PM_UL_plugins"
 
@@ -153,11 +161,6 @@ class PM_MT_library(Menu):
         layout.separator()
         layout.operator("plugin_manager.setup_library", icon="LINKED", text="启用/修复挂载")
         layout.operator("plugin_manager.refresh", icon="FILE_REFRESH", text="刷新列表")
-        layout.operator("plugin_manager.show_warnings", icon="INFO", text="诊断信息")
-        layout.separator()
-        layout.operator("plugin_manager.clear_updates", icon="X", text="清除更新标记")
-        layout.separator()
-        layout.operator("plugin_manager.unmount_library", icon="UNLINKED", text="卸载挂载")
 
 
 class PM_MT_category(Menu):
@@ -310,10 +313,27 @@ class PM_PT_main(Panel):
                 grey = sub2.row()
                 grey.enabled = False
                 grey.label(text=f"?{unk_n}")
-            # 一键测试（显眼入口）
+            # 一键测试（显眼入口）；任务运行时改为进度与取消
             row = layout.row(align=True)
-            row.operator("plugin_manager.verify_compat", icon="CHECKMARK",
-                         text="一键测试插件支持")
+            if prefs.compat_running:
+                row.operator("plugin_manager.cancel_compat", icon="X", text="取消测试")
+            else:
+                row.operator("plugin_manager.verify_compat", icon="CHECKMARK",
+                             text="一键测试插件支持")
+
+        if prefs.compat_running:
+            box = layout.box()
+            box.label(text=f"测试进度 {prefs.compat_done} / {prefs.compat_total}",
+                      icon="TIME")
+            if prefs.compat_current:
+                box.label(text=f"当前: {prefs.compat_current}")
+            _progress_bar(box, prefs.compat_done / max(1, prefs.compat_total),
+                          f"{prefs.compat_done}/{prefs.compat_total}")
+            sub = box.row(align=True)
+            sub.label(text=f"✓ {prefs.compat_ok}　✗ {prefs.compat_fail}")
+            sub.operator("plugin_manager.cancel_compat", icon="X", text="取消")
+            if prefs.compat_cancelling:
+                box.label(text="正在取消，等待当前插件处理结束…", icon="INFO")
 
         # --- 搜索 + 过滤（一行）---
         row = layout.row(align=True)
@@ -532,48 +552,6 @@ class PM_PT_actions(Panel):
             layout.label(text=prefs.report_summary)
 
 
-class PM_PT_tools(Panel):
-    """迁移收编与启动控制。"""
-
-    bl_idname = "PM_PT_tools"
-    bl_label = "迁移与启动控制"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "插件库"
-    bl_parent_id = "PM_PT_main"
-    bl_options = {"DEFAULT_CLOSED"}
-    bl_order = 4
-
-    def draw(self, context):
-        layout = self.layout
-        prefs = bridge.get_prefs()
-        if prefs is None:
-            return
-
-        col = layout.column(align=True)
-        col.label(text="把现有插件收编进库:", icon="IMPORT")
-        col.operator("plugin_manager.scan_candidates", icon="VIEWZOOM")
-        if prefs.candidate_count:
-            col.label(text=f"可收编 {prefs.candidate_count} 个")
-        col.operator("plugin_manager.import_candidates", icon="IMPORT")
-
-        layout.separator()
-        col = layout.column(align=True)
-        col.label(text="设备启用配置:", icon="RECOVER_LAST")
-        try:
-            from .storage import machine_config
-            from .storage.device_profiles import DeviceProfileStore
-            local = machine_config.load()
-            profile = DeviceProfileStore(prefs.library_path).load(local["device_id"])
-            device_count = len(DeviceProfileStore(prefs.library_path).list_devices())
-            col.label(text=f"本设备启用 {len(profile['enabled_plugins'])} 个；同步设备 {device_count} 台")
-        except Exception:
-            col.label(text="设备配置尚未创建")
-        col.operator("plugin_manager.verify_compat", icon="CHECKMARK", text="一键测试插件支持")
-        col.operator("plugin_manager.cleanup_residue", icon="TRASH",
-                     text="清理失败插件残留")
-
-
 # ---------------------------------------------------------------------------
 def _support_counts(prefs) -> tuple[int, int, int]:
     """当前可见列表的支持统计：(✓支持, ✗不支持, ?未测试)。"""
@@ -609,5 +587,4 @@ classes = (
     PM_PT_detail,
     PM_PT_batch,
     PM_PT_actions,
-    PM_PT_tools,
 )

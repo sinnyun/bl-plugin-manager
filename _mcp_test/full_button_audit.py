@@ -199,7 +199,8 @@ def main():
         call("unmount_library", lambda: bpy.ops.plugin_manager.unmount_library())
         call("setup_library_again", lambda: bpy.ops.plugin_manager.setup_library())
 
-        # Menus/panels/header draw smoke after all data is present.
+        # Menus/panels draw smoke after all data is present.
+        assert not hasattr(PM.ui, "PM_PT_tools"), "PM_PT_tools should be removed"
         class Layout:
             def __init__(self): self.errors=[]; self.calls=0
             def __getattr__(self, name):
@@ -215,7 +216,7 @@ def main():
                 return f
             def __setattr__(self,k,v): object.__setattr__(self,k,v)
         for cls in (PM.ui.PM_PT_main, PM.ui.PM_PT_detail, PM.ui.PM_PT_batch,
-                    PM.ui.PM_PT_actions, PM.ui.PM_PT_tools, PM.ui.PM_MT_library,
+                    PM.ui.PM_PT_actions, PM.ui.PM_MT_library,
                     PM.ui.PM_MT_category, PM.ui.PM_MT_plugin):
             lay=Layout()
             try: cls.draw(type("Shim", (), {"layout": lay})(), bpy.context)

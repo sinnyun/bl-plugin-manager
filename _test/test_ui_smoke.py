@@ -11,6 +11,8 @@ from bl_plugin_manager import operators as pm_ops
 from bl_plugin_manager import ui as pm_ui
 
 ERRORS = []
+# 跨子布局收集所有 layout.operator(...) 的 idname，便于断言入口是否存在
+OP_CALLS = []
 
 
 class MockLayout:
@@ -26,6 +28,7 @@ class MockLayout:
             self.calls.append((name, args, kwargs))
             if name == "operator":
                 idname = args[0] if args else kwargs.get("operator", "")
+                OP_CALLS.append(idname)
                 if idname and not hasattr(bpy.ops, idname.split(".")[0]):
                     ERRORS.append(f"{self.path}: 未知操作符命名空间 {idname}")
                 elif idname:
@@ -86,10 +89,14 @@ def run():
     if len(prefs.plugin_items) and not sel_ok[1]:
         ERRORS.append("with-selection 状态下未渲染选中项详情")
 
-    # 2) 工具面板 draw
-    mock = MockLayout("tools")
-    pm_ui.PM_PT_tools.draw(type("S", (), {"layout": mock})(), bpy.context)
-    print(f"[UI] 工具面板 draw: {len(mock.calls)} 次布局调用")
+    # 2) 工具面板已删除：迁移/维护入口改由偏好设置承载
+    if hasattr(pm_ui, "PM_PT_tools"):
+        ERRORS.append("PM_PT_tools 应已删除（迁移入口已移入偏好设置）")
+    if hasattr(pm_ui, "PM_MT_library") is False:
+        ERRORS.append("PM_MT_library 缺失")
+    mock = MockLayout("library_menu")
+    pm_ui.PM_MT_library.draw(type("S", (), {"layout": mock})(), bpy.context)
+    print(f"[UI] 库菜单 draw: {len(mock.calls)} 次布局调用")
 
     # 3) 列表行 draw
     class RowMock(MockLayout):
@@ -105,24 +112,51 @@ def run():
 
     # 4) 偏好设置 draw（AddonPreferences.draw 使用 self.layout）
     class PrefShim:
-        pass
+        """把未显式提供的属性转发到真实偏好，便于直接调用 draw。"""
 
-    shim = PrefShim()
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+    shim = PrefShim(prefs)
     shim.layout = MockLayout("prefs")
-    shim.library_path = prefs.library_path
-    shim.auto_scan = prefs.auto_scan
-    shim.scan_interval = prefs.scan_interval
     from bl_plugin_manager.preferences import PMAddonPreferences
 
+    del OP_CALLS[:]
     PMAddonPreferences.draw(shim, bpy.context)
-    print("[UI] 偏好 draw: 通过")
+    # unify_store 是条件入口：已统一时改为显示提示文案，因此不计入必选。
+    for needed in ("plugin_manager.unmount_library", "plugin_manager.show_warnings",
+                   "plugin_manager.clear_updates", "plugin_manager.cleanup_residue",
+                   "plugin_manager.scan_candidates", "plugin_manager.import_candidates"):
+        if needed not in OP_CALLS:
+            ERRORS.append(f"偏好设置未渲染维护/迁移入口: {needed}")
+    print(f"[UI] 偏好 draw: 通过（含 {len(OP_CALLS)} 个操作符入口）")
+
+    # 4b) 任务运行时主面板 draw（进度 + 取消）
+    prefs.compat_running = True
+    prefs.compat_total = 3
+    prefs.compat_done = 1
+    prefs.compat_ok = 1
+    prefs.compat_current = "SomePlugin"
+    mock = MockLayout("main[running]")
+    del OP_CALLS[:]
+    pm_ui.PM_PT_main.draw(type("S", (), {"layout": mock})(), bpy.context)
+    if "plugin_manager.cancel_compat" not in OP_CALLS:
+        ERRORS.append("任务运行时主面板未渲染取消入口")
+    if "plugin_manager.verify_compat" in OP_CALLS:
+        ERRORS.append("任务运行时应显示取消按钮而非再次启动测试")
+    prefs.compat_running = False
+    prefs.compat_cancelling = False
+    print("[UI] 主面板运行态 draw: 通过")
 
     # 5) 面板元数据
     meta = {
         "main_category": pm_ui.PM_PT_main.bl_category,
         "main_bl_idname": pm_ui.PM_PT_main.bl_idname,
-        "tools_parent": pm_ui.PM_PT_tools.bl_parent_id,
         "list_idname": pm_ui.PM_UL_plugins.bl_idname,
+        "tools_removed": not hasattr(pm_ui, "PM_PT_tools"),
     }
     print("@@UI_META@@", json.dumps(meta, ensure_ascii=False))
 

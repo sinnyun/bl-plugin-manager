@@ -103,8 +103,15 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 - 传统插件进入 `addons/`；带 `blender_manifest.toml` 的扩展进入 `extensions/`。
 - 扩展 ID 会转换为合法 Python 标识符，manifest 会在导入前校验。
 - 支持搜索、收藏、扁平分类、别名、备注、批量启停、更新检查和回收站移除。
+- 「一键测试插件支持」为分步任务：侧栏显示 `已完成 / 总数`、当前插件名与进度条，界面在测试期间保持可交互；可随时「取消」，取消在当前插件处理结束后生效，已完成结果保留。测试范围可选「继续未完成项」（默认）或「全部重新测试」。
 - 兼容性实测会真实运行第三方插件代码，建议只在可信插件和已保存工程中使用。
 - 在线安装需要用户自行在 Blender 系统设置中允许联网；管理器不会代为开启。
+
+## 界面入口
+
+- **3D 视图侧边栏（N → 插件库）**：高频插件管理——库连接状态、搜索筛选、插件列表、插件详情、批量操作、导入、在线商店、更新、扫描报告，以及兼容性测试入口与运行时进度。
+- **编辑 → 偏好设置 → 插件 → 插件库管理器**：低频配置与维护——设备名称、库路径、启用/修复与卸载挂载、刷新、诊断、启动同步策略、迁移收编、清理失败插件残留、清除更新标记，以及官方商店目录关联。
+- 3D 视图顶部栏不再提供「插件库」按钮或分类快捷入口（2.1.0 起移除）。
 
 ## 安全边界
 
@@ -123,7 +130,23 @@ powershell -ExecutionPolicy Bypass -File _test/run_regressions.ps1
 powershell -ExecutionPolicy Bypass -File _test/run_e2e.ps1
 ```
 
-详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-14-scoped-management-design.md` 和 `docs/superpowers/plans/2026-09-14-scoped-management.md`。
+详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-14-scoped-management-design.md`、`docs/superpowers/specs/2026-09-15-compatibility-task-and-settings-design.md` 和 `docs/superpowers/plans/2026-09-15-compatibility-task-and-settings-plan.md`。
+
+## 2.1.0 变更（2026-09-15）
+
+- 兼容性测试改为计时器驱动的分步任务：每个计时器事件只测试一个插件，事件之间把控制权交还 Blender，因此测试期间界面保持可交互。
+- 侧栏显示 `已完成 / 总数`、当前插件名与进度条；状态栏同步显示进度；任务运行时「一键测试」按钮变为「取消」。
+- 新增「测试范围」：继续未完成项（默认，保留本轮已完成结果）与全部重新测试（逐项覆盖旧实测结果）。
+- 「取消」不中断正在运行的插件加载/卸载：设置取消请求，当前插件处理结束后停止后续测试，并把已完成结果写入数据库、报告与界面；取消后的摘要显示已完成与未完成数量。
+- 任务结束（完成 / 取消 / 异常）统一移除计时器、清空状态栏、保存记录、刷新列表并生成可查看摘要；停用插件时也会安全收尾。
+- 侧栏移除低频的「迁移与启动控制」子面板；库级菜单不再承载诊断、清除更新、卸载挂载。
+- 上述低频配置与维护入口（设备名称、库路径、启用/修复与卸载挂载、刷新、诊断、启动同步策略、迁移收编、清理残留、清除更新、官方商店目录关联）收进「编辑 → 偏好设置 → 插件 → 插件库管理器」。
+- 删除 3D 视图顶部栏「插件库」按钮、分类快捷按钮及其弹出列表；不再注册 `VIEW3D_HT_header` 回调。
+- 让「启动时按『自启』标记同步」策略真正生效：开启后，Blender 启动时按库内自启标记同步一次插件启用状态。
+- 安装包：`dist/bl_plugin_manager-2.1.0.zip`（29 个发行文件，不含缓存或编译产物），SHA-256 为 `5324A6B4CC9BCCAB3CD994FF4CD2D8AEAA6375942E03A123F141CB4C9D8B7260`。
+- 验证（Blender 5.2.1 LTS，隔离运行）：Python 单元测试 57 项通过（1 项按运行条件跳过，含 `tests/test_compat_task_v2.py` 17 项任务逻辑测试）；Blender 隔离回归 30/30 通过；Blender 隔离端到端 186/186 通过；UI 冒烟无错误。
+- 端到端新增「完整任务」检查：走真实 `_compat_start` → `_compat_tick` → 收尾链路，验证 8 个目标逐项处理、计时器注销、状态栏清空、`load_state` 逐条落盘，以及目标恢复为原未启用状态。
+- 回归与端到端运行前后，真实 Blender 5.2 `userpref.blend` SHA-256 均为 `6889F40FCD4CD34994FF854E18ECB2A008A593B107107DD4A6DB8BC4066C5BB0`，未被测试改动。
 
 ## 2.0.1 修复状态（2026-09-15）
 

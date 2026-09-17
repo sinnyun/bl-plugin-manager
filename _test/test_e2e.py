@@ -944,6 +944,99 @@ check("one-click verify operator exists",
       hasattr(bpy.ops.plugin_manager, "verify_compat"))
 check("verify op label", "一键测试" in PM.operators.PM_OT_verify_compat.bl_label,
       PM.operators.PM_OT_verify_compat.bl_label)
+check("cancel operator exists",
+      hasattr(bpy.ops.plugin_manager, "cancel_compat"))
+check("verify op exposes scope",
+      "scope" in bpy.ops.plugin_manager.verify_compat.get_rna_type().properties)
+check("header module removed", not hasattr(PM, "header"))
+check("tools panel removed", not hasattr(PM.ui, "PM_PT_tools"))
+check("compat runtime props exist",
+      all(hasattr(prefs, n) for n in ("compat_running", "compat_done",
+                                      "compat_total", "compat_current")))
+
+# 模态调度：一次 tick 只处理一项，取消在当前项之后生效
+_modal_records = [
+    ("addons/m1", {"module": "m1", "name": "M1", "load_state": ""}),
+    ("addons/m2", {"module": "m2", "name": "M2", "load_state": ""}),
+]
+_modal_sel = PM.compat_task.select_targets(
+    _modal_records, enabled_modules=set(), scope=PM.compat_task.SCOPE_RETEST_ALL)
+_modal_state = PM.compat_task.TaskState(
+    _modal_sel.targets, False, PM.compat_task.SCOPE_RETEST_ALL)
+
+
+class _ModalApi:
+    def set_enabled(self, module, enabled):
+        return (True, "")
+
+    def is_module_enabled(self, module):
+        return False
+
+    def module_residue(self, module):
+        return 0
+
+
+PM.compat_task.step(_modal_state, _ModalApi())
+check("one tick processes exactly one target", _modal_state.index == 1,
+      f"index={_modal_state.index}")
+_modal_state.request_cancel()
+check("cancel stops after current item",
+      PM.compat_task.step(_modal_state, _ModalApi()) is None and _modal_state.index == 1)
+check("cancelled summary reports remaining",
+      "未完成 1" in PM.compat_task.summary_text(_modal_state, cancelled=True))
+
+# 完整任务：走真实 start → tick → finish 链路，验证数据库落盘、计时器注销、
+# 状态栏清空与摘要生成。
+_prefs_t = bpy.context.preferences.addons["bl_plugin_manager"].preferences
+_db_t = PM.db.LibraryDB(lib)
+_sel_t = PM.compat_task.select_targets(
+    list(_db_t.plugins.items()), PM.bridge.enabled_modules(),
+    include_enabled=False, scope=PM.compat_task.SCOPE_RETEST_ALL)
+check("full task selects real plugins", len(_sel_t.targets) > 0,
+      f"targets={len(_sel_t.targets)}")
+# 取一个本轮确实未启用的目标：它必须被实测并恢复到未启用
+_was_disabled = [t for t in _sel_t.targets if not t.was_enabled]
+check("full task has a disabled target to verify", len(_was_disabled) > 0,
+      f"enabled_targets={len(_sel_t.targets) - len(_was_disabled)}")
+
+PM.operators._compat_start(_prefs_t, _db_t, _sel_t, False,
+                           PM.compat_task.SCOPE_RETEST_ALL)
+check("task marked running", _prefs_t.compat_running is True)
+check("task timer registered",
+      bpy.app.timers.is_registered(PM.operators._compat_tick))
+check("task total mirrors selection", _prefs_t.compat_total == len(_sel_t.targets))
+
+# 直接驱动计时器回调直至结束（后台模式不派发真实计时器事件）。
+# 共 len(targets) 次调用：前 N-1 次各处理一项并返回间隔，最后一次处理完并收尾返回 None。
+_ticks = 0
+while _ticks < 500:
+    _ticks += 1
+    if PM.operators._compat_tick() is None:
+        break
+check("task drives to completion via ticks", _ticks == len(_sel_t.targets),
+      f"ticks={_ticks} targets={len(_sel_t.targets)}")
+check("task clears running flag", _prefs_t.compat_running is False)
+check("task unregisters timer",
+      not bpy.app.timers.is_registered(PM.operators._compat_tick))
+check("task progress mirrors done", _prefs_t.compat_done == len(_sel_t.targets),
+      f"done={_prefs_t.compat_done}")
+check("task writes summary", bool(_prefs_t.report_summary),
+      _prefs_t.report_summary)
+
+# 实测结果必须落盘，且目标恢复为原来的未启用状态
+_db_after = PM.db.LibraryDB(lib, use_cache=False)
+_measured = 0
+_restored = 0
+for _t in _was_disabled:
+    _r = _db_after.get(_t.key) or {}
+    if _r.get("load_state") in ("ok", "failed"):
+        _measured += 1
+    if not _r.get("enabled"):
+        _restored += 1
+check("full task persists load_state for every disabled target",
+      _measured == len(_was_disabled), f"{_measured}/{len(_was_disabled)}")
+check("full task restores disabled state",
+      _restored == len(_was_disabled), f"{_restored}/{len(_was_disabled)}")
 
 check("list item shows max supported version",
       bool(it_mx and it_mx.max_version_text == "≤ 4.9.0"),

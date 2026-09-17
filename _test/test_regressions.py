@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import bpy  # type: ignore
 
-from bl_plugin_manager import bridge, constants as C, library, ui
+from bl_plugin_manager import bridge, compat_task, constants as C, library, ui
 from bl_plugin_manager.db import LibraryDB
 from bl_plugin_manager.storage.shared_db import SharedDatabase
 
@@ -297,6 +297,110 @@ def case_list_compatibility_display(_root: str) -> None:
           ("? 声明兼容，未实测", "最高 ≤ 5.2.0", False))
 
 
+class _FakeCompatApi:
+    """Deterministic Blender-bridge stand-in for modal scheduling checks."""
+
+    def __init__(self, enable_ok: bool = True, enable_err: str = ""):
+        self.enable_ok = enable_ok
+        self.enable_err = enable_err
+
+    def set_enabled(self, module: str, enabled: bool):
+        return (self.enable_ok, self.enable_err)
+
+    def is_module_enabled(self, module: str) -> bool:
+        return False
+
+    def module_residue(self, module: str) -> int:
+        return 0
+
+
+def case_compat_task_modal_scheduling(_root: str) -> None:
+    """Modal scheduling: one tick per item, cancel after the current item."""
+    check("cancel operator registered",
+          hasattr(bpy.ops.plugin_manager, "cancel_compat"))
+    # In this auto-registered environment ``get_rna_type()`` is unreliable, so
+    # assert the declared property and its enum source instead.
+    from bl_plugin_manager import operators as pm_ops
+    annots = getattr(pm_ops.PM_OT_verify_compat, "__annotations__", {})
+    check("verify operator exposes scope", "scope" in annots, f"annotations={sorted(annots)}")
+    scope_ids = [item[0] for item in compat_task.SCOPE_ITEMS]
+    check("scope enum offers continue and retest_all",
+          scope_ids == ["continue", "retest_all"], f"items={scope_ids}")
+
+    records = [
+        ("addons/a", {"module": "a", "name": "A", "load_state": ""}),
+        ("addons/b", {"module": "b", "name": "B", "load_state": ""}),
+        ("addons/c", {"module": "c", "name": "C", "load_state": ""}),
+    ]
+    sel = compat_task.select_targets(records, enabled_modules=set(),
+                                     include_enabled=False,
+                                     scope=compat_task.SCOPE_RETEST_ALL)
+    state = compat_task.TaskState(sel.targets, False, compat_task.SCOPE_RETEST_ALL)
+    api = _FakeCompatApi()
+
+    first = compat_task.step(state, api)
+    check("one tick processes exactly one target",
+          first is not None and state.index == 1, f"index={state.index}")
+
+    state.request_cancel()
+    check("cancel stops after current item",
+          compat_task.step(state, api) is None and state.index == 1,
+          f"index={state.index}")
+
+    summary = compat_task.summary_text(state, cancelled=True)
+    check("cancelled summary reports remaining",
+          "已完成 1/3" in summary and "未完成 2" in summary, summary)
+
+
+def case_retest_all_preserves_until_measured(_root: str) -> None:
+    """retest_all selects measured records but only overwrites them when measured."""
+    records = [
+        ("addons/ok", {"module": "ok", "name": "Ok", "load_state": "ok"}),
+        ("addons/bad", {"module": "bad", "name": "Bad", "load_state": "failed"}),
+    ]
+    sel = compat_task.select_targets(records, enabled_modules=set(),
+                                     scope=compat_task.SCOPE_RETEST_ALL)
+    check("retest_all re-selects measured records", len(sel.targets) == 2,
+          f"targets={len(sel.targets)}")
+
+    # Cancel before any step: no record may be touched, so old results survive.
+    state = compat_task.TaskState(sel.targets, False, compat_task.SCOPE_RETEST_ALL)
+    state.request_cancel()
+    check("cancel before first tick leaves old results intact",
+          compat_task.step(state, _FakeCompatApi()) is None and state.index == 0)
+
+    cont = compat_task.select_targets(records, enabled_modules=set(),
+                                      scope=compat_task.SCOPE_CONTINUE)
+    check("continue_scope skips measured records", len(cont.targets) == 0,
+          f"targets={len(cont.targets)}")
+
+
+def case_top_bar_removed(_root: str) -> None:
+    """The 3D-view header module is gone and nothing hooks VIEW3D_HT_header."""
+    import os
+    from bl_plugin_manager import constants as _C
+
+    pkg_dir = os.path.dirname(_C.__file__)
+    check("header module deleted",
+          not os.path.exists(os.path.join(pkg_dir, "header.py")))
+    check("tools panel removed", not hasattr(ui, "PM_PT_tools"))
+
+    hooked = False
+    try:
+        funcs = bpy.types.VIEW3D_HT_header._dyn_ui_initialize()
+        stack = list(funcs)
+        while stack:
+            fn = stack.pop()
+            if isinstance(fn, (list, tuple)):
+                stack.extend(fn)
+                continue
+            if getattr(fn, "__name__", "") == "_draw_header":
+                hooked = True
+    except Exception:
+        pass
+    check("no header draw hooked", not hooked)
+
+
 def main() -> int:
     base = tempfile.mkdtemp(prefix="pmlib_regressions_")
     root = os.path.join(base, "library")
@@ -309,6 +413,9 @@ def main() -> int:
         ("mount state signature", case_mount_state_signature),
         ("repository target", case_repository_target_selection),
         ("list compatibility display", case_list_compatibility_display),
+        ("compat task modal scheduling", case_compat_task_modal_scheduling),
+        ("retest all preserves until measured", case_retest_all_preserves_until_measured),
+        ("top bar removed", case_top_bar_removed),
     )
     try:
         for label, case in cases:

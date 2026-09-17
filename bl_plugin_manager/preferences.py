@@ -160,6 +160,15 @@ class PMAddonPreferences(AddonPreferences):
     search: StringProperty(default="", update=_on_filter_update)
     candidate_count: IntProperty(default=0)
 
+    # 兼容性测试任务运行时状态（仅本会话，不写入偏好文件）
+    compat_running: BoolProperty(default=False, options={"SKIP_SAVE"})
+    compat_cancelling: BoolProperty(default=False, options={"SKIP_SAVE"})
+    compat_total: IntProperty(default=0, options={"SKIP_SAVE"})
+    compat_done: IntProperty(default=0, options={"SKIP_SAVE"})
+    compat_ok: IntProperty(default=0, options={"SKIP_SAVE"})
+    compat_fail: IntProperty(default=0, options={"SKIP_SAVE"})
+    compat_current: StringProperty(default="", options={"SKIP_SAVE"})
+
     # 本次扫描/导入的结果明细（面板展示）
     report_items: CollectionProperty(type=PM_ReportItem)
     report_summary: StringProperty(default="")
@@ -191,6 +200,8 @@ class PMAddonPreferences(AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
+
+        # --- 设备与库 ---
         col = layout.column()
         col.prop(self, "device_name")
         try:
@@ -199,10 +210,11 @@ class PMAddonPreferences(AddonPreferences):
         except Exception:
             pass
         col.prop(self, "library_path")
+
+        # --- 挂载 ---
         row = col.row(align=True)
         row.operator("plugin_manager.setup_library", icon="LINKED")
-        row.operator("plugin_manager.refresh", icon="FILE_REFRESH")
-        row.operator("plugin_manager.scan_inbox", icon="FILE_REFRESH", text="扫描投放区")
+        row.operator("plugin_manager.unmount_library", icon="UNLINKED")
 
         if self.library_path:
             state = bridge.library_state(self.library_path)
@@ -218,6 +230,46 @@ class PMAddonPreferences(AddonPreferences):
             box.label(text="在 3D 视图侧边栏 '插件库' 标签中管理")
         else:
             layout.label(text="请先设置插件库路径", icon="ERROR")
+
+        # --- 诊断与维护 ---
+        box = layout.box()
+        box.label(text="诊断与维护", icon="TOOL_SETTINGS")
+        row = box.row(align=True)
+        row.operator("plugin_manager.refresh", icon="FILE_REFRESH")
+        row.operator("plugin_manager.scan_inbox", icon="FILE_REFRESH", text="扫描投放区")
+        row.operator("plugin_manager.show_warnings", icon="INFO", text="诊断信息")
+        row = box.row(align=True)
+        row.operator("plugin_manager.cleanup_residue", icon="TRASH", text="清理失败插件残留")
+        row.operator("plugin_manager.clear_updates", icon="X", text="清除更新标记")
+
+        # --- 启动同步策略 ---
+        box = layout.box()
+        box.label(text="启动同步策略", icon="PLAY")
+        box.prop(self, "sync_startup_on_launch")
+        box.prop(self, "startup_disable_unmarked")
+        box.operator("plugin_manager.apply_startup", icon="PLAY", text="立即同步自启状态")
+
+        # --- 迁移收编 ---
+        box = layout.box()
+        box.label(text="迁移收编", icon="IMPORT")
+        row = box.row(align=True)
+        row.operator("plugin_manager.scan_candidates", icon="VIEWZOOM", text="扫描可收编插件")
+        if self.candidate_count:
+            box.label(text=f"可收编 {self.candidate_count} 个")
+        box.operator("plugin_manager.import_candidates", icon="IMPORT", text="收编全部")
+
+        # --- 官方商店目录关联 ---
+        box = layout.box()
+        box.label(text="官方商店目录关联", icon="URL")
+        try:
+            official = bool(bridge.library_state(self.library_path).get("official")) if self.library_path else False
+        except Exception:
+            official = False
+        if official:
+            box.label(text="官方商店面板已与本库共用目录", icon="CHECKMARK")
+        else:
+            box.operator("plugin_manager.unify_store", icon="LINKED",
+                         text="让官方商店使用本插件库")
 
 
 classes = (PM_PluginItem, PM_CategoryItem, PM_ReportItem, PMAddonPreferences)

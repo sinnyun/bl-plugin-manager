@@ -7,16 +7,13 @@ import re
 BASE = r"E:\AI\geren\chajian_guanliqi\bl_plugin_manager"
 ops_src = open(f"{BASE}/operators.py", encoding="utf-8").read()
 ui_src = open(f"{BASE}/ui.py", encoding="utf-8").read()
-hd_src = open(f"{BASE}/header.py", encoding="utf-8").read()
 pref_src = open(f"{BASE}/preferences.py", encoding="utf-8").read()
 
 defined = set(re.findall(r'bl_idname\s*=\s*"plugin_manager\.([a-z_]+)"', ops_src))
-defined |= set(re.findall(r'bl_idname\s*=\s*"plugin_manager\.([a-z_]+)"', hd_src))
 
 ui_refs = set(re.findall(r'"plugin_manager\.([a-z_]+)"', ui_src))
-hd_refs = set(re.findall(r'"plugin_manager\.([a-z_]+)"', hd_src))
 pref_refs = set(re.findall(r'"plugin_manager\.([a-z_]+)"', pref_src))
-reachable = ui_refs | hd_refs | pref_refs
+reachable = ui_refs | pref_refs
 
 # 这些是"被别的操作符内部调用"或纯弹窗/内部使用的，不算缺失
 interactive_only = {
@@ -63,7 +60,7 @@ must_have = {
     "copy_report": "复制报告", "open_report_log": "打开日志",
     "clear_updates": "清除更新标记", "scan_candidates": "扫描可收编",
     "import_candidates": "收编全部", "apply_startup": "同步自启",
-    "header_popup": "标题栏入口", "edit_meta": "编辑信息",
+    "cancel_compat": "取消兼容性测试",
 }
 missing_must = [k for k in must_have if k not in reachable]
 print(f"\n关键功能入口缺失: {len(missing_must)}")

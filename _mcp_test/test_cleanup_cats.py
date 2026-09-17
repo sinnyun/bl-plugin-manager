@@ -2,7 +2,7 @@
 import importlib, io, json, sys
 import bpy
 import bl_plugin_manager as PM
-for n in ("constants","scan","db","bridge","library","items","preferences","operators","ui","header"):
+for n in ("constants","scan","db","bridge","library","items","preferences","operators","ui"):
     try: importlib.reload(getattr(PM, n))
     except Exception: pass
 out = {}

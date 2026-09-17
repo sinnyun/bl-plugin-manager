@@ -7,7 +7,7 @@ import bpy
 
 import bl_plugin_manager as PM
 for n in ("scan", "db", "bridge", "library", "store", "updates", "migrate",
-          "watcher", "items", "preferences", "operators", "ui", "header"):
+          "watcher", "items", "preferences", "operators", "ui"):
     try:
         importlib.reload(getattr(PM, n))
     except Exception:

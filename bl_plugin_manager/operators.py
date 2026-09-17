@@ -8,11 +8,12 @@ import bpy
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
+    EnumProperty,
     StringProperty,
 )
 from bpy.types import Operator
 
-from . import (bridge, constants as C, library, migrate, scan,
+from . import (bridge, compat_task, constants as C, library, migrate, scan,
                scoped_management, store, updates, watcher)
 from .db import LibraryDB, now_iso
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
@@ -378,8 +379,13 @@ class PM_OT_set_startup(_PMBase):
 class PM_OT_verify_compat(_PMBase):
     bl_idname = "plugin_manager.verify_compat"
     bl_label = "一键测试插件支持"
-    bl_description = "逐个尝试加载插件，测出哪些能在当前 Blender 下正常工作；结果用 ✓ / ✗ 标出"
+    bl_description = ("分步真实加载插件测出可用性；不阻塞界面，可随时取消")
 
+    scope: EnumProperty(
+        name="测试范围",
+        items=compat_task.SCOPE_ITEMS,
+        default=compat_task.SCOPE_CONTINUE,
+    )
     include_enabled: BoolProperty(
         name="也测试已启用的插件",
         description="已启用的插件通常可用；勾选后一并复测（更慢）",
@@ -387,127 +393,188 @@ class PM_OT_verify_compat(_PMBase):
     )
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=440)
+        prefs = _prefs(context)
+        if prefs is not None and getattr(prefs, "compat_running", False):
+            return _report(self, False, "已有测试任务在运行，请等待完成或先取消")
+        return context.window_manager.invoke_props_dialog(self, width=460)
 
     def execute(self, context):
         prefs = _prefs(context)
         db = _db(context)
         if not prefs or not db:
             return _report(self, False, "插件库未就绪")
+        if getattr(prefs, "compat_running", False):
+            return _report(self, False, "已有测试任务在运行，请等待完成或先取消")
 
-        enabled_set = bridge.enabled_modules()
-        targets = []
-        skipped_themes = 0
-        for key, rec in db.plugins.items():
-            mod = rec.get("module")
-            if not mod or rec.get("missing"):
-                continue
-            # 主题(theme)不是插件，无法用 addon_enable 启用，跳过
-            if (rec.get("pkg_type") or rec.get("type") or "").strip() == "theme":
-                skipped_themes += 1
-                continue
-            already = mod in enabled_set
-            if already and not self.include_enabled:
-                continue
-            targets.append((key, rec, already))
+        selection = compat_task.select_targets(
+            list(db.plugins.items()), bridge.enabled_modules(),
+            include_enabled=self.include_enabled, scope=self.scope,
+        )
+        if not selection.targets:
+            return _report(self, True,
+                           compat_task.no_targets_text(selection, self.scope))
+        _compat_start(prefs, db, selection, self.include_enabled, self.scope)
+        return _report(
+            self, True,
+            f"已开始测试 {len(selection.targets)} 个插件；可在侧栏查看进度或取消")
 
-        if not targets:
-            return _report(self, True, "没有需要测试的插件")
 
-        total = len(targets)
-        _status(f"插件库：正在测试 0/{total} …")
-        ok_n = fail_n = 0
-        fails = []
-        # 只清理本轮实际参与测试的记录；未参与的历史结果仍然有效。
-        for _key, rec, _was_enabled in targets:
-            rec["load_state"] = ""
-            rec["load_error"] = ""
-            rec["restore_error"] = ""
+# ---------------------------------------------------------------------------
+# 兼容性测试任务：计时器分步驱动
+# ---------------------------------------------------------------------------
+_COMPAT: dict = {"state": None, "db": None, "prefs": None}
+
+
+class _CompatBridgeAPI:
+    """把任务逻辑需要的 Blender 侧能力收拢到一个注入对象里。"""
+
+    def set_enabled(self, module: str, enabled: bool):
+        return bridge.set_enabled(module, enabled)
+
+    def is_module_enabled(self, module: str) -> bool:
+        return bridge.is_module_enabled(module)
+
+    def module_residue(self, module: str) -> int:
+        return bridge.module_residue(module)
+
+
+def _compat_start(prefs, db, selection, include_enabled: bool, scope: str) -> None:
+    """建立任务状态并把每步进度镜像到偏好属性（供侧栏绘制）。"""
+    state = compat_task.TaskState(selection.targets, include_enabled, scope)
+    _COMPAT.update(state=state, db=db, prefs=prefs)
+    prefs.compat_running = True
+    prefs.compat_cancelling = False
+    prefs.compat_total = state.total
+    prefs.compat_done = 0
+    prefs.compat_ok = 0
+    prefs.compat_fail = 0
+    prefs.compat_current = state.current_name
+    _status(f"插件库：正在测试 0/{state.total} …")
+    _compat_register_timer()
+    _redraw()
+
+
+def _compat_register_timer() -> None:
+    try:
+        if not bpy.app.timers.is_registered(_compat_tick):
+            bpy.app.timers.register(_compat_tick, first_interval=0.0)
+    except Exception as exc:
+        print("[插件库] 无法启动兼容性测试计时器:", exc)
+
+
+def _compat_stop_timer() -> None:
+    try:
+        if bpy.app.timers.is_registered(_compat_tick):
+            bpy.app.timers.unregister(_compat_tick)
+    except Exception:
+        pass
+
+
+def _compat_tick():
+    """每个计时器事件只处理一个插件，然后在事件之间把控制权交还 Blender。"""
+    state, prefs, db = _COMPAT.get("state"), _COMPAT.get("prefs"), _COMPAT.get("db")
+    if state is None or prefs is None or db is None:
+        _compat_stop_timer()
+        return None
+    try:
+        if state.cancelled or not state.pending():
+            _compat_finish(state, db, prefs, cancelled=state.cancelled)
+            return None
+        outcome = compat_task.step(state, _CompatBridgeAPI())
+        if outcome is not None:
+            record = db.get(outcome.key) or {}
+            record.update(outcome.fields)
+            db.upsert(outcome.key, record)
+            # 每步落盘：取消或异常时已完成的结果不丢。
+            db.save()
+            prefs.compat_done = state.index
+            prefs.compat_ok = state.ok
+            prefs.compat_fail = state.fail
+            prefs.compat_current = state.current_name
+        _status(f"插件库：正在测试 {state.index}/{state.total} — {state.current_name}")
+        _redraw()
+        if not state.pending():
+            _compat_finish(state, db, prefs, cancelled=False)
+            return None
+        return 0.02
+    except Exception as exc:  # noqa: BLE001 — 任务必须清理并留痕
+        print("[插件库] 兼容性测试任务异常:", exc)
+        _compat_finish(state, db, prefs, cancelled=False, error=str(exc))
+        return None
+
+
+def _compat_finish(state, db, prefs, cancelled: bool, error: str = "") -> None:
+    """统一收尾：注销计时器、清状态栏、存结果、刷新列表、生成摘要。"""
+    _compat_stop_timer()
+    _clear_status()
+    try:
         db.save()
-        try:
-            for done, (key, rec, was_enabled) in enumerate(targets, 1):
-                if done % 3 == 1 or done == total:
-                    _status(f"插件库：正在测试 {done}/{total} …")
-                mod = rec["module"]
-                rec["restore_error"] = ""
-                # 已启用插件只有在用户明确选择复测时才做真实停用/重载。
-                if was_enabled and self.include_enabled:
-                    off_ok, off_err = bridge.set_enabled(mod, False)
-                    if not off_ok or bridge.is_module_enabled(mod):
-                        rec["load_state"] = "failed"
-                        rec["load_error"] = "无法开始复测：停用失败"
-                        rec["restore_error"] = off_err or rec["load_error"]
-                        rec["enabled"] = bridge.is_module_enabled(mod)
-                        fail_n += 1
-                        fails.append({"name": rec.get("name"), "key": key,
-                                      "error": rec["load_error"], "residue": 0})
-                        db.upsert(key, rec)
-                        continue
+    except Exception as exc:
+        print("[插件库] 保存测试结果失败:", exc)
 
-                # 尝试启用（能完整加载即可用），随后严格恢复原状态。
-                success, err = bridge.set_enabled(mod, True)
-                if success:
-                    restore_ok, restore_err = True, ""
-                    if not was_enabled:
-                        restore_ok, restore_err = bridge.set_enabled(mod, False)
-                        restore_ok = restore_ok and not bridge.is_module_enabled(mod)
-                    elif self.include_enabled:
-                        # 已启用插件已在上面停用，现在需要确认重新启用成功。
-                        restore_ok = bridge.is_module_enabled(mod)
-                    if restore_ok:
-                        rec["load_state"] = "ok"
-                        rec["load_error"] = ""
-                        rec["enabled"] = was_enabled
-                        ok_n += 1
-                    else:
-                        rec["load_state"] = "failed"
-                        rec["load_error"] = "加载成功但无法恢复原启用状态"
-                        rec["restore_error"] = restore_err or rec["load_error"]
-                        rec["enabled"] = bridge.is_module_enabled(mod)
-                        fail_n += 1
-                        fails.append({"name": rec.get("name"), "key": key,
-                                      "error": rec["restore_error"], "residue": 0})
-                else:
-                    # 失败：set_enabled 已尝试清理残留；记录剩余残留数量，
-                    # 便于界面提示"需重启 Blender 清理"
-                    left = bridge.module_residue(mod)
-                    rec["residue"] = left
-                    rec["load_state"] = "failed"
-                    rec["load_error"] = err or "未知错误"
-                    rec["last_error"] = err or rec.get("last_error", "")
-                    rec["enabled"] = bridge.is_module_enabled(mod)
-                    fail_n += 1
-                    fails.append({"name": rec.get("name"), "key": key,
-                                  "error": err, "residue": left})
-                db.upsert(key, rec)
-        finally:
-            _clear_status()
+    prefs.report_items.clear()
+    for item in state.fails:
+        entry = prefs.report_items.add()
+        entry.name = item.get("name") or ""
+        entry.path = item.get("key") or ""
+        entry.kind = "兼容性"
+        entry.status = "failed"
+        entry.detail = item.get("error") or ""
+    prefs.report_summary = compat_task.summary_text(state, cancelled=cancelled)
 
-        db.save()
+    log_entries = [{"name": i.get("name"), "path": i.get("key"), "kind": "兼容性",
+                    "status": "failed", "detail": i.get("error")} for i in state.fails]
+    if error:
+        prefs.report_summary += f"；任务异常：{error}"
+        log_entries.append({"name": "任务异常", "path": "", "kind": "兼容性",
+                            "status": "failed", "detail": error})
+    _write_report_log(prefs, {"entries": log_entries})
+
+    from . import items
+
+    items.rebuild_items(prefs)
+    prefs.compat_running = False
+    prefs.compat_cancelling = False
+    prefs.compat_current = ""
+    try:
         bridge.save_prefs()
-
-        # 把失败项写进扫描报告，便于查看/复制
-        prefs.report_items.clear()
-        for f_ in fails:
-            it = prefs.report_items.add()
-            it.name = f_.get("name") or ""
-            it.path = f_.get("key") or ""
-            it.kind = "兼容性"
-            it.status = "failed"
-            it.detail = f_.get("error") or ""
-        prefs.report_summary = (f"一键测试完成：✓ 支持 {ok_n} 个，"
-                               f"✗ 不支持 {fail_n} 个（共 {len(targets)} 个）")
-        log = _write_report_log(prefs, {"entries": [
-            {"name": f_.get("name"), "path": f_.get("key"), "kind": "兼容性",
-             "status": "failed", "detail": f_.get("error")} for f_ in fails]})
-
-        from . import items
-
-        items.rebuild_items(prefs)
-        if fail_n:
+    except Exception:
+        pass
+    _redraw()
+    # 失败项目进入报告；取消不报告为错误，也不弹窗。
+    if state.fails and not cancelled:
+        try:
             bpy.ops.plugin_manager.show_report()
-            return _report(self, False, f"可用 {ok_n}，不可用 {fail_n}（详见报告）" + (f"；日志 {log}" if log else ""))
-        return _report(self, True, f"实测完成：{ok_n} 个插件均可用")
+        except Exception:
+            pass
+    _COMPAT.update(state=None, db=None, prefs=None)
+
+
+def shutdown_compat_task() -> None:
+    """停用插件或退出时调用：取消任务并完成收尾，避免计时器悬空。"""
+    state, prefs, db = _COMPAT.get("state"), _COMPAT.get("prefs"), _COMPAT.get("db")
+    if state is not None and db is not None and prefs is not None:
+        state.request_cancel()
+        _compat_finish(state, db, prefs, cancelled=True)
+    _compat_stop_timer()
+
+
+class PM_OT_cancel_compat(_PMBase):
+    bl_idname = "plugin_manager.cancel_compat"
+    bl_label = "取消兼容性测试"
+    bl_description = "当前插件处理结束后停止后续测试；已完成结果会保留"
+
+    def execute(self, context):
+        state = _COMPAT.get("state")
+        prefs = _prefs(context)
+        if state is None or prefs is None:
+            return _report(self, False, "没有正在运行的测试")
+        # 不中断正在进行的加载/卸载，只设置取消请求。
+        state.request_cancel()
+        prefs.compat_cancelling = True
+        _status("插件库：正在取消，等待当前插件处理结束…")
+        _redraw()
+        return _report(self, True, "已请求取消：当前插件处理结束后停止，已完成结果会保留")
 
 
 class PM_OT_cleanup_residue(_PMBase):
@@ -1730,6 +1797,7 @@ classes = (
     PM_OT_set_startup,
     PM_OT_apply_startup,
     PM_OT_verify_compat,
+    PM_OT_cancel_compat,
     PM_OT_cleanup_residue,
     PM_OT_toggle_select,
     PM_OT_select_all,

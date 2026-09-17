@@ -12,7 +12,7 @@ out = {}
 # 重载 ui（含菜单）
 import bl_plugin_manager as PM
 for name in ("constants", "scan", "db", "bridge", "library", "store", "updates",
-             "migrate", "watcher", "items", "preferences", "operators", "ui", "header"):
+             "migrate", "watcher", "items", "preferences", "operators", "ui"):
     mod = getattr(PM, name, None)
     if mod is None:
         try:
@@ -40,11 +40,6 @@ try:
                 bpy.utils.register_class(cls)
             except Exception as e:
                 out.setdefault("reg_errors", []).append(f"{cls.__name__}: {e}")
-    try:
-        PM.header.unregister()
-    except Exception:
-        pass
-    PM.header.register()
     out["reregister"] = "ok"
 except Exception as e:
     out["reregister"] = f"ERR {e}"
@@ -53,7 +48,8 @@ finally:
 
 # 1) 面板与菜单是否注册
 out["panels"] = [c for c in ("PM_PT_main", "PM_PT_detail", "PM_PT_batch",
-                             "PM_PT_actions", "PM_PT_tools") if hasattr(bpy.types, c)]
+                             "PM_PT_actions") if hasattr(bpy.types, c)]
+out["tools_removed"] = not hasattr(bpy.types, "PM_PT_tools")
 out["menus"] = [c for c in ("PM_MT_library", "PM_MT_category", "PM_MT_plugin")
                 if hasattr(bpy.types, c)]
 
@@ -76,7 +72,7 @@ dialog_only = {"store_install", "store_open", "store_sync", "show_report",
                "unmount_library", "clear_updates", "toggle", "set_startup",
                "toggle_select", "select_all", "batch_enable", "batch_set_category",
                "batch_set_startup", "open_folder", "remove_plugin", "set_favorite",
-               "scan_candidates", "import_candidates", "apply_startup", "header_popup"}
+               "scan_candidates", "import_candidates", "apply_startup", "cancel_compat"}
 
 # 4) 真实绘制：面板 + 菜单
 class L:
@@ -107,7 +103,7 @@ if prefs.plugin_items:
     prefs.active_index = 0
     prefs.selected_key = prefs.plugin_items[0].key
 
-for cls_name in ("PM_PT_main", "PM_PT_detail", "PM_PT_batch", "PM_PT_actions", "PM_PT_tools"):
+for cls_name in ("PM_PT_main", "PM_PT_detail", "PM_PT_batch", "PM_PT_actions"):
     cls = getattr(PM.ui, cls_name, None)
     if not cls:
         drawn[cls_name] = "MISSING"

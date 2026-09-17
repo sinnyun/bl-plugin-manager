@@ -21,7 +21,7 @@ out = {}
 # --- 1) 重载代码 ---
 import bl_plugin_manager as PM
 for name in ("constants", "scan", "db", "bridge", "library", "store", "updates",
-             "migrate", "watcher", "items", "preferences", "operators", "ui", "header"):
+             "migrate", "watcher", "items", "preferences", "operators", "ui"):
     mod = getattr(PM, name, None)
     if mod is None:
         try:
@@ -49,11 +49,6 @@ try:
                 bpy.utils.register_class(cls)
             except Exception:
                 pass
-    try:
-        PM.header.unregister()
-    except Exception:
-        pass
-    PM.header.register()
     out["reload"] = "ok"
 except Exception as e:
     out["reload"] = f"ERR {e}"
