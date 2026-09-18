@@ -1,4 +1,4 @@
-# Blender 插件库管理器 2.0
+# Blender 插件库管理器 2.1
 
 面向 Blender 4.2+ 的便携插件库。它统一管理传统插件、扩展插件、分类、别名、备注、启用状态、扩展仓库和自定义脚本目录，同时把“共享数据”与“每台电脑的路径和启用清单”严格分开。
 
@@ -11,6 +11,7 @@
 - 管理开启时，Blender 原生“获取扩展 / 插件 / 文件路径”中的相关配置由本插件接管并双向同步。
 - 管理停止时，只恢复扩展仓库、自定义脚本目录和库内插件启用状态；不会重置主题、快捷键、语言、渲染、资产库或其它偏好。
 - 插件不会调用 Blender 的全局偏好保存或工厂重置操作，也不会自动修改“允许联网访问”。
+- 「一键测试插件支持」以分步任务运行：界面在测试期间保持可交互，可随时取消，进度与结果即时可见。
 
 ## 数据布局
 
@@ -125,10 +126,17 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 ## 验证
 
 ```powershell
+# 纯 Python：单元测试 + 静态入口检查（不需要 Blender）
 python -m unittest discover -s tests -p "test*.py" -q
+python _test/check_ui.py
+python _test/audit_features.py
+
+# Blender 隔离回归与端到端（需 Blender 4.2+，可用 BLENDER_EXE 指定可执行文件）
 powershell -ExecutionPolicy Bypass -File _test/run_regressions.ps1
 powershell -ExecutionPolicy Bypass -File _test/run_e2e.ps1
 ```
+
+两套 Blender 启动器会把配置、脚本、TEMP、本机配置和本地状态全部指向一次性临时目录，因此不会改动真实插件库或用户偏好。`_test/test_ui_smoke.py` 用模拟布局真实执行各面板与列表行的 `draw`，需在 Blender 内单独运行。
 
 详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-14-scoped-management-design.md`、`docs/superpowers/specs/2026-09-15-compatibility-task-and-settings-design.md` 和 `docs/superpowers/plans/2026-09-15-compatibility-task-and-settings-plan.md`。
 
