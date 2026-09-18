@@ -144,6 +144,7 @@ def _refresh_existing(rec: dict, new_src: str, dest: str, root: str, db: Library
         raise
 
     fresh = scan.read_meta(dest, kind) or {}
+    plugin_id = rec["plugin_id"]
     rec["version"] = fresh.get("version") or rec.get("version", "")
     rec["name"] = fresh.get("name") or rec.get("name") or rec.get("folder_name")
     rec["blender_min"] = fresh.get("blender_min", rec.get("blender_min", ""))
@@ -165,7 +166,7 @@ def _refresh_existing(rec: dict, new_src: str, dest: str, root: str, db: Library
     if not rec.get("note"):
         rec["note"] = rec.get("description", "")
     rec["enabled"] = was_enabled
-    db.upsert(rec["key"], rec)
+    db.plugins[plugin_id] = rec
     db.save()
 
     bridge.refresh_blender()
@@ -173,7 +174,7 @@ def _refresh_existing(rec: dict, new_src: str, dest: str, root: str, db: Library
         ok, err = bridge.set_enabled(rec["module"], True)
         rec["enabled"] = bridge.is_module_enabled(rec["module"])
         rec["restore_error"] = "" if ok else (err or "更新后重新启用失败")
-        db.upsert(rec["key"], rec)
+        db.plugins[plugin_id] = rec
         db.save()
     return rec
 
@@ -200,74 +201,83 @@ def backup_plugin(root: str, plugin_dir: str) -> str | None:
 # ---------------------------------------------------------------------------
 # 建立记录
 # ---------------------------------------------------------------------------
-def _build_record(root: str, plugin_dir: str, kind: str, meta: dict, old: dict | None = None,
-                  origin: str = "", origin_path: str = "",
-                  module: str | None = None, check_issues: bool = True) -> dict:
+def _build_entry(root: str, plugin_dir: str, kind: str, meta: dict,
+                 module: str | None = None, check_issues: bool = True) -> dict:
+    """构造一条**扫描条目**（不是最终记录）。
+
+    条目只携带可与总资料库对齐的信息；``plugin_id`` 由 ``link_scan`` 依据身份
+    线索匹配或新建，因此导入路径不会自己编造 id。
+    """
     folder = os.path.basename(plugin_dir)
-    pkg_id = meta.get("id") or (folder if kind == C.KIND_EXTENSION else "")
-    # module 可由调用方预先解析（批量同步时只算一次索引），避免逐个重复遍历
+    pkg_id = meta.get("id") or ""
     if module is None:
         module = bridge.resolve_module(plugin_dir, kind, pkg_id)
-    auto_name = meta.get("name") or folder
-    compat = scan.blender_compat(meta.get("blender_min", ""), meta.get("blender_max", ""))
-    rec = {
-        "kind": kind,
+    entry = {
         "rel": rel_key(root, plugin_dir),
-        "folder_name": folder,
-        "id": pkg_id,
+        "kind": kind,
         "pkg_id": pkg_id,
-        "name": auto_name,
+        "id": pkg_id,
+        "name": meta.get("name") or folder,
+        "folder_name": folder,
         "version": meta.get("version", ""),
         "blender_min": meta.get("blender_min", ""),
         "blender_max": meta.get("blender_max", ""),
         "pkg_type": meta.get("type", ""),
-        "compat": compat[0],
-        "compat_detail": compat[1],
         "author": meta.get("author", ""),
         "description": meta.get("description", ""),
         "auto_category": meta.get("category", "") or C.DEFAULT_CATEGORY,
         "auto_tags": meta.get("tags", []) or [],
+        "doc_url": meta.get("doc_url", ""),
+        "location": meta.get("location", ""),
         "metadata_fingerprint": scan.metadata_fingerprint(plugin_dir, kind),
-        "source_url": meta.get("doc_url", ""),
-        "module": module,
-        "missing": False,
-        # 扩展插件的 manifest 合规问题（会导致 Blender 跳过加载）
-        # 批量同步时可跳过（check_issues=False）以省去逐目录重读 manifest；
-        # 导入/新增时仍校验，保证问题能被报出来。
         "issues": (scan.manifest_issues(plugin_dir)
                    if (check_issues and kind == C.KIND_EXTENSION) else []),
-        # 上次启用失败的原因（便于排查）
-        "last_error": "",
+        "module": module,
     }
-    if old:
-        # 已有人为指定的分类就保留；否则一律归到「未分类」，不套用插件自带分类
-        rec["category"] = old.get("category") or C.DEFAULT_CATEGORY
-        rec["tags"] = old.get("tags", []) or rec["auto_tags"]
-        # 备注：用户手动写过就保留；没写过则用插件自带的描述自动填充
-        rec["note"] = old.get("note", "") or rec["description"]
-        rec["favorite"] = old.get("favorite", False)
-        rec["display_name"] = old.get("display_name", "")
-        rec["origin"] = old.get("origin", origin)
-        rec["origin_path"] = old.get("origin_path", origin_path)
-        rec["created_at"] = old.get("created_at")
-        # 自启标记：保留用户设置；首次出现时保守默认为「不随启动加载」，
-        # 由用户在界面显式勾选（避免把当前会话临时启用的插件误当成自启）
-        rec["startup"] = bool(old["startup"]) if "startup" in old else False
-        rec["last_error"] = old.get("last_error", "")
-    else:
-        # 新导入的插件默认「未分类」，分类完全由你自己整理
-        rec["category"] = C.DEFAULT_CATEGORY
-        rec["tags"] = list(rec["auto_tags"])
-        # 首次导入自动写入描述作为备注，用户之后可覆盖
-        rec["note"] = rec["description"]
-        rec["favorite"] = False
-        rec["display_name"] = ""
-        rec["startup"] = False
-        rec["origin"] = origin
-        rec["origin_path"] = origin_path
-        rec["imported_at"] = now_iso()
-    rec["enabled"] = bridge.is_module_enabled(module)
-    return rec
+    return entry
+
+
+def _link_entry(db: LibraryDB, entry: dict) -> str:
+    """把单条扫描条目并入总资料库，返回匹配/新建的 plugin_id。"""
+    db.merge_scan([entry])
+    plugin_id = db.assignments.get(entry.get("rel", ""))
+    if not plugin_id:
+        for pid, rel in db.bindings.items():
+            if rel == entry.get("rel"):
+                plugin_id = pid
+                break
+    if not plugin_id:
+        raise RuntimeError("插件未能并入总资料库")
+    return plugin_id
+
+
+def _apply_user_defaults(db: LibraryDB, plugin_id: str, entry: dict,
+                         origin: str, origin_path: str) -> dict:
+    """为新并入的条目补齐用户字段默认值（仅在字段缺失时）。"""
+    from .db import now_iso as _now
+
+    record = db.get(plugin_id) or {}
+    changed = False
+    defaults = {
+        "category": C.DEFAULT_CATEGORY,
+        "tags": list(entry.get("auto_tags") or []),
+        "note": entry.get("description", ""),
+        "favorite": False,
+        "display_name": "",
+        "startup": False,
+        "origin": origin,
+        "origin_path": origin_path,
+        "created_at": record.get("created_at") or _now(),
+    }
+    for field, value in defaults.items():
+        # 用户字段必须始终存在（即便值为空），界面与调用方按字段读取。
+        if record.get(field) in (None, ""):
+            record[field] = value
+            changed = True
+    if changed:
+        db.plugins[plugin_id] = record
+    return record
+
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +318,6 @@ def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = Fa
 
     dest = _unique_dest(base, folder)
 
-    key = rel_key(root, dest)
-    old = db.get(key) or db.get(rel_key(root, plugin_dir) if not move else "")
-
     # 目标已存在（同名覆盖）时先备份再清理
     if os.path.exists(dest):
         backup_plugin(root, dest)
@@ -321,18 +328,37 @@ def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = Fa
     else:
         shutil.copytree(plugin_dir, dest)
 
-    rec = _build_record(root, dest, kind, meta, old=old, origin=origin, origin_path=origin_path)
-    stored = db.upsert(rel_key(root, dest), rec)
+    entry = _build_entry(root, dest, kind, meta)
+    # 匹配可能连回既有条目，也可能新建（本机已有同一插件的另一个副本时）。
+    plugin_id = _link_entry(db, entry)
+    # 目标目录已按库内命名规范落位，覆盖本机绑定，避免沿用导入源的路径。
+    # 用户字段默认值写完后必须重新取回记录：_apply_user_defaults 更新的是
+    # db.plugins 中的那份，持有旧引用再回写会把补齐的字段覆盖掉。
+    _apply_user_defaults(db, plugin_id, entry, origin, origin_path)
+    record = db.get(plugin_id) or {}
+    record["rel"] = entry["rel"]
+    record["folder_name"] = entry["folder_name"]
+    record["module"] = entry["module"]
+    record["metadata_fingerprint"] = entry["metadata_fingerprint"]
+    record["issues"] = entry["issues"]
+    record["missing"] = False
+    # compat 是相对当前 Blender 版本的结论，属本机派生字段（界面每次现算），
+    # 这里一并写入，便于调用方直接读取导入结果。
+    record["compat"], record["compat_detail"] = scan.blender_compat(
+        record.get("blender_min", ""), record.get("blender_max", ""))
+    record["enabled"] = bridge.is_module_enabled(record.get("module", ""))
+    db.plugins[plugin_id] = record
     db.save()
 
     bridge.refresh_blender(deep=True)
     if enable:
-        stored["enabled"] = bridge.is_module_enabled(stored["module"])
-        bridge.set_enabled(stored["module"], True)
-        stored["enabled"] = bridge.is_module_enabled(stored["module"])
-        db.upsert(stored["key"], stored)
+        stored = db.get(plugin_id) or record
+        bridge.set_enabled(stored.get("module", ""), True)
+        stored["enabled"] = bridge.is_module_enabled(stored.get("module", ""))
+        db.plugins[plugin_id] = stored
         db.save()
-    return stored
+        return stored
+    return db.get(plugin_id) or record
 
 
 def import_zip(zip_path: str, root: str, db: LibraryDB, enable: bool = False,
@@ -470,131 +496,76 @@ def connect_library(root: str, db: LibraryDB, move_flat: bool = True) -> dict:
 
 
 def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
-    """扫描库内容，补建/更新记录，并标记消失的插件。
+    """扫描库内容，把本机安装的插件连接到总资料库。
 
-    性能要点：
-    * 模块索引只解析一次并复用（原先每个插件都全量遍历一次，152 个约 8 秒）；
-    * 已存在且版本未变的记录直接跳过，不做 manifest 重解析与写盘。
+    记录以稳定 plugin_id 为键；本机实际安装位置保存在 ``db.bindings`` 中。
+    已存在且元数据未变的插件只刷新本机派生字段（模块名、启用状态），跳过
+    manifest 重解析与写盘。
+
+    性能要点：模块索引只解析一次并复用（原先每个插件都全量遍历一次，
+    152 个约 8 秒）。
     """
-    seen = set()
-    stats = {"added": 0, "updated": 0, "unchanged": 0, "missing": 0}
-
-    if db.data.get("schema") == 2 and db.data.get("library_id"):
-        portable = []
-        runtime_modules = {}
-        module_index = bridge._module_index()
-        active_repo = bridge._active_repo_module()
-        for kind, base in ((C.KIND_ADDON, os.path.join(root, C.DIR_ADDONS)),
-                           (C.KIND_EXTENSION, os.path.join(root, C.DIR_EXTENSIONS))):
-            for entry in scan.scan_dir(base, kind_hint=kind):
-                if not entry["valid"]:
-                    continue
-                meta = entry["meta"] or {}
-                key = rel_key(root, entry["abs"])
-                module = module_index.get(bridge._norm(entry["abs"]))
-                if not module:
-                    folder = os.path.basename(os.path.normpath(entry["abs"]))
-                    module = (f"bl_ext.{active_repo}.{folder}"
-                              if kind == C.KIND_EXTENSION else folder)
-                runtime_modules[key] = module
-                portable.append({
-                    "key": key,
-                    "kind": kind,
-                    "rel": rel_key(root, entry["abs"]),
-                    "id": meta.get("id", ""),
-                    "name": meta.get("name") or entry.get("name", ""),
-                    "folder_name": entry.get("name", ""),
-                    "version": meta.get("version", ""),
-                })
-        old_keys = set(db.plugins)
-        new = db.merge_scan(portable)
-        stats["added"] = len(set(new) - old_keys)
-        stats["updated"] = len(set(new) & old_keys)
-        stats["missing"] = len(old_keys - set(new))
-        for key, record in db.plugins.items():
-            module = runtime_modules.get(key)
-            if module:
-                record["module"] = module
-                record["enabled"] = bridge.is_module_enabled(module)
-                record["missing"] = False
-            else:
-                record["missing"] = True
-        # merge_scan writes portable metadata first; this second save splits
-        # the derived fields into the environment-local state file while
-        # keeping the shared library database machine-independent.
-        db.save()
-        return stats
-
-    # 一次性建立模块索引，供本函数内所有记录解析复用
+    entries = []
+    runtime_modules: dict[str, str] = {}
     module_index = bridge._module_index()
-
-    # 扩展模块名要带上"实际仓库"，一次性取好避免逐条查询
     active_repo = bridge._active_repo_module()
-
-    def _module_for(plugin_dir, kind, pkg_id):
-        found = module_index.get(bridge._norm(plugin_dir))
-        if found:
-            return found
-        folder = os.path.basename(os.path.normpath(plugin_dir))
-        if kind == C.KIND_EXTENSION:
-            return f"bl_ext.{active_repo}.{folder}"
-        return folder
 
     for kind, base in ((C.KIND_ADDON, os.path.join(root, C.DIR_ADDONS)),
                        (C.KIND_EXTENSION, os.path.join(root, C.DIR_EXTENSIONS))):
         for entry in scan.scan_dir(base, kind_hint=kind):
             if not entry["valid"]:
                 continue
-            key = rel_key(root, entry["abs"])
-            seen.add(key)
-            old = db.get(key)
             meta = entry["meta"] or {}
-            pkg_id = meta.get("id") or (entry["name"] if kind == C.KIND_EXTENSION else "")
+            folder = os.path.basename(os.path.normpath(entry["abs"]))
+            key = rel_key(root, entry["abs"])
+            module = module_index.get(bridge._norm(entry["abs"]))
+            if not module:
+                module = (f"bl_ext.{active_repo}.{folder}"
+                          if kind == C.KIND_EXTENSION else folder)
+            runtime_modules[key] = module
+            entries.append({
+                "rel": key,
+                "kind": kind,
+                "pkg_id": meta.get("id", ""),
+                "id": meta.get("id", ""),
+                # scan_dir 的 entry["name"] 是**目录名**；插件声明名在 meta 中。
+                "name": meta.get("name") or folder,
+                "folder_name": folder,
+                "version": meta.get("version", ""),
+                "blender_min": meta.get("blender_min", ""),
+                "blender_max": meta.get("blender_max", ""),
+                "pkg_type": meta.get("type", ""),
+                "author": meta.get("author", ""),
+                "description": meta.get("description", ""),
+                "auto_category": meta.get("category", "") or C.DEFAULT_CATEGORY,
+                "auto_tags": meta.get("tags", []) or [],
+                "doc_url": meta.get("doc_url", ""),
+                "location": meta.get("location", ""),
+                "metadata_fingerprint": scan.metadata_fingerprint(entry["abs"], kind),
+                "issues": (scan.manifest_issues(entry["abs"])
+                           if kind == C.KIND_EXTENSION else []),
+            })
 
-            # 记录已存在、版本一致、且文件未动 → 只刷新派生字段，跳过重解析
-            if old is not None and skip_unchanged:
-                same_ver = (meta.get("version") or "") == (old.get("version") or "")
-                fingerprint = scan.metadata_fingerprint(entry["abs"], kind)
-                same_meta = old.get("metadata_fingerprint") == fingerprint
-                if same_ver and same_meta and not old.get("missing"):
-                    module = old.get("module") or _module_for(entry["abs"], kind, pkg_id)
-                    enabled = bridge.is_module_enabled(module)
-                    changed = False
-                    if enabled != bool(old.get("enabled")) or "module" not in old:
-                        old["module"] = module
-                        old["enabled"] = enabled
-                        changed = True
-                    # 兼容信息是派生字段，老记录可能缺失 → 补算
-                    if "blender_max" not in old or "compat" not in old:
-                        old["blender_max"] = meta.get("blender_max", "")
-                        _c = scan.blender_compat(meta.get("blender_min", ""),
-                                                 old["blender_max"])
-                        old["compat"], old["compat_detail"] = _c
-                        changed = True
-                    if changed:
-                        stats["updated"] += 1
-                    else:
-                        stats["unchanged"] += 1
-                    continue
+    db.merge_scan(entries)
+    stats = dict(db.scan_stats or {})
+    stats.setdefault("added", 0)
+    stats.setdefault("updated", 0)
+    stats.setdefault("unchanged", 0)
+    stats.setdefault("missing", 0)
+    stats["bindings"] = len(db.bindings)
 
-            module = _module_for(entry["abs"], kind, pkg_id)
-            # 已有记录（非新增）时跳过 manifest 合规重校验，显著加快批量同步
-            rec = _build_record(root, entry["abs"], kind, meta, old=old, module=module,
-                                check_issues=(old is None))
-            if old is None:
-                stats["added"] += 1
-            else:
-                stats["updated"] += 1
-            db.upsert(key, rec)
-
-    for key, rec in list(db.plugins.items()):
-        if key not in seen:
-            if not rec.get("missing"):
-                rec["missing"] = True
-                stats["missing"] += 1
-        elif rec.get("missing"):
-            rec["missing"] = False
-
+    # 本机派生字段：模块名、启用状态、缺失标记。写入本机运行状态，不进总资料库。
+    for record in db.plugins.values():
+        record["compat"], record["compat_detail"] = scan.blender_compat(
+            record.get("blender_min", ""), record.get("blender_max", ""))
+        module = runtime_modules.get(record.get("rel", ""))
+        if module:
+            record["module"] = module
+            record["enabled"] = bridge.is_module_enabled(module)
+            record["missing"] = False
+        else:
+            # 本机这次没扫描到：保留既有启用意图，只标记缺失。
+            record["missing"] = True
     db.save()
     return stats
 
@@ -628,6 +599,8 @@ def remove_plugin(root: str, db: LibraryDB, key: str, to_trash: bool = True) -> 
             shutil.rmtree(plugin_dir, ignore_errors=True)
     # 若是扩展插件，尽量同步从仓库缓存中移除
     bridge.refresh_blender(deep=True)
+    # 只解除本机绑定；总资料库条目保留（别名/分类/备注属于所有电脑，
+    # 该插件在别的电脑上仍然安装着，重新安装到本机时也会自动连回）。
     db.remove(key)
     db.save()
     return moved_to
@@ -750,7 +723,7 @@ def replace_from_zip(rec: dict, zip_path: str, root: str, db: LibraryDB,
     rec["last_error"] = ""
     rec["enabled"] = was_enabled
     rec["updated_at"] = now_iso()
-    db.upsert(rec["key"], rec)
+    db.plugins[rec["plugin_id"]] = rec
     if defer_refresh:
         return rec
     db.save()
@@ -761,6 +734,6 @@ def replace_from_zip(rec: dict, zip_path: str, root: str, db: LibraryDB,
         ok, err = bridge.set_enabled(module, True)
         rec["enabled"] = bridge.is_module_enabled(module)
         rec["restore_error"] = "" if ok else (err or "更新后重新启用失败")
-        db.upsert(rec["key"], rec)
+        db.plugins[rec["plugin_id"]] = rec
         db.save()
     return rec

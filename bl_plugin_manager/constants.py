@@ -7,8 +7,8 @@ import os
 # --- 身份标识 -------------------------------------------------------------
 ADDON_ID = "bl_plugin_manager"
 ADDON_NAME = "插件库管理器"
-ADDON_VERSION = (2, 1, 0)
-ADDON_VERSION_STR = "2.1.0"
+ADDON_VERSION = (2, 2, 0)
+ADDON_VERSION_STR = "2.2.0"
 
 # Blender 侧扩展仓库标识（必须是合法的 Python 标识符）
 REPO_MODULE = "pmlib"
@@ -22,8 +22,11 @@ DIR_TRASH = "trash"            # 移除区
 DIR_META = ".pm"               # 内部数据（元数据库、备份、日志）
 DIR_BACKUPS = os.path.join(DIR_META, "backups")
 
-DB_FILENAME = "library.json"
-DB_SCHEMA = 2
+# 总插件数据库：可同步的插件资料库（所有电脑共享），位于 <库>/.pm/catalog.json
+DB_FILENAME = "catalog.json"
+DB_SCHEMA = 1
+# 旧版（2.1 及以前）共享库文件名，升级时会被迁移并归档。
+LEGACY_DB_FILENAME = "library.json"
 PROCESSED_LOG = os.path.join(DIR_META, "processed.json")
 
 DEFAULT_CATEGORY = "未分类"

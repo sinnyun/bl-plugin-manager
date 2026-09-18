@@ -31,7 +31,7 @@ class UIRefreshTests(unittest.TestCase):
             prefs = Prefs()
             prefs.library_path = root
             (Path(root) / ".pm").mkdir()
-            (Path(root) / ".pm" / "library.json").write_text("{}", encoding="utf-8")
+            (Path(root) / ".pm" / "catalog.json").write_text("{}", encoding="utf-8")
             mod._LAST = {"t": 0.0, "sig": None}
             with patch.object(mod, "rebuild_items") as rebuild, patch.object(mod.time, "time", side_effect=[1.0, 2.0]):
                 mod.maybe_rebuild(prefs, force=True)

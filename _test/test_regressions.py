@@ -21,7 +21,15 @@ import bpy  # type: ignore
 
 from bl_plugin_manager import bridge, compat_task, constants as C, library, ui
 from bl_plugin_manager.db import LibraryDB
-from bl_plugin_manager.storage.shared_db import SharedDatabase
+from bl_plugin_manager.storage.catalog import Catalog
+
+
+def _id_for_rel(db, rel: str) -> str:
+    """按库内相对路径反查 plugin_id（记录以稳定 id 为键）。"""
+    for pid, bound in db.bindings.items():
+        if bound == rel:
+            return pid
+    return ""
 
 
 def _assert_isolated_runtime() -> None:
@@ -108,6 +116,7 @@ def case_failed_trash_move(root: str) -> None:
     db = LibraryDB(root, use_cache=False)
     rec = library.import_plugin_dir(plugin, root, db, move=True)
     installed = os.path.join(root, rec["rel"].replace("/", os.sep))
+    plugin_id = rec["plugin_id"]
 
     original_move = library.shutil.move
 
@@ -116,12 +125,12 @@ def case_failed_trash_move(root: str) -> None:
 
     library.shutil.move = fail_move
     try:
-        result = library.remove_plugin(root, db, rec["key"], to_trash=True)
+        result = library.remove_plugin(root, db, plugin_id, to_trash=True)
     finally:
         library.shutil.move = original_move
     check("failed trash move returns failure", result is None)
     check("failed trash move keeps source", os.path.isdir(installed))
-    check("failed trash move keeps record", LibraryDB(root, use_cache=False).get(rec["key"]) is not None)
+    check("failed trash move keeps record", LibraryDB(root, use_cache=False).get(plugin_id) is not None)
 
 
 def case_same_version_metadata_refresh(root: str) -> None:
@@ -130,50 +139,59 @@ def case_same_version_metadata_refresh(root: str) -> None:
     _write_legacy(plugin, "Old Regression Name")
     db = LibraryDB(root, use_cache=False)
     first = library.sync_library(root, db)
-    key = "addons/SameVersion"
-    old = LibraryDB(root, use_cache=False).get(key)
-    check("same-version fixture imported", old is not None, str(first))
+    stored = LibraryDB(root, use_cache=False)
+    plugin_id = _id_for_rel(stored, "addons/SameVersion")
+    check("same-version fixture imported", bool(plugin_id), str(first))
+    if not plugin_id:
+        return
 
     # Ensure both mtime and size differ on filesystems with coarse timestamps.
     time.sleep(0.02)
     _write_legacy(plugin, "New Regression Name")
     os.utime(os.path.join(plugin, C.LEGACY_INIT), None)
     stats = library.sync_library(root, LibraryDB(root, use_cache=False))
-    fresh = LibraryDB(root, use_cache=False).get(key)
-    check("same-version metadata refreshed", fresh and fresh.get("name") == "New Regression Name",
-          f"name={fresh.get('name') if fresh else None}, stats={stats}")
+    fresh = LibraryDB(root, use_cache=False).get(plugin_id)
+    check("same-version metadata refreshed",
+          fresh and "new-regression-name" in (fresh.get("names") or []),
+          f"names={fresh.get('names') if fresh else None}, stats={stats}")
 
 
 def case_cache_isolation(root: str) -> None:
     """Mutating a saved DB object after save must not mutate the global cache."""
     db = LibraryDB(root, use_cache=True)
-    rec = db.upsert("addons/cache_fixture", {"name": "saved value"})
+    db.prepare()
+    rec = db.upsert("addon:cache-fixture", {"name": "saved value", "rel": "addons/cache_fixture"})
     db.save()
     rec["name"] = "UNSAVED mutation"
     fresh = LibraryDB(root, use_cache=True)
-    loaded = fresh.get("addons/cache_fixture")
+    loaded = fresh.get("addon:cache-fixture")
     check("DB cache isolates unsaved mutation",
           loaded is not None and loaded.get("name") == "saved value",
           str(loaded))
 
 
-def case_schema2_scan_persists_local_module(root: str) -> None:
-    """A fresh schema-2 scan must resolve module names into local state."""
-    schema_root = root + "_schema2"
-    SharedDatabase(schema_root).initialize()
+def case_catalog_scan_persists_local_module(root: str) -> None:
+    """A scan must resolve module names into local state, never the catalog."""
+    schema_root = root + "_catalog"
     plugin = os.path.join(schema_root, C.DIR_ADDONS, "blender_mcp")
     _write_legacy(plugin, "MCP for Blender", (1, 6))
 
-    library.sync_library(schema_root, LibraryDB(schema_root, use_cache=False))
-    record = LibraryDB(schema_root, use_cache=False).get("addons/blender_mcp")
-    check("schema2 scan resolves MCP module locally",
+    db = LibraryDB(schema_root, use_cache=False)
+    db.prepare()
+    library.sync_library(schema_root, db)
+    reopened = LibraryDB(schema_root, use_cache=False)
+    plugin_id = _id_for_rel(reopened, "addons/blender_mcp")
+    record = reopened.get(plugin_id) if plugin_id else None
+    check("scan resolves MCP module locally",
           record is not None and record.get("module") == "blender_mcp", str(record))
 
     with open(os.path.join(schema_root, C.DIR_META, C.DB_FILENAME),
               "r", encoding="utf-8") as fh:
-        shared_record = json.load(fh)["plugins"]["addons/blender_mcp"]
-    check("schema2 shared record excludes machine module",
+        shared_record = json.load(fh)["plugins"][plugin_id]
+    check("catalog record excludes machine module",
           "module" not in shared_record, str(shared_record))
+    check("catalog record excludes local path",
+          "rel" not in shared_record, str(shared_record))
 
 
 def case_mount_state_signature(root: str) -> None:
@@ -409,7 +427,7 @@ def main() -> int:
         ("failed trash move", case_failed_trash_move),
         ("same-version metadata", case_same_version_metadata_refresh),
         ("cache isolation", case_cache_isolation),
-        ("schema2 local module", case_schema2_scan_persists_local_module),
+        ("catalog local module", case_catalog_scan_persists_local_module),
         ("mount state signature", case_mount_state_signature),
         ("repository target", case_repository_target_selection),
         ("list compatibility display", case_list_compatibility_display),

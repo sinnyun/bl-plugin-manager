@@ -202,9 +202,9 @@ def install_package(pkg: dict, root: str, db: LibraryDB, enable: bool = False,
                                  origin="在线商店", origin_path=pkg.get("website", ""))
         if pkg.get("id") and not rec.get("id"):
             rec["id"] = pkg["id"]
-        rec["source"] = "store"
+        rec["origin"] = "在线商店"
         rec["source_url"] = pkg.get("website", "") or rec.get("source_url", "")
-        db.upsert(rec["key"], rec)
+        db.plugins[rec["plugin_id"]] = rec
         db.save()
         return True, "", rec
     except Exception as exc:

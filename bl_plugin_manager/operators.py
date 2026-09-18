@@ -17,7 +17,6 @@ from . import (bridge, compat_task, constants as C, library, migrate, scan,
                scoped_management, store, updates, watcher)
 from .db import LibraryDB, now_iso
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
-from .storage.shared_db import SharedDatabase
 
 
 # ---------------------------------------------------------------------------
@@ -60,11 +59,14 @@ def _sync_device_config(prefs) -> str:
 
 
 def _initialize_schema2(root: str) -> LibraryDB:
-    """Archive non-schema-2 metadata, then open the clean shared database."""
-    report = SharedDatabase(root).initialize()
-    if report.status == "CORRUPT":
+    """确保总资料库就绪，并把旧版 library.json 迁移进资料库。
+
+    调用方必须先确认目录是插件库（不是无关目录），否则会创建出空库。
+    """
+    db = LibraryDB(root, use_cache=False)
+    if db.prepare() == "CORRUPT":
         raise RuntimeError("插件库元数据已损坏，已保持只读，未覆盖原文件")
-    return LibraryDB(root, use_cache=False)
+    return db
 
 
 class _PMBase(Operator):
@@ -484,7 +486,8 @@ def _compat_tick():
         if outcome is not None:
             record = db.get(outcome.key) or {}
             record.update(outcome.fields)
-            db.upsert(outcome.key, record)
+            record["key"] = outcome.key
+            db.plugins[outcome.key] = record
             # 每步落盘：取消或异常时已完成的结果不丢。
             db.save()
             prefs.compat_done = state.index
@@ -613,7 +616,7 @@ class PM_OT_cleanup_residue(_PMBase):
                     cleaned.append(rec.get("name") or mod)
                 else:
                     still.append({"name": rec.get("name") or mod, "left": left})
-                db.upsert(key, rec)
+                db.plugins[key] = rec
         finally:
             _clear_status()
 

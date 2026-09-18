@@ -13,14 +13,20 @@ _LAST = {"t": 0.0, "sig": None}
 
 
 def _signature(prefs):
-    db_sig = None
+    """界面刷新签名：库路径、筛选条件，以及总插件数据库与旧库的文件签名。
+
+    资源管理器同时监听 catalog.json 与旧的 library.json，这样同步软件在任一侧
+    更新后列表都会重建；旧库只在升级迁移期间存在。
+    """
+    db_sigs = []
     if getattr(prefs, "library_path", ""):
-        path = os.path.join(prefs.library_path, C.DIR_META, C.DB_FILENAME)
-        try:
-            st = os.stat(path)
-            db_sig = (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size)
-        except OSError:
-            db_sig = None
+        for name in (C.DB_FILENAME, C.LEGACY_DB_FILENAME):
+            path = os.path.join(prefs.library_path, C.DIR_META, name)
+            try:
+                st = os.stat(path)
+                db_sigs.append((st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size))
+            except OSError:
+                continue
     return (
         prefs.library_path,
         prefs.active_category,
@@ -29,7 +35,7 @@ def _signature(prefs):
         prefs.only_enabled,
         prefs.only_incompatible,
         prefs.search,
-        db_sig,
+        tuple(db_sigs),
     )
 
 

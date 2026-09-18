@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 1, 0),
+    "version": (2, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -89,15 +89,14 @@ def _bootstrap_prefs():
         return
     try:
         bridge.ensure_library_dirs(prefs.library_path)
-        from .storage.shared_db import SharedDatabase
-        report = SharedDatabase(prefs.library_path).initialize()
-        if report.status == "CORRUPT":
+        local_db = db.LibraryDB(prefs.library_path, use_cache=False)
+        if local_db.prepare() == "CORRUPT":
             print("[插件库] 元数据损坏，已保持只读，跳过自动扫描")
             return
         result = scoped_management.activate(prefs.library_path)
         if result["state"] == "ERROR":
             print("[插件库] 恢复设备配置时存在失败:", result["failures"])
-        library.sync_library(prefs.library_path, db.LibraryDB(prefs.library_path, use_cache=False))
+        library.sync_library(prefs.library_path, local_db)
     except Exception as exc:
         print("[插件库] 初始化库失败:", exc)
 
