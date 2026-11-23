@@ -534,12 +534,27 @@ class PM_PT_main(Panel):
         search_row.prop(prefs, "search", text="", icon="VIEWZOOM")
         search_row.prop(prefs, "kind_filter", text="")
 
+        tri_filters = layout.row(align=True)
+        tri_filters.prop(prefs, "enabled_filter", text="")
+        tri_filters.prop(prefs, "startup_filter", text="")
+        tri_filters.prop(prefs, "issue_filter", text="")
+
+        has_active_filter = bool(
+            prefs.search or prefs.active_category not in ("", "全部")
+            or prefs.active_preset_filter
+            or prefs.kind_filter != "all"
+            or prefs.enabled_filter != "all"
+            or prefs.startup_filter != "all"
+            or prefs.issue_filter != "all"
+            or prefs.only_favorites or prefs.only_updates
+        )
         filters = layout.row(align=True)
-        filters.prop(prefs, "only_enabled", text="已启用", toggle=True)
         filters.prop(prefs, "only_favorites", text="收藏", toggle=True)
         filters.prop(prefs, "only_updates", text="更新", toggle=True)
-        filters.prop(prefs, "only_incompatible", text="问题", toggle=True)
         filters.prop(prefs, "batch_mode", text="批量", toggle=True)
+        reset_sub = filters.row(align=True)
+        reset_sub.enabled = has_active_filter
+        reset_sub.operator("plugin_manager.reset_filters", text="", icon="X")
 
         if prefs.active_preset_filter:
             chip = layout.row(align=True)
@@ -593,6 +608,9 @@ class PM_PT_main(Panel):
                 prefs.search or prefs.active_category not in ("", "全部")
                 or bool(prefs.active_preset_filter)
                 or prefs.kind_filter != "all"
+                or prefs.enabled_filter != "all"
+                or prefs.startup_filter != "all"
+                or prefs.issue_filter != "all"
                 or any((prefs.only_enabled, prefs.only_updates, prefs.only_favorites,
                         prefs.only_incompatible))
             )

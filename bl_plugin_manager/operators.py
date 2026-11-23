@@ -1434,6 +1434,33 @@ class PM_OT_batch_add_preset(_PMBase):
         return _report(self, True, f"已将 {len(keys)} 个插件{verb}预设「{target}」")
 
 
+class PM_OT_reset_filters(_PMBase):
+    bl_idname = "plugin_manager.reset_filters"
+    bl_label = "重置筛选"
+    bl_description = "清空所有搜索与筛选条件，显示全部插件"
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        if not prefs:
+            return _report(self, False, "插件库未启用")
+        prefs.search = ""
+        prefs.kind_filter = "all"
+        prefs.enabled_filter = "all"
+        prefs.startup_filter = "all"
+        prefs.issue_filter = "all"
+        prefs.only_favorites = False
+        prefs.only_updates = False
+        prefs.only_enabled = False
+        prefs.only_incompatible = False
+        prefs.active_preset_filter = ""
+        prefs.active_category = "全部"
+        from . import items
+
+        items.rebuild_items(prefs)
+        _redraw()
+        return {"FINISHED"}
+
+
 class PM_OT_manual_prompt_action(_PMBase):
     bl_idname = "plugin_manager.manual_prompt_action"
     bl_label = "处理手动启用的插件"
@@ -2663,6 +2690,7 @@ classes = (
     PM_OT_preset_deactivate_all,
     PM_OT_preset_filter,
     PM_OT_plugin_toggle_preset,
+    PM_OT_reset_filters,
     PM_OT_manual_prompt_action,
     PM_OT_plugin_toggle_group,
     PM_OT_import,

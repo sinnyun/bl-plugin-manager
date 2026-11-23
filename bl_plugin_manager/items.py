@@ -34,6 +34,9 @@ def _signature(prefs):
         prefs.active_category,
         getattr(prefs, "active_preset_filter", ""),
         getattr(prefs, "kind_filter", "all"),
+        getattr(prefs, "enabled_filter", "enabled" if prefs.only_enabled else "all"),
+        getattr(prefs, "startup_filter", "all"),
+        getattr(prefs, "issue_filter", "only" if prefs.only_incompatible else "all"),
         prefs.only_favorites,
         prefs.only_updates,
         prefs.only_enabled,
@@ -68,7 +71,7 @@ def compatibility_status(compat: str, load_state: str) -> str:
     return "declared" if compat == "ok" else "unknown"
 
 
-def _filter(rec: dict, prefs) -> bool:
+def _filter(rec: dict, prefs, startup_keys: set[str] | None = None) -> bool:
     kind_filter = getattr(prefs, "kind_filter", "all") or "all"
     if kind_filter != "all" and (rec.get("kind") or "") != kind_filter:
         return False
@@ -76,13 +79,37 @@ def _filter(rec: dict, prefs) -> bool:
         return False
     if prefs.only_updates and not rec.get("update_available"):
         return False
-    if prefs.only_enabled and not rec.get("enabled"):
+
+    enabled_filter = getattr(prefs, "enabled_filter", None)
+    if enabled_filter is None:
+        enabled_filter = "enabled" if prefs.only_enabled else "all"
+    is_enabled = bool(rec.get("enabled"))
+    if enabled_filter == "enabled" and not is_enabled:
         return False
-    if getattr(prefs, "only_incompatible", False):
+    if enabled_filter == "disabled" and is_enabled:
+        return False
+
+    startup_filter = getattr(prefs, "startup_filter", "all") or "all"
+    if startup_filter != "all":
+        key = rec.get("key") or rec.get("plugin_id") or ""
+        is_startup = bool(rec.get("startup")) or (startup_keys is not None and key in startup_keys)
+        if startup_filter == "startup" and not is_startup:
+            return False
+        if startup_filter == "not_startup" and is_startup:
+            return False
+
+    issue_filter = getattr(prefs, "issue_filter", None)
+    if issue_filter is None:
+        issue_filter = "only" if getattr(prefs, "only_incompatible", False) else "all"
+    if issue_filter != "all":
         comp = scan.blender_compat(rec.get("blender_min", ""),
                                    rec.get("blender_max", ""))[0]
-        if compatibility_status(comp, rec.get("load_state", "")) not in {"load_failed", "out_of_range"}:
+        compat_bad = compatibility_status(comp, rec.get("load_state", "")) in {"load_failed", "out_of_range"}
+        if issue_filter == "only" and not compat_bad:
             return False
+        if issue_filter == "hide" and (compat_bad or rec.get("missing") or rec.get("last_error")):
+            return False
+
     needle = (prefs.search or "").strip().lower()
     if needle:
         hay = " ".join(
@@ -126,6 +153,7 @@ def rebuild_items(prefs) -> list[str]:
             prefs.active_preset_filter = ""
             active_preset = ""
 
+    startup_keys, _ = preset_service.effective_startup_targets(db)
     keys = []
     for key, rec in db.plugins.items():
         if preset_member_set is not None and key not in preset_member_set:
@@ -137,7 +165,7 @@ def rebuild_items(prefs) -> list[str]:
         elif active_cat not in ("", "全部"):
             if active_cat not in groups:
                 continue
-        if not _filter(rec, prefs):
+        if not _filter(rec, prefs, startup_keys=startup_keys):
             continue
         keys.append(key)
 

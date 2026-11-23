@@ -19,6 +19,7 @@ from . import bridge, constants as C, native_names
 
 _LOADING_MACHINE_PATH = False
 _SYNCING_GROUP_INDEX = False
+_SYNCING_FILTERS = False
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,56 @@ def _on_filter_update(self, context):
     from . import items
 
     items.maybe_rebuild(self, force=True)
+
+
+def _on_only_enabled_update(self, context):
+    global _SYNCING_FILTERS
+    if not _SYNCING_FILTERS:
+        _SYNCING_FILTERS = True
+        try:
+            if self.only_enabled:
+                self.enabled_filter = "enabled"
+            elif self.enabled_filter == "enabled":
+                self.enabled_filter = "all"
+        finally:
+            _SYNCING_FILTERS = False
+    _on_filter_update(self, context)
+
+
+def _on_enabled_filter_update(self, context):
+    global _SYNCING_FILTERS
+    if not _SYNCING_FILTERS:
+        _SYNCING_FILTERS = True
+        try:
+            self.only_enabled = self.enabled_filter == "enabled"
+        finally:
+            _SYNCING_FILTERS = False
+    _on_filter_update(self, context)
+
+
+def _on_only_incompatible_update(self, context):
+    global _SYNCING_FILTERS
+    if not _SYNCING_FILTERS:
+        _SYNCING_FILTERS = True
+        try:
+            if self.only_incompatible:
+                self.issue_filter = "only"
+            elif self.issue_filter == "only":
+                self.issue_filter = "all"
+        finally:
+            _SYNCING_FILTERS = False
+    _on_filter_update(self, context)
+
+
+def _on_issue_filter_update(self, context):
+    global _SYNCING_FILTERS
+    if not _SYNCING_FILTERS:
+        _SYNCING_FILTERS = True
+        try:
+            self.only_incompatible = self.issue_filter == "only"
+        finally:
+            _SYNCING_FILTERS = False
+    _on_filter_update(self, context)
 
 
 def _on_group_index_update(self, context):
@@ -235,6 +286,24 @@ _KIND_FILTER_ITEMS = (
     (C.KIND_BUILTIN, "内置插件", "仅显示虚拟链接管理的 Blender 自带基础插件"),
 )
 
+_ENABLED_FILTER_ITEMS = (
+    ("all", "启停:全部", "同时显示已启用和未启用的插件"),
+    ("enabled", "已启用", "仅显示当前已启用的插件"),
+    ("disabled", "未启用", "仅显示当前未启用的插件"),
+)
+
+_STARTUP_FILTER_ITEMS = (
+    ("all", "自启:全部", "同时显示已自启和未自启的插件"),
+    ("startup", "已自启", "仅显示已标记自启或属于自启预设的插件"),
+    ("not_startup", "未自启", "仅显示未标记自启且不在自启预设中的插件"),
+)
+
+_ISSUE_FILTER_ITEMS = (
+    ("all", "问题:全部", "显示所有插件（含兼容性或启动问题）"),
+    ("only", "仅问题", "仅显示启动实测失败或声明版本范围不兼容的插件"),
+    ("hide", "隐藏问题", "隐藏启动失败、版本不兼容或文件缺失的插件"),
+)
+
 
 _STARTUP_MODE_ITEMS = (
     ("remember", "记住上次状态", "下次打开 Blender 自动恢复退出前启用的全部插件"),
@@ -284,6 +353,24 @@ class PMAddonPreferences(AddonPreferences):
         default="all",
         update=_on_filter_update,
     )
+    enabled_filter: EnumProperty(
+        name="启用筛选",
+        items=_ENABLED_FILTER_ITEMS,
+        default="all",
+        update=_on_enabled_filter_update,
+    )
+    startup_filter: EnumProperty(
+        name="自启筛选",
+        items=_STARTUP_FILTER_ITEMS,
+        default="all",
+        update=_on_filter_update,
+    )
+    issue_filter: EnumProperty(
+        name="问题筛选",
+        items=_ISSUE_FILTER_ITEMS,
+        default="all",
+        update=_on_issue_filter_update,
+    )
     batch_mode: BoolProperty(
         name="批量选择",
         description="对当前筛选结果开启批量勾选与操作栏（关闭时清空勾选）",
@@ -292,11 +379,11 @@ class PMAddonPreferences(AddonPreferences):
     )
     only_favorites: BoolProperty(default=False, update=_on_filter_update)
     only_updates: BoolProperty(default=False, update=_on_filter_update)
-    only_enabled: BoolProperty(default=False, update=_on_filter_update)
+    only_enabled: BoolProperty(default=False, update=_on_only_enabled_update)
     only_incompatible: BoolProperty(
         name="兼容性问题",
         description="显示启动实测失败或声明版本范围不符合当前 Blender 的插件",
-        default=False, update=_on_filter_update)
+        default=False, update=_on_only_incompatible_update)
     search: StringProperty(default="", update=_on_filter_update)
     candidate_count: IntProperty(default=0)
 

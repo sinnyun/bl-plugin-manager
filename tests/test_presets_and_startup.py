@@ -230,6 +230,67 @@ class PresetEngineAndStartupTests(unittest.TestCase):
                 sm.machine_config = orig_mc
                 sm.LibraryDB = orig_db
 
+    def test_tristate_filters_enabled_disabled_startup_and_hide_problems(self):
+        items_mod = _load("bl_plugin_manager.items")
+        presets = _load("bl_plugin_manager.services.presets")
+        with tempfile.TemporaryDirectory() as root:
+            db = self._seed_db(root)
+            db.get("addon:mod-a")["enabled"] = True
+            db.get("addon:mod-a")["startup"] = True
+            db.add_preset("开机预设", ["addon:shared-tool"])
+            db.set_preset_state("开机预设", startup=True)
+            db.get("addon:manual-c")["missing"] = True
+            db.save()
+
+            startup_keys, _ = presets.effective_startup_targets(db)
+            base_prefs = lambda **kw: types.SimpleNamespace(**({
+                "kind_filter": "all",
+                "only_favorites": False,
+                "only_updates": False,
+                "only_enabled": False,
+                "only_incompatible": False,
+                "enabled_filter": "all",
+                "startup_filter": "all",
+                "issue_filter": "all",
+                "search": "",
+            } | kw))
+
+            # Enabled vs Disabled
+            p_en = base_prefs(enabled_filter="enabled")
+            self.assertEqual(
+                {k for k, r in db.plugins.items() if items_mod._filter(r, p_en, startup_keys)},
+                {"addon:mod-a"},
+            )
+            p_dis = base_prefs(enabled_filter="disabled")
+            self.assertNotIn(
+                "addon:mod-a",
+                {k for k, r in db.plugins.items() if items_mod._filter(r, p_dis, startup_keys)},
+            )
+
+            # Startup (includes both plugin.startup AND startup preset member) vs Not-Startup
+            p_st = base_prefs(startup_filter="startup")
+            self.assertEqual(
+                {k for k, r in db.plugins.items() if items_mod._filter(r, p_st, startup_keys)},
+                {"addon:mod-a", "addon:shared-tool"},
+            )
+            p_nst = base_prefs(startup_filter="not_startup")
+            nst_hits = {k for k, r in db.plugins.items() if items_mod._filter(r, p_nst, startup_keys)}
+            self.assertNotIn("addon:mod-a", nst_hits)
+            self.assertNotIn("addon:shared-tool", nst_hits)
+            self.assertIn("addon:sculpt-b", nst_hits)
+
+            # Issues: only vs hide (hide excludes load_failed AND missing)
+            p_only = base_prefs(issue_filter="only")
+            self.assertEqual(
+                {k for k, r in db.plugins.items() if items_mod._filter(r, p_only, startup_keys)},
+                {"addon:broken-d"},
+            )
+            p_hide = base_prefs(issue_filter="hide")
+            hide_hits = {k for k, r in db.plugins.items() if items_mod._filter(r, p_hide, startup_keys)}
+            self.assertNotIn("addon:broken-d", hide_hits)
+            self.assertNotIn("addon:manual-c", hide_hits)
+            self.assertIn("addon:mod-a", hide_hits)
+
 
 if __name__ == "__main__":
     unittest.main()
