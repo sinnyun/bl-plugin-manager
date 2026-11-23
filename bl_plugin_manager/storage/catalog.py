@@ -22,6 +22,7 @@ import json
 import os
 import stat
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,8 +39,7 @@ DEFAULT_CATEGORY = {"id": "uncategorized", "name": "未分类", "order": 0}
 # 运行结果）都会被拒绝，确保本机路径永远不会泄漏进可同步的数据。
 PORTABLE_FIELDS = frozenset({
     # 稳定身份与插件自带元数据
-    "plugin_id", "kind", "pkg_id", "id", "name", "version",
-    "blender_min", "blender_max", "pkg_type", "author",
+    "plugin_id", "kind", "pkg_id", "id", "name", "pkg_type", "author",
     "description", "auto_category", "auto_tags", "doc_url", "location",
     # 用户数据（跨电脑共享）
     "display_name", "category", "category_id", "tags", "note",
@@ -72,6 +72,23 @@ class InvalidCatalogFieldError(ValueError):
 
 class CatalogConflictError(RuntimeError):
     pass
+
+
+@contextmanager
+def _publish_lock(path: Path):
+    """Serialize writers on the same filesystem; synchronized replicas remain independent."""
+    with open(path, "a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise CatalogConflictError("另一个进程正在保存资料，请重试") from exc
+        yield
 
 
 def now_utc() -> str:
@@ -115,7 +132,10 @@ class Catalog:
             return False
         if not isinstance(value.get("revision"), int):
             return False
-        if not isinstance(value.get("plugins"), dict):
+        if not isinstance(value.get("plugins"), dict) or not all(
+            isinstance(key, str) and key and isinstance(record, dict)
+            for key, record in value["plugins"].items()
+        ):
             return False
         categories = value.get("categories")
         return isinstance(categories, list) and all(
@@ -153,7 +173,12 @@ class Catalog:
             self.status = "MISSING"
             self.loaded_signature = None
             return self.status
-        if value is None or not self._is_valid(value):
+        if isinstance(value, dict) and isinstance(value.get("schema"), int) and value["schema"] != SCHEMA:
+            self.data = {}
+            self.status = "UNSUPPORTED"
+            self.loaded_signature = sig
+            return self.status
+        if not self._is_valid(value):
             self.data = {}
             self.status = "CORRUPT"
             self.loaded_signature = sig
@@ -171,39 +196,45 @@ class Catalog:
         旧文件损坏时返回 ``CORRUPT`` 而不创建资料库，调用方据此进入只读状态，
         绝不覆盖或丢弃旧文件。
         """
-        if self.legacy_is_corrupt():
-            return InitializationReport("CORRUPT", self.path)
+        legacy_status = self.legacy_status()
+        if legacy_status in {"CORRUPT", "UNSUPPORTED"}:
+            return InitializationReport(legacy_status, self.path)
 
         status = self.load()
         if status == "OK":
             return InitializationReport("READY", self.path)
-        if status == "CORRUPT":
-            return InitializationReport("CORRUPT", self.path)
+        if status != "MISSING":
+            return InitializationReport(status, self.path)
 
         self.data = self._empty()
         self._write()
         self.status = "OK"
         return InitializationReport("CREATED", self.path)
 
-    def legacy_is_corrupt(self) -> bool:
-        """旧库存在但不可解析时为 True（此时不得创建/覆盖任何数据）。"""
+    def legacy_status(self) -> str:
         if not self.legacy_path.exists():
-            return False
+            return "MISSING"
         try:
             with open(self.legacy_path, "r", encoding="utf-8") as fh:
-                json.load(fh)
+                value = json.load(fh)
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            return True
-        return False
+            return "CORRUPT"
+        if not isinstance(value, dict) or not isinstance(value.get("plugins"), dict):
+            return "CORRUPT"
+        if value.get("schema") not in (1, 2):
+            return "UNSUPPORTED"
+        if not all(isinstance(record, dict) for record in value["plugins"].values()):
+            return "CORRUPT"
+        return "OK" if isinstance(value.get("categories", []), list) else "CORRUPT"
 
     def read_legacy(self) -> dict | None:
-        """读取旧版 schema 2 的 library.json；不存在或非 schema 2 时返回 None。"""
+        """读取受支持的 schema 1/2 library.json。"""
         if not self.legacy_path.exists():
             return None
         with open(self.legacy_path, "r", encoding="utf-8") as fh:
             value = json.load(fh)
-        if not isinstance(value, dict) or value.get("schema") != 2:
-            return None
+        if not isinstance(value, dict) or value.get("schema") not in (1, 2):
+            raise ValueError("旧库格式不受支持")
         return value
 
     def archive_legacy(self) -> Path | None:
@@ -226,10 +257,10 @@ class Catalog:
         return target
 
     def _write(self) -> None:
-        if self.status == "CORRUPT":
-            raise CatalogConflictError(f"拒绝覆盖损坏数据库: {self.path}")
+        if self.status not in {"OK", "MISSING"}:
+            raise CatalogConflictError(f"插件资料库不可写 ({self.status}): {self.path}")
         current = self._signature()
-        if self.loaded_signature is not None and current is not None and current != self.loaded_signature:
+        if current != self.loaded_signature:
             raise CatalogConflictError(f"数据库已被外部更新: {self.path}")
         self.directory.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + f".{uuid.uuid4().hex}.tmp")
@@ -239,9 +270,12 @@ class Catalog:
                 fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
-            json_cache.store(str(self.path), self.data)
-            self.loaded_signature = self._signature()
+            with _publish_lock(self.directory / "catalog.lock"):
+                if self._signature() != current:
+                    raise CatalogConflictError(f"数据库已被外部更新: {self.path}")
+                os.replace(tmp, self.path)
+                json_cache.store(str(self.path), self.data)
+                self.loaded_signature = self._signature()
         finally:
             try:
                 tmp.unlink()

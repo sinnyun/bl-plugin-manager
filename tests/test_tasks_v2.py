@@ -1,5 +1,6 @@
 import importlib
 import sys
+import threading
 import types
 import unittest
 
@@ -27,6 +28,24 @@ class TaskTests(unittest.TestCase):
         task.join()
         self.assertEqual(task.state, "failed")
         self.assertIn("boom", task.error)
+
+    def test_cancelled_worker_discards_staged_result(self):
+        mod = _module()
+        task = mod.TaskController()
+        release = threading.Event()
+        discarded = []
+
+        def stage():
+            release.wait(2)
+            return "staged.zip"
+
+        task.start(stage, discard=discarded.append)
+        task.cancel()
+        release.set()
+        task.join(2)
+        self.assertEqual(task.state, "cancelled")
+        self.assertEqual(discarded, ["staged.zip"])
+        self.assertIsNone(task.result)
 
 
 if __name__ == "__main__":

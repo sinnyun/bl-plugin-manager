@@ -162,6 +162,7 @@ def link_scan(existing_plugins: dict, existing_bindings: dict,
     result = LinkResult(plugins=plugins, bindings=bindings)
     claimed: set[str] = set()
     occupied = set(occupied_folders or ())
+    by_location = {rel: plugin_id for plugin_id, rel in bindings.items()}
 
     def _bound_folder(plugin_id: str) -> str:
         rel = bindings.get(plugin_id) or ""
@@ -175,12 +176,35 @@ def link_scan(existing_plugins: dict, existing_bindings: dict,
         match_id = None
         entry_folder = slug(entry.get("folder_name") or entry.get("folder"))
         strong, weak = _entry_hints(entry)
+        package_id = str(entry.get("pkg_id") or entry.get("id") or "").casefold()
+
+        def eligible(candidate, *, weak_match=False):
+            if not candidate or candidate in claimed:
+                return False
+            record = plugins[candidate]
+            existing_id = str(record.get("pkg_id") or record.get("id") or "").casefold()
+            if entry.get("kind") != record.get("kind"):
+                return False
+            if package_id and existing_id and package_id != existing_id:
+                return False
+            if weak_match and entry.get("kind") == "addon":
+                name, old_name = slug(entry.get("name")), slug(record.get("name"))
+                if name and old_name and name != old_name:
+                    author = slug(entry.get("author"))
+                    return bool(author and author == slug(record.get("author")))
+            return True
+
+        bound_id = by_location.get(rel)
+        if eligible(bound_id, weak_match=True):
+            match_id = bound_id
 
         # 强线索（manifest id / 声明名）只在原安装位置已不占用时才生效，
         # 否则同一台电脑上同名插件的第二个副本会错误抢占原记录的别名。
         for hint in strong:
+            if match_id:
+                break
             candidate = index.get(hint)
-            if not candidate or candidate in claimed:
+            if not eligible(candidate):
                 continue
             bound = _bound_folder(candidate)
             if bound == entry_folder or bound not in occupied:
@@ -192,7 +216,7 @@ def link_scan(existing_plugins: dict, existing_bindings: dict,
         if match_id is None:
             for hint in weak:
                 candidate = index.get(hint)
-                if candidate and candidate not in claimed:
+                if eligible(candidate, weak_match=True):
                     match_id = candidate
                     break
 
@@ -223,7 +247,10 @@ def link_scan(existing_plugins: dict, existing_bindings: dict,
         record["plugin_id"] = match_id
 
         claimed.add(match_id)
+        if bound_id and bound_id != match_id and bindings.get(bound_id) == rel:
+            del bindings[bound_id]
         bindings[match_id] = rel
+        by_location[rel] = match_id
         result.present.add(match_id)
         result.assignment[rel] = match_id
 

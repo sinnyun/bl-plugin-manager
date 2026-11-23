@@ -2,61 +2,17 @@
 
 from __future__ import annotations
 
-import json
-import os
-
 import bpy
 
-from . import constants as C, scan
+from . import constants as C, scan, store
 from .db import now_iso
 
 
-def _repo_dirs() -> list[tuple[str, str]]:
-    """返回 [(仓库名, 目录)]，仅包含带可用目录的仓库。"""
-    out = []
-    try:
-        repos = bpy.context.preferences.extensions.repos
-    except Exception:
-        return out
-    for repo in repos:
-        directory = getattr(repo, "custom_directory", "") or getattr(repo, "directory", "")
-        if directory and os.path.isdir(directory):
-            out.append((getattr(repo, "name", ""), directory))
-    return out
-
-
-def collect_known_versions(exclude_dir: str = "") -> dict:
-    """从各扩展仓库的 .blender_ext/index.json 汇总 id -> 最新版本信息。"""
-    known: dict[str, dict] = {}
-    exclude = os.path.normcase(os.path.abspath(exclude_dir)) if exclude_dir else ""
-    for name, directory in _repo_dirs():
-        if exclude and os.path.normcase(os.path.abspath(directory)) == exclude:
-            continue
-        index_path = os.path.join(directory, ".blender_ext", "index.json")
-        if not os.path.isfile(index_path):
-            continue
-        try:
-            with open(index_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            continue
-        for item in (data.get("data") or []):
-            pkg_id = item.get("id")
-            version = scan.version_str(item.get("version"))
-            if not pkg_id or not version:
-                continue
-            cur = known.get(pkg_id)
-            if cur is None or scan.compare_versions(version, cur["version"]) > 0:
-                known[pkg_id] = {
-                    "version": version,
-                    "name": item.get("name", ""),
-                    "repo": name,
-                    "url": item.get("archive_url", ""),
-                    "archive_hash": item.get("archive_hash", ""),
-                    "archive_size": item.get("archive_size", 0),
-                    "tagline": item.get("tagline", ""),
-                    "website": item.get("website", ""),
-                }
+def collect_known_versions() -> dict:
+    known = {}
+    for offer in store.read_catalog(include_unavailable=True):
+        if offer["version"] and store.is_compatible(offer):
+            known.setdefault(offer["id"].casefold(), []).append(offer)
     return known
 
 
@@ -72,7 +28,7 @@ def check_updates(db, root: str, online: bool = False) -> dict:
         except Exception as exc:
             print("[插件库] 同步商店索引失败（将使用本地缓存）:", exc)
 
-    known = collect_known_versions(exclude_dir="")
+    known = collect_known_versions()
     stats = {"checked": 0, "updates": 0, "unknown": 0}
     stamp = now_iso()
 
@@ -83,26 +39,28 @@ def check_updates(db, root: str, online: bool = False) -> dict:
             rec["latest_version"] = ""
             stats["unknown"] += 1
             continue
-        info = known.get(rec.get("id") or "")
-        if not info:
+        key = str(rec.get("pkg_id") or rec.get("id") or "").casefold()
+        source = rec.get("archive_source")
+        offers = known.get(key, ())
+        candidates = [offer for offer in offers if offer["source"] == source]
+        rec["update_source_required"] = bool(not candidates and offers and not rec.get("missing"))
+        if not candidates or rec.get("missing"):
             rec["update_available"] = False
             rec["latest_version"] = ""
+            rec["latest_url"] = ""
             stats["unknown"] += 1
             continue
+        offer = candidates[0]
         stats["checked"] += 1
-        rec["latest_version"] = info["version"]
-        rec["latest_url"] = info.get("url", "")
-        rec["latest_hash"] = info.get("archive_hash", "")
-        rec["latest_size"] = info.get("archive_size", 0)
-        rec["latest_website"] = info.get("website", "")
-        if scan.compare_versions(info["version"], rec.get("version", "0")) > 0:
-            rec["update_available"] = True
+        rec["update_available"] = scan.compare_versions(offer["version"], rec.get("version", "0")) > 0
+        rec["latest_version"] = offer["version"]
+        rec["latest_url"] = offer["archive_url"]
+        rec["latest_hash"] = offer["archive_hash"]
+        rec["latest_size"] = offer["archive_size"]
+        rec["latest_website"] = offer["website"]
+        rec["latest_repo"] = offer["repo"]
+        if rec["update_available"]:
             stats["updates"] += 1
-        else:
-            rec["update_available"] = False
-            rec["latest_url"] = ""
-            rec["latest_hash"] = ""
-            rec["latest_size"] = 0
 
     db.save()
     return stats

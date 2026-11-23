@@ -7,6 +7,7 @@ import os
 import bpy
 from bpy.props import (
     BoolProperty,
+    FloatProperty,
     CollectionProperty,
     IntProperty,
     StringProperty,
@@ -139,6 +140,11 @@ class PMAddonPreferences(AddonPreferences):
         options={"SKIP_SAVE"},
         update=_on_library_path_update,
     )
+    pending_library_path: StringProperty(name="待连接插件库", subtype="DIR_PATH",
+                                         options={"SKIP_SAVE"})
+    library_preview: StringProperty(options={"SKIP_SAVE"})
+    self_update_busy: BoolProperty(options={"SKIP_SAVE"})
+    self_update_status: StringProperty(options={"SKIP_SAVE"})
     device_name: StringProperty(
         name="设备名称",
         description="此电脑在同步插件库中的显示名称；启用插件清单按设备分别保存",
@@ -154,8 +160,8 @@ class PMAddonPreferences(AddonPreferences):
     only_updates: BoolProperty(default=False, update=_on_filter_update)
     only_enabled: BoolProperty(default=False, update=_on_filter_update)
     only_incompatible: BoolProperty(
-        name="仅不兼容",
-        description="只显示与当前 Blender 版本不兼容（版本过高或过低）的插件",
+        name="兼容性问题",
+        description="显示启动实测失败或声明版本范围不符合当前 Blender 的插件",
         default=False, update=_on_filter_update)
     search: StringProperty(default="", update=_on_filter_update)
     candidate_count: IntProperty(default=0)
@@ -168,6 +174,11 @@ class PMAddonPreferences(AddonPreferences):
     compat_ok: IntProperty(default=0, options={"SKIP_SAVE"})
     compat_fail: IntProperty(default=0, options={"SKIP_SAVE"})
     compat_current: StringProperty(default="", options={"SKIP_SAVE"})
+    archive_running: BoolProperty(options={"SKIP_SAVE"})
+    archive_cancelling: BoolProperty(options={"SKIP_SAVE"})
+    archive_retry: BoolProperty(options={"SKIP_SAVE"})
+    archive_status: StringProperty(options={"SKIP_SAVE"})
+    archive_progress: FloatProperty(min=0.0, max=1.0, options={"SKIP_SAVE"})
 
     # 本次扫描/导入的结果明细（面板展示）
     report_items: CollectionProperty(type=PM_ReportItem)
@@ -176,6 +187,7 @@ class PMAddonPreferences(AddonPreferences):
 
     # 在线商店
     store_search: StringProperty(name="搜索", default="", description="按名称/描述搜索商店")
+    store_page: IntProperty(name="页码", default=1, min=1, options={"SKIP_SAVE"})
     store_only_new: BoolProperty(name="仅未安装", default=True,
                                  description="只显示尚未安装到插件库的扩展")
     store_only_compatible: BoolProperty(name="仅兼容版本", default=True,
@@ -200,6 +212,17 @@ class PMAddonPreferences(AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
+        from . import _update_boot_message, self_update
+
+        updates = layout.box()
+        updates.label(text=f"插件库管理器 {C.ADDON_VERSION_STR}", icon="PLUGIN")
+        row = updates.row()
+        row.enabled = not self.self_update_busy
+        row.operator("plugin_manager.github_update", icon="FILE_REFRESH")
+        op = updates.operator("wm.url_open", text="查看 GitHub 发布", icon="URL")
+        op.url = self_update.RELEASES_URL
+        if message := self.self_update_status or _update_boot_message:
+            updates.label(text=message, icon="INFO")
 
         # --- 设备与库 ---
         col = layout.column()
@@ -209,12 +232,17 @@ class PMAddonPreferences(AddonPreferences):
             col.label(text=f"设备 ID: {machine_config.load()['device_id'][:12]}")
         except Exception:
             pass
-        col.prop(self, "library_path")
+        if self.library_path:
+            col.label(text=self.library_path, icon="FILE_FOLDER")
+        col.operator("plugin_manager.pick_library_path", text="选择插件库…", icon="FILEBROWSER")
+        if self.pending_library_path:
+            col.label(text=self.pending_library_path)
+            col.label(text=self.library_preview, icon="INFO")
 
         # --- 挂载 ---
         row = col.row(align=True)
-        row.operator("plugin_manager.setup_library", icon="LINKED")
-        row.operator("plugin_manager.unmount_library", icon="UNLINKED")
+        row.operator("plugin_manager.setup_library", text="启用管理 / 重连", icon="LINKED")
+        row.operator("plugin_manager.unmount_library", text="停止管理", icon="UNLINKED")
 
         if self.library_path:
             state = bridge.library_state(self.library_path)
@@ -236,7 +264,6 @@ class PMAddonPreferences(AddonPreferences):
         box.label(text="诊断与维护", icon="TOOL_SETTINGS")
         row = box.row(align=True)
         row.operator("plugin_manager.refresh", icon="FILE_REFRESH")
-        row.operator("plugin_manager.scan_inbox", icon="FILE_REFRESH", text="扫描投放区")
         row.operator("plugin_manager.show_warnings", icon="INFO", text="诊断信息")
         row = box.row(align=True)
         row.operator("plugin_manager.cleanup_residue", icon="TRASH", text="清理失败插件残留")
@@ -246,7 +273,9 @@ class PMAddonPreferences(AddonPreferences):
         box = layout.box()
         box.label(text="启动同步策略", icon="PLAY")
         box.prop(self, "sync_startup_on_launch")
-        box.prop(self, "startup_disable_unmarked")
+        row = box.row()
+        row.enabled = self.sync_startup_on_launch
+        row.prop(self, "startup_disable_unmarked")
         box.operator("plugin_manager.apply_startup", icon="PLAY", text="立即同步自启状态")
 
         # --- 迁移收编 ---

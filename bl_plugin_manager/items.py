@@ -10,6 +10,8 @@ from .db import LibraryDB
 
 # 轻量节流：避免 N 面板高频重绘时反复读取库文件
 _LAST = {"t": 0.0, "sig": None}
+_local_state = ("", "")
+_database_status = ("", "MISSING")
 
 
 def _signature(prefs):
@@ -20,13 +22,16 @@ def _signature(prefs):
     """
     db_sigs = []
     if getattr(prefs, "library_path", ""):
-        for name in (C.DB_FILENAME, C.LEGACY_DB_FILENAME):
-            path = os.path.join(prefs.library_path, C.DIR_META, name)
+        paths = [os.path.join(prefs.library_path, C.DIR_META, name)
+                 for name in (C.DB_FILENAME, C.LEGACY_DB_FILENAME)]
+        if _local_state[0] == prefs.library_path and _local_state[1]:
+            paths.append(_local_state[1])
+        for path in paths:
             try:
                 st = os.stat(path)
                 db_sigs.append((st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size))
             except OSError:
-                continue
+                db_sigs.append(None)
     return (
         prefs.library_path,
         prefs.active_category,
@@ -51,6 +56,16 @@ def maybe_rebuild(prefs, force: bool = False) -> None:
 
 
 
+def compatibility_status(compat: str, load_state: str) -> str:
+    if load_state == "failed":
+        return "load_failed"
+    if load_state == "ok":
+        return "load_ok"
+    if compat in ("too_new", "too_old"):
+        return "out_of_range"
+    return "declared" if compat == "ok" else "unknown"
+
+
 def _filter(rec: dict, prefs) -> bool:
     if prefs.only_favorites and not rec.get("favorite"):
         return False
@@ -62,7 +77,7 @@ def _filter(rec: dict, prefs) -> bool:
         # 实时判定，避免用换版本后已过期的存储结论
         comp = scan.blender_compat(rec.get("blender_min", ""),
                                    rec.get("blender_max", ""))[0]
-        if comp not in ("too_new", "too_old"):
+        if compatibility_status(comp, rec.get("load_state", "")) not in {"load_failed", "out_of_range"}:
             return False
     needle = (prefs.search or "").strip().lower()
     if needle:
@@ -81,12 +96,18 @@ def rebuild_items(prefs) -> list[str]:
     勾选状态保存在 SELECTED_KEYS 里，重建后按 key 恢复，因此面板重绘、
     刷新、过滤都不会把用户的勾选弄丢。
     """
+    global _local_state, _database_status
+    previous_selection = prefs.selected_key
     prefs.plugin_items.clear()
     if not prefs.library_path:
         prefs.active_index = 0
+        prefs.selected_key = ""
         return []
 
     db = LibraryDB(prefs.library_path)
+    _database_status = (prefs.library_path, db.status)
+    library_id = db.data.get("library_id")
+    _local_state = (prefs.library_path, str(db._state_store(library_id).path) if library_id else "")
     keys = []
     for key, rec in db.plugins.items():
         cat = rec.get("category") or C.DEFAULT_CATEGORY
@@ -133,12 +154,11 @@ def rebuild_items(prefs) -> list[str]:
         item.load_state = rec.get("load_state") or ""
         item.load_error = rec.get("load_error") or ""
         item.residue = int(rec.get("residue") or 0)
-        if item.load_state == "failed":
+        state = compatibility_status(item.compat, item.load_state)
+        if state in {"load_failed", "out_of_range"}:
             item.supported = "no"
-        elif item.load_state == "ok":
+        elif state == "load_ok":
             item.supported = "yes"
-        elif item.compat in ("too_new", "too_old"):
-            item.supported = "no"
         else:
             item.supported = "unknown"
         item.author = rec.get("author") or ""
@@ -155,11 +175,15 @@ def rebuild_items(prefs) -> list[str]:
         # 恢复勾选状态
         item.selected = key in SELECTED_KEYS
 
-    if prefs.active_index >= len(keys):
-        prefs.active_index = max(0, len(keys) - 1)
-    prefs.selected_key = keys[prefs.active_index] if keys else ""
+    prefs.active_index = keys.index(previous_selection) if previous_selection in keys else -1
+    prefs.selected_key = previous_selection if previous_selection in keys else ""
     _rebuild_categories(prefs, db)
+    _LAST["sig"] = _signature(prefs)
     return keys
+
+
+def database_status(prefs) -> str:
+    return _database_status[1] if _database_status[0] == prefs.library_path else "MISSING"
 
 
 # 勾选集合（以插件 key 为准，跨重建/重绘保持）

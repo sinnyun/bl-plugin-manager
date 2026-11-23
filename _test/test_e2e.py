@@ -177,9 +177,16 @@ rp.use_custom_directory = True
 rp.custom_directory = repo2
 db4 = PM.db.LibraryDB(lib)
 stats = PM.updates.check_updates(db4, lib)
+er2 = next(r for r in db4.plugins.values() if r.get("id") == "ext_demo")
+check("unknown update source requires a choice",
+      er2.get("update_source_required") and not er2.get("update_available"))
+er2["archive_source"] = PM.bridge.OFFICIAL_SOURCE_URL
+db4.save()
+stats = PM.updates.check_updates(db4, lib)
 er2 = [r for r in db4.plugins.values() if r.get("id") == "ext_demo"][0]
 check("update detected", er2.get("update_available") is True, str(er2.get("latest_version")))
-check("latest version", er2.get("latest_version") == "1.7.0", str(er2.get("latest_version")))
+check("latest version from installed repository",
+      er2.get("latest_version") == "1.6.0", str(er2.get("latest_version")))
 
 # --- 同步/移除 -----------------------------------------------------------
 stats = PM.library.sync_library(lib, PM.db.LibraryDB(lib))
@@ -304,6 +311,9 @@ if rm_rec:
     moved = PM.library.remove_plugin(lib, PM.db.LibraryDB(lib), rm_rec["key"], to_trash=True)
     check("remove to trash", moved is not None and os.path.isdir(moved), str(moved))
     check("record removed", PM.db.LibraryDB(lib).get(rm_rec["key"]) is None)
+    restored = PM.library.restore_plugin(lib, PM.db.LibraryDB(lib), os.path.basename(moved))
+    check("trash restores original directory and identity",
+          restored["key"] == rm_rec["key"] and restored["rel"] == rm_rec["rel"])
 
 # --- 直接丢在库根目录也应自动整理 ---------------------------------------
 root_drop = os.path.join(base, "RootDropDemo")
@@ -453,9 +463,14 @@ r_bad = PM.library.connect_library(legacy_src, PM.db.LibraryDB(legacy_src))
 check("connect: rejects plugin-as-library", bool(r_bad["error"]),
       r_bad["error"][:40])
 
-# pick_library_path 操作符：切到已有库并侦测
+# pick_library_path 先预览，显式启用才切换
+old_path = prefs.library_path
 r_op = bpy.ops.plugin_manager.pick_library_path(directory=flat_lib)
-check("pick_library_path operator",
+check("pick_library_path previews without switching",
+      r_op == {"FINISHED"} and prefs.pending_library_path == flat_lib and prefs.library_path == old_path,
+      str(prefs.pending_library_path))
+r_op = bpy.ops.plugin_manager.setup_library()
+check("explicit activation switches library",
       r_op == {"FINISHED"} and os.path.normcase(prefs.library_path) == os.path.normcase(flat_lib),
       str(prefs.library_path))
 pinfo = PM.library.inspect_target(flat_lib)
@@ -1049,7 +1064,7 @@ check("list item compat flag too_new",
       it_mx is not None and it_mx.compat == "too_new",
       getattr(it_mx, "compat", None))
 
-# 「仅不兼容」过滤：只留下不兼容项，且该项在其中
+# 「有问题」包含版本不兼容和启动失败
 prefs.only_incompatible = True
 keys_inc = PM.items.rebuild_items(prefs)
 check("only_incompatible filter works",
@@ -1060,12 +1075,154 @@ for k in keys_inc:
     r = d_chk.get(k) or {}
     st = r.get("compat") or SM.blender_compat(r.get("blender_min", ""),
                                               r.get("blender_max", ""))[0]
-    if st not in ("too_new", "too_old"):
+    if PM.items.compatibility_status(st, r.get("load_state", "")) not in ("out_of_range", "load_failed"):
         all_inc = False
         break
-check("filter yields only incompatible", all_inc)
+check("filter yields only compatibility problems", all_inc)
 prefs.only_incompatible = False
 PM.items.rebuild_items(prefs)
+
+from pathlib import Path
+from threading import Event, get_ident
+from bl_plugin_manager import archive_jobs
+from bl_plugin_manager.storage import machine_config
+
+# Verify in the real Blender runtime that an incompatible replacement restores
+# both the original files and module activation.
+rollback_db = PM.db.LibraryDB(lib)
+rollback_rec = rollback_db.get(recs["LegacyDemo"]["key"])
+rollback_path = Path(lib, rollback_rec["rel"], "__init__.py")
+original_content = rollback_path.read_bytes()
+original_version = rollback_rec["version"]
+assert PM.bridge.set_enabled(rollback_rec["module"], True)[0]
+invalid_update = Path(base, "rollback-sample.zip")
+with zipfile.ZipFile(invalid_update, "w") as replacement:
+    replacement.writestr("LegacyDemo/__init__.py",
+                         "bl_info = {'name': 'Legacy Demo', 'version': (9, 0, 0)}\n"
+                         "def register(): raise RuntimeError('replacement failed')\n"
+                         "def unregister(): pass\n")
+try:
+    PM.library.replace_from_zip(rollback_rec, str(invalid_update), lib, rollback_db)
+except RuntimeError:
+    check("failed update keeps original bytes", rollback_path.read_bytes() == original_content)
+    check("failed update restores enabled module", PM.bridge.is_module_enabled(rollback_rec["module"]))
+    check("failed update keeps original version",
+          PM.db.LibraryDB(lib).get(rollback_rec["key"])["version"] == original_version)
+else:
+    check("failed update is reported", False)
+finally:
+    PM.bridge.set_enabled(rollback_rec["module"], False)
+
+# A simulated downloader runs on a worker while the actual installation
+# runs through the same main-thread queue used by the store.
+manifest = ('schema_version = "1.0.0"\nid = "queue_demo"\nversion = "1.0.0"\n'
+            'name = "Queue Demo"\ntagline = "Check archive queue"\nmaintainer = "Test"\n'
+            'type = "add-on"\nblender_version_min = "4.2.0"\nlicense = ["SPDX:GPL-3.0-or-later"]\n')
+fixture = Path(base, "archive-queue.zip")
+with zipfile.ZipFile(fixture, "w") as archive:
+    archive.writestr("blender_manifest.toml", manifest)
+    archive.writestr("__init__.py", "def register(): pass\ndef unregister(): pass\n")
+offer = {"id": "queue_demo", "name": "Queue Demo", "version": "1.0.0", "source": "fixture", "repo": "Test"}
+request = (offer, "", "")
+download_calls = []
+staged_paths = []
+main_thread_id = get_ident()
+
+
+def download_fixture(package, progress, cancelled):
+    download_calls.append(get_ident())
+    if len(download_calls) == 1:
+        raise OSError("simulated connection loss")
+    path = Path(base, f"staged-queue-{len(download_calls)}.zip")
+    shutil.copyfile(fixture, path)
+    staged_paths.append(path)
+    progress(100)
+    return str(path)
+
+
+original_download = PM.store.download_package
+try:
+    PM.store.download_package = download_fixture
+    archive_jobs.start(prefs, [request])
+    archive_jobs._tick()
+    archive_jobs._active.worker.join(2)
+    archive_jobs._tick()
+    check("archive worker failure is retryable", prefs.archive_retry and bool(prefs.report_items))
+    archive_jobs.retry(prefs)
+    archive_jobs._tick()
+    archive_jobs._active.worker.join(2)
+    archive_jobs._tick()
+    check("retry applies archive and records repository source",
+          PM.db.LibraryDB(lib).get("ext:queue_demo").get("archive_source") == "fixture")
+    check("network job uses worker thread and clears staged files",
+          all(call != main_thread_id for call in download_calls)
+          and not any(path.exists() for path in staged_paths))
+
+    release_download = Event()
+
+    def cancellable_download(package, progress, cancelled):
+        release_download.wait(2)
+        return download_fixture(package, progress, cancelled)
+
+    PM.store.download_package = cancellable_download
+    archive_jobs.start(prefs, [request])
+    archive_jobs._tick()
+    archive_jobs.cancel()
+    release_download.set()
+    archive_jobs._active.worker.join(2)
+    archive_jobs._tick()
+    check("queue cancellation removes staged archive and skips apply",
+          not prefs.archive_running and "未处理 1" in prefs.report_summary
+          and not any(path.exists() for path in staged_paths))
+finally:
+    PM.store.download_package = original_download
+    archive_jobs.shutdown()
+
+# Missing storage on startup should preserve the existing Blender configuration.
+active_config = machine_config.load()
+offline = Path(base, "temporarily-missing-library")
+script_sentinel = Path(base, "independent-scripts")
+script_sentinel.mkdir()
+scope = PM.bridge.capture_scoped_configuration()
+scope["script_directories"].append({"name": "Sentinel", "directory": str(script_sentinel)})
+PM.bridge.apply_scoped_configuration(scope)
+try:
+    machine_config.save({"library_path": str(offline), "management_enabled": True})
+    PM._bootstrap_prefs()
+    prefs.sync_startup_on_launch = True
+    PM._apply_launch_sync()
+    check("offline startup preserves existing Blender paths",
+          PM.bridge.find_script_dir(str(script_sentinel))[0] >= 0)
+    check("offline launch sync does not create a library", not offline.exists())
+    check("offline startup keeps management intent", machine_config.load()["management_enabled"])
+finally:
+    prefs.sync_startup_on_launch = False
+    machine_config.save(active_config)
+    PM._bootstrap_prefs()
+
+broken_switch = Path(base, "mount-failure")
+assert bpy.ops.plugin_manager.pick_library_path(directory=str(broken_switch)) == {"FINISHED"}
+original_apply_scope = PM.bridge.apply_scoped_configuration
+
+def fail_new_mount(config):
+    if any(Path(entry["directory"]) == broken_switch for entry in config["script_directories"]):
+        raise OSError("simulated mount failure")
+    return original_apply_scope(config)
+
+try:
+    PM.bridge.apply_scoped_configuration = fail_new_mount
+    try:
+        bpy.ops.plugin_manager.setup_library()
+    except RuntimeError:
+        check("failed switch restores old scope and path",
+              prefs.library_path == active_config["library_path"]
+              and machine_config.load()["library_path"] == active_config["library_path"]
+              and PM.bridge.is_registered(active_config["library_path"]))
+    else:
+        check("failed switch is reported", False)
+finally:
+    PM.bridge.apply_scoped_configuration = original_apply_scope
+    bpy.ops.plugin_manager.pick_library_path(cancel_preview=True)
 
 print("\n===SUMMARY===")
 fails = [r for r in RESULTS if not r[1]]

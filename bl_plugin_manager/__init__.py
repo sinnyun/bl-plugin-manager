@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 2, 0),
+    "version": (2, 3, 1),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -21,172 +21,196 @@ import os
 _PM_WAS_IMPORTED = "bpy" in globals()
 import bpy
 
-from . import constants as C
-from . import (
-    bridge,
-    compat_task,
-    db,
-    items,
-    library,
-    migrate,
-    operators,
-    preferences,
-    scoped_management,
-    scan,
-    store,
-    ui,
-    updates,
-    watcher,
-)
+import sys
 
-# 支持在 Blender 文本编辑器中热重载
-if _PM_WAS_IMPORTED:  # pragma: no cover
-    for _mod in (C, scan, db, bridge, scoped_management, library, store, updates, migrate, watcher,
-                 items, compat_task, preferences, operators, ui):
-        importlib.reload(_mod)
+from . import self_update
 
-_modules = (preferences, operators, ui)
-_registered = []
-
-
-def _sync_manager_state():
-    """Mirror native-panel changes into the active device profile."""
+_update_boot_message = ""
+_update_backup = None
+if not _PM_WAS_IMPORTED:
     try:
-        from .storage import machine_config
-        local = machine_config.load()
-        root = local.get("library_path")
-        if local.get("management_enabled") and root and os.path.isdir(root):
-            scoped_management.sync_to_profile(root)
-    except Exception as exc:
-        print("[插件库] 同步原生配置失败:", exc)
-    return 2.0
+        _update_installation = self_update.installed_path(__file__, bpy.utils.user_resource("SCRIPTS"))
+    except ValueError:
+        pass
+    else:
+        try:
+            _update_backup = self_update.activate_pending(
+                _update_installation, bl_info["version"], bpy.app.version)
+        except (OSError, SyntaxError, ValueError) as error:
+            _update_boot_message = f"未能应用更新，旧版仍可用：{error}"
+            print("[插件库]", _update_boot_message)
+
+if _update_backup:
+    self_update.load_replacement(sys.modules[__name__], _update_installation, _update_backup)
+else:
+    from . import constants as C
+    from . import (
+        archive_jobs,
+        bridge,
+        compat_task,
+        db,
+        items,
+        library,
+        migrate,
+        operators,
+        preferences,
+        scoped_management,
+        scan,
+        store,
+        ui,
+        updates,
+        watcher,
+    )
+
+    # 支持在 Blender 文本编辑器中热重载
+    if _PM_WAS_IMPORTED:  # pragma: no cover
+        for _mod in (C, scan, db, bridge, scoped_management, library, store, updates, migrate, watcher,
+                     items, compat_task, preferences, operators, ui):
+            importlib.reload(_mod)
+
+    _modules = (preferences, operators, ui)
+    _registered = []
 
 
-def _bootstrap_prefs():
-    """Load machine-local identity and resume only an explicitly active library."""
-    prefs = bridge.get_prefs()
-    local = None
-    if prefs:
+    def _sync_manager_state():
+        """Mirror native-panel changes into the active device profile."""
         try:
             from .storage import machine_config
             local = machine_config.load()
-            path = local.get("library_path")
-            preferences._LOADING_MACHINE_PATH = True
-            try:
-                prefs.device_name = local.get("device_name", "")
-                if path:
-                    prefs.library_path = path
-            finally:
-                preferences._LOADING_MACHINE_PATH = False
+            root = local.get("library_path")
+            if local.get("management_enabled") and root and os.path.isdir(root):
+                scoped_management.sync_to_profile(root)
         except Exception as exc:
-            print("[插件库] 读取本机插件库路径失败:", exc)
-    if not prefs or not local or not local.get("management_enabled"):
-        return
-    if not os.path.isdir(prefs.library_path):
-        bridge.reset_scoped_configuration()
-        machine_config.save({"management_enabled": False})
-        print("[插件库] 已配置的库不可用；仅将受管仓库和脚本路径恢复为默认")
-        return
-    try:
-        bridge.ensure_library_dirs(prefs.library_path)
-        local_db = db.LibraryDB(prefs.library_path, use_cache=False)
-        if local_db.prepare() == "CORRUPT":
-            print("[插件库] 元数据损坏，已保持只读，跳过自动扫描")
+            print("[插件库] 同步原生配置失败:", exc)
+        return 2.0
+
+
+    def _bootstrap_prefs():
+        """Load machine-local identity and resume only an explicitly active library."""
+        prefs = bridge.get_prefs()
+        local = None
+        if prefs:
+            try:
+                from .storage import machine_config
+                local = machine_config.load()
+                path = local.get("library_path")
+                preferences._LOADING_MACHINE_PATH = True
+                try:
+                    prefs.device_name = local.get("device_name", "")
+                    if path:
+                        prefs.library_path = path
+                finally:
+                    preferences._LOADING_MACHINE_PATH = False
+            except Exception as exc:
+                print("[插件库] 读取本机插件库路径失败:", exc)
+        if not prefs or not local or not local.get("management_enabled"):
             return
-        result = scoped_management.activate(prefs.library_path)
-        if result["state"] == "ERROR":
-            print("[插件库] 恢复设备配置时存在失败:", result["failures"])
-        library.sync_library(prefs.library_path, local_db)
-    except Exception as exc:
-        print("[插件库] 初始化库失败:", exc)
-
-
-def _apply_launch_sync():
-    """仅当偏好开启时，按库内「自启」标记同步一次插件启用状态。"""
-    prefs = bridge.get_prefs()
-    if not prefs or not prefs.sync_startup_on_launch or not prefs.library_path:
-        return
-    try:
-        from .db import LibraryDB
-        library.apply_startup(prefs.library_path, LibraryDB(prefs.library_path),
-                              enable_marked=True,
-                              disable_unmarked=prefs.startup_disable_unmarked)
-        from . import items
-        items.rebuild_items(prefs)
-    except Exception as exc:
-        print("[插件库] 启动同步自启状态失败:", exc)
-
-
-def register():
-    try:
-        for mod in _modules:
-            for cls in getattr(mod, "classes", ()):
-                bpy.utils.register_class(cls)
-                _registered.append(cls)
-        _bootstrap_prefs()
-    except Exception:
+        if not os.path.isdir(prefs.library_path):
+            print("[插件库] 插件库离线，已保留本机配置")
+            return
         try:
-            operators.shutdown_compat_task()
+            result = scoped_management.activate_library(prefs.library_path, resume=True)
+            if result["state"] == "ERROR":
+                print("[插件库] 恢复设备配置时存在失败:", result["failures"])
+        except Exception as exc:
+            print("[插件库] 初始化库失败:", exc)
+
+
+    def _apply_launch_sync():
+        """仅当偏好开启时，按库内「自启」标记同步一次插件启用状态。"""
+        prefs = bridge.get_prefs()
+        if not prefs or not prefs.sync_startup_on_launch or not prefs.library_path:
+            return
+        from .storage import machine_config
+        if (not machine_config.load().get("management_enabled")
+                or not os.path.isdir(prefs.library_path) or not bridge.is_registered(prefs.library_path)):
+            return
+        try:
+            from .db import LibraryDB
+            library.apply_startup(prefs.library_path, LibraryDB(prefs.library_path),
+                                  enable_marked=True,
+                                  disable_unmarked=prefs.startup_disable_unmarked)
+            from . import items
+            items.rebuild_items(prefs)
+        except Exception as exc:
+            print("[插件库] 启动同步自启状态失败:", exc)
+
+
+    def register():
+        try:
+            for mod in _modules:
+                for cls in getattr(mod, "classes", ()):
+                    bpy.utils.register_class(cls)
+                    _registered.append(cls)
+            _bootstrap_prefs()
+        except Exception:
+            try:
+                operators.shutdown_compat_task()
+            except Exception:
+                pass
+            for cls in reversed(_registered):
+                try:
+                    bpy.utils.unregister_class(cls)
+                except Exception:
+                    pass
+            _registered.clear()
+            raise
+        # 启动同步：延迟执行，等 Blender 初始化完成（仅当偏好开启时生效）
+        try:
+            bpy.app.timers.unregister(_sync_manager_state)
         except Exception:
             pass
+        try:
+            bpy.app.timers.register(_sync_manager_state, first_interval=2.0, persistent=True)
+        except Exception:
+            pass
+        # 启动同步策略：等 Blender 与库加载就绪后执行一次（仅当偏好开启时生效）
+        try:
+            bpy.app.timers.unregister(_apply_launch_sync)
+        except Exception:
+            pass
+        try:
+            bpy.app.timers.register(_apply_launch_sync, first_interval=2.5)
+        except Exception:
+            pass
+        print(f"[插件库] 已启用 v{C.ADDON_VERSION_STR}（投放区为手动扫描）")
+
+
+    def unregister():
+        try:
+            bpy.app.timers.unregister(_sync_manager_state)
+        except Exception:
+            pass
+        try:
+            bpy.app.timers.unregister(_apply_launch_sync)
+        except Exception:
+            pass
+        try:
+            operators.shutdown_compat_task()
+            operators.shutdown_self_update()
+        except Exception as exc:
+            print("[插件库] 关闭兼容性测试任务失败:", exc)
+        try:
+            archive_jobs.shutdown()
+        except Exception as exc:
+            print("[插件库] 关闭安装任务失败:", exc)
+        try:
+            from .storage import machine_config
+            local = machine_config.load()
+            root = local.get("library_path")
+            if local.get("management_enabled") and root:
+                result = scoped_management.deactivate(root)
+                if result["state"] == "ERROR":
+                    print("[插件库] 停用时存在失败:", result["failures"])
+        except Exception as exc:
+            print("[插件库] 撤销插件库挂载失败:", exc)
         for cls in reversed(_registered):
             try:
                 bpy.utils.unregister_class(cls)
             except Exception:
                 pass
         _registered.clear()
-        raise
-    # 启动同步：延迟执行，等 Blender 初始化完成（仅当偏好开启时生效）
-    try:
-        bpy.app.timers.unregister(_sync_manager_state)
-    except Exception:
-        pass
-    try:
-        bpy.app.timers.register(_sync_manager_state, first_interval=2.0, persistent=True)
-    except Exception:
-        pass
-    # 启动同步策略：等 Blender 与库加载就绪后执行一次（仅当偏好开启时生效）
-    try:
-        bpy.app.timers.unregister(_apply_launch_sync)
-    except Exception:
-        pass
-    try:
-        bpy.app.timers.register(_apply_launch_sync, first_interval=2.5)
-    except Exception:
-        pass
-    print(f"[插件库] 已启用 v{C.ADDON_VERSION_STR}（投放区为手动扫描）")
 
 
-def unregister():
-    try:
-        bpy.app.timers.unregister(_sync_manager_state)
-    except Exception:
-        pass
-    try:
-        bpy.app.timers.unregister(_apply_launch_sync)
-    except Exception:
-        pass
-    try:
-        operators.shutdown_compat_task()
-    except Exception as exc:
-        print("[插件库] 关闭兼容性测试任务失败:", exc)
-    try:
-        from .storage import machine_config
-        local = machine_config.load()
-        root = local.get("library_path")
-        if local.get("management_enabled") and root:
-            result = scoped_management.deactivate(root)
-            if result["state"] == "ERROR":
-                print("[插件库] 停用时存在失败:", result["failures"])
-    except Exception as exc:
-        print("[插件库] 撤销插件库挂载失败:", exc)
-    for cls in reversed(_registered):
-        try:
-            bpy.utils.unregister_class(cls)
-        except Exception:
-            pass
-    _registered.clear()
-
-
-if __name__ == "__main__":
-    register()
+    if __name__ == "__main__":
+        register()

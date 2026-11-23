@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import tempfile
 import zipfile
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 
 from . import bridge, constants as C, scan
-from .db import LibraryDB, now_iso
+from .db import LibraryDB, clear_load_result, now_iso
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
 from .security.archive import extract_archive
 
@@ -98,14 +101,15 @@ def _copy_tree_into(src: str, dst: str) -> None:
             shutil.copy2(entry.path, target)
 
 
-def _replace_tree_transactional(src: str, dest: str, root: str, kind: str) -> None:
+@contextmanager
+def _replace_tree_transactional(src: str, dest: str, root: str, kind: str):
     """Stage and atomically swap plugin contents, retaining a rollback path."""
     backup = backup_plugin(root, dest)
     if not backup:
         raise RuntimeError("无法创建更新前备份，已取消替换")
     parent = os.path.dirname(dest)
     stage = tempfile.mkdtemp(prefix=".pm_stage_", dir=parent)
-    old = dest + ".pm_old_" + uuid.uuid4().hex
+    old = os.path.join(parent, ".pm_old_" + uuid.uuid4().hex)
     try:
         _copy_tree_into(src, stage)
         valid_kind, reason = scan.validate_plugin(stage)
@@ -113,70 +117,26 @@ def _replace_tree_transactional(src: str, dest: str, root: str, kind: str) -> No
             raise ValueError(reason or "更新包类型与现有插件不一致")
         shutil.move(dest, old)
         try:
-            shutil.move(stage, dest)
+            os.rename(stage, dest)
+            yield
         except Exception:
-            # Restore the old directory before propagating the failure.
-            if os.path.exists(old) and not os.path.exists(dest):
-                shutil.move(old, dest)
+            if os.path.exists(dest):
+                os.rename(dest, stage)
+            os.rename(old, dest)
             raise
         shutil.rmtree(old, ignore_errors=True)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
 
-def _refresh_existing(rec: dict, new_src: str, dest: str, root: str, db: LibraryDB,
-                      meta: dict, origin: str, origin_path: str,
-                      move: bool, enable: bool) -> dict:
-    """用新内容刷新库中同名扩展：保留用户字段与启用状态，复用原目录。"""
-    kind = scan.detect_kind(dest) or C.KIND_EXTENSION
-    was_enabled = bridge.is_module_enabled(rec.get("module", ""))
-    if was_enabled:
-        ok, err = bridge.set_enabled(rec.get("module", ""), False)
-        if not ok:
-            raise RuntimeError(f"更新前停用失败: {err}")
-    try:
-        _replace_tree_transactional(new_src, dest, root, kind)
-        if move:
-            shutil.rmtree(new_src, ignore_errors=True)
-    except Exception:
-        if was_enabled:
-            bridge.set_enabled(rec.get("module", ""), True)
-        raise
-
-    fresh = scan.read_meta(dest, kind) or {}
-    plugin_id = rec["plugin_id"]
-    rec["version"] = fresh.get("version") or rec.get("version", "")
-    rec["name"] = fresh.get("name") or rec.get("name") or rec.get("folder_name")
-    rec["blender_min"] = fresh.get("blender_min", rec.get("blender_min", ""))
-    rec["blender_max"] = fresh.get("blender_max", rec.get("blender_max", ""))
-    _c = scan.blender_compat(rec["blender_min"], rec["blender_max"])
-    rec["compat"], rec["compat_detail"] = _c
-    rec["author"] = fresh.get("author", rec.get("author", ""))
-    rec["description"] = fresh.get("description", rec.get("description", ""))
-    rec["auto_category"] = fresh.get("category", rec.get("auto_category", ""))
-    rec["auto_tags"] = fresh.get("tags", rec.get("auto_tags", []))
-    rec["metadata_fingerprint"] = scan.metadata_fingerprint(dest, kind)
-    rec["issues"] = scan.manifest_issues(dest)
-    rec["update_available"] = False
-    rec["latest_version"] = ""
-    rec["latest_url"] = ""
-    rec["last_error"] = ""
-    rec["updated_at"] = now_iso()
-    # 保留分类/备注/别名/收藏/自启等用户字段；用户没填备注时用新描述
-    if not rec.get("note"):
-        rec["note"] = rec.get("description", "")
-    rec["enabled"] = was_enabled
-    db.plugins[plugin_id] = rec
-    db.save()
-
-    bridge.refresh_blender()
-    if was_enabled and rec.get("module"):
-        ok, err = bridge.set_enabled(rec["module"], True)
-        rec["enabled"] = bridge.is_module_enabled(rec["module"])
-        rec["restore_error"] = "" if ok else (err or "更新后重新启用失败")
-        db.plugins[plugin_id] = rec
-        db.save()
-    return rec
+def _refresh_existing(rec: dict, source: str, dest: str, root: str, db: LibraryDB,
+                      *, move: bool, enable: bool) -> dict:
+    if os.path.normcase(os.path.realpath(source)) == os.path.normcase(os.path.realpath(dest)):
+        raise ValueError("该插件已在目标目录中")
+    result = _replace_installed(rec, source, dest, root, db, enable=enable, archive_source="")
+    if move:
+        shutil.rmtree(source, ignore_errors=True)
+    return result
 
 
 def backup_plugin(root: str, plugin_dir: str) -> str | None:
@@ -185,7 +145,7 @@ def backup_plugin(root: str, plugin_dir: str) -> str | None:
     os.makedirs(backups, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = sanitize_name(os.path.basename(plugin_dir))
-    zip_path = os.path.join(backups, f"{safe}__{stamp}.zip")
+    zip_path = os.path.join(backups, f"{safe}__{stamp}_{uuid.uuid4().hex[:8]}.zip")
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for folder, _dirs, files in os.walk(plugin_dir):
@@ -239,7 +199,7 @@ def _build_entry(root: str, plugin_dir: str, kind: str, meta: dict,
 
 def _link_entry(db: LibraryDB, entry: dict) -> str:
     """把单条扫描条目并入总资料库，返回匹配/新建的 plugin_id。"""
-    db.merge_scan([entry])
+    db.merge_scan([entry], complete=False, persist=False)
     plugin_id = db.assignments.get(entry.get("rel", ""))
     if not plugin_id:
         for pid, rel in db.bindings.items():
@@ -314,41 +274,44 @@ def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = Fa
                     continue
                 if os.path.isdir(existing):
                     return _refresh_existing(rec, plugin_dir, existing, root, db,
-                                             meta, origin, origin_path, move, enable)
+                                             move=move, enable=enable)
 
     dest = _unique_dest(base, folder)
 
-    # 目标已存在（同名覆盖）时先备份再清理
-    if os.path.exists(dest):
-        backup_plugin(root, dest)
-        shutil.rmtree(dest, ignore_errors=True)
-
+    with tempfile.TemporaryDirectory(prefix=".pm_import_", dir=base) as staging:
+        staged = os.path.join(staging, "contents")
+        shutil.copytree(plugin_dir, staged)
+        if os.path.exists(dest):
+            raise FileExistsError("安装目标已被占用")
+        os.rename(staged, dest)
+        try:
+            entry = _build_entry(root, dest, kind, meta)
+            # 匹配可能连回既有条目，也可能新建（本机已有同一插件的另一个副本时）。
+            plugin_id = _link_entry(db, entry)
+            # 目标目录已按库内命名规范落位，覆盖本机绑定，避免沿用导入源的路径。
+            # 用户字段默认值写完后必须重新取回记录：_apply_user_defaults 更新的是
+            # db.plugins 中的那份，持有旧引用再回写会把补齐的字段覆盖掉。
+            _apply_user_defaults(db, plugin_id, entry, origin, origin_path)
+            record = db.get(plugin_id) or {}
+            record["rel"] = entry["rel"]
+            record["folder_name"] = entry["folder_name"]
+            record["module"] = entry["module"]
+            record["metadata_fingerprint"] = entry["metadata_fingerprint"]
+            record["issues"] = entry["issues"]
+            record["missing"] = False
+            # compat 是相对当前 Blender 版本的结论，属本机派生字段（界面每次现算），
+            # 这里一并写入，便于调用方直接读取导入结果。
+            record["compat"], record["compat_detail"] = scan.blender_compat(
+                record.get("blender_min", ""), record.get("blender_max", ""))
+            record["enabled"] = bridge.is_module_enabled(record.get("module", ""))
+            db.plugins[plugin_id] = record
+            db.save()
+        except Exception:
+            os.rename(dest, staged)
+            db.load()
+            raise
     if move:
-        shutil.move(plugin_dir, dest)
-    else:
-        shutil.copytree(plugin_dir, dest)
-
-    entry = _build_entry(root, dest, kind, meta)
-    # 匹配可能连回既有条目，也可能新建（本机已有同一插件的另一个副本时）。
-    plugin_id = _link_entry(db, entry)
-    # 目标目录已按库内命名规范落位，覆盖本机绑定，避免沿用导入源的路径。
-    # 用户字段默认值写完后必须重新取回记录：_apply_user_defaults 更新的是
-    # db.plugins 中的那份，持有旧引用再回写会把补齐的字段覆盖掉。
-    _apply_user_defaults(db, plugin_id, entry, origin, origin_path)
-    record = db.get(plugin_id) or {}
-    record["rel"] = entry["rel"]
-    record["folder_name"] = entry["folder_name"]
-    record["module"] = entry["module"]
-    record["metadata_fingerprint"] = entry["metadata_fingerprint"]
-    record["issues"] = entry["issues"]
-    record["missing"] = False
-    # compat 是相对当前 Blender 版本的结论，属本机派生字段（界面每次现算），
-    # 这里一并写入，便于调用方直接读取导入结果。
-    record["compat"], record["compat_detail"] = scan.blender_compat(
-        record.get("blender_min", ""), record.get("blender_max", ""))
-    record["enabled"] = bridge.is_module_enabled(record.get("module", ""))
-    db.plugins[plugin_id] = record
-    db.save()
+        shutil.rmtree(plugin_dir, ignore_errors=True)
 
     bridge.refresh_blender(deep=True)
     if enable:
@@ -362,7 +325,8 @@ def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = Fa
 
 
 def import_zip(zip_path: str, root: str, db: LibraryDB, enable: bool = False,
-               origin: str = "zip", origin_path: str = "") -> dict:
+               origin: str = "zip", origin_path: str = "", *, expected_id: str = "",
+               expected_version: str = "") -> dict:
     info = scan.inspect_zip(zip_path)
     if not info:
         raise ValueError("压缩包中没有可识别的插件（缺少 manifest 或 __init__.py）")
@@ -370,6 +334,12 @@ def import_zip(zip_path: str, root: str, db: LibraryDB, enable: bool = False,
     try:
         extract_archive(zip_path, tmp)
         src = os.path.join(tmp, info["prefix"]) if info["prefix"] else tmp
+        if expected_id or expected_version:
+            meta = scan.read_meta(src, C.KIND_EXTENSION) or {}
+            if expected_id and meta.get("id") != expected_id:
+                raise ValueError("下载包的扩展 ID 与预览不一致")
+            if expected_version and scan.compare_versions(meta.get("version"), expected_version) != 0:
+                raise ValueError("下载包版本与预览不一致")
         rec = import_plugin_dir(src, root, db, move=True, enable=enable,
                                 origin=origin, origin_path=origin_path)
         return rec
@@ -419,6 +389,8 @@ def inspect_target(path: str) -> dict:
         return info
 
     info["is_plugin"] = scan.detect_kind(path) is not None
+    info["is_library"] = any(os.path.isfile(os.path.join(path, C.DIR_META, name))
+                             for name in (C.DB_FILENAME, C.LEGACY_DB_FILENAME))
     try:
         info["is_empty"] = not any(True for _ in os.scandir(path))
     except OSError:
@@ -453,6 +425,16 @@ def inspect_target(path: str) -> dict:
     return info
 
 
+def target_error(info: dict) -> str:
+    if info["path"] and os.path.exists(info["path"]) and not info["exists"]:
+        return "所选路径不是目录"
+    if info["is_plugin"]:
+        return "所选目录本身就是一个插件，请选择它的上一级目录作为插件库"
+    if info["exists"] and not (info["is_library"] or info["is_empty"] or info["flat_plugins"]):
+        return "该目录非空且其中没有可识别的插件；请选择空目录或已有插件库"
+    return ""
+
+
 def connect_library(root: str, db: LibraryDB, move_flat: bool = True) -> dict:
     """智能连接一个目录作为插件库。
 
@@ -465,20 +447,13 @@ def connect_library(root: str, db: LibraryDB, move_flat: bool = True) -> dict:
     result = {"info": info, "created": False, "imported": [], "failed": [],
               "already_library": info["is_library"], "error": ""}
 
-    if info["path"] and info["is_plugin"]:
-        result["error"] = "所选目录本身就是一个插件，请选择它的上一级目录作为插件库"
+    if error := target_error(info):
+        result["error"] = error
         return result
 
     if not info["exists"]:
         bridge.ensure_library_dirs(root)
         result["created"] = True
-        return result
-
-    # 保护：已存在、非空、既不是插件库也没有可识别的插件 →
-    # 不擅自初始化，避免把资产目录等无关文件夹变成插件库
-    if not info["is_library"] and not info["is_empty"] and not info["flat_plugins"]:
-        result["error"] = ("该目录非空且其中没有可识别的插件，不像是插件库；"
-                           "为避免误改文件夹，已取消。请改选空目录或已有的插件库目录")
         return result
 
     bridge.ensure_library_dirs(root)
@@ -582,18 +557,36 @@ def remove_plugin(root: str, db: LibraryDB, key: str, to_trash: bool = True) -> 
     except UnsafeLibraryPathError:
         return None
     moved_to = None
+    journal = None
+    module = rec.get("module", "")
+    was_enabled = bool(module and bridge.is_module_enabled(module))
     if os.path.isdir(plugin_dir):
         if to_trash:
             trash = os.path.join(root, C.DIR_TRASH)
             os.makedirs(trash, exist_ok=True)
+            if Path(trash).resolve().parent != Path(root).resolve():
+                raise ValueError("回收站目录不在插件库内")
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            target = os.path.join(trash, f"{sanitize_name(rec.get('folder_name') or key)}__{stamp}")
+            name = f"{sanitize_name(rec.get('folder_name') or key)}__{stamp}_{uuid.uuid4().hex[:8]}"
+            target = os.path.join(trash, name)
+            journal = Path(trash) / (name + ".json")
+            if was_enabled:
+                ok, error = bridge.set_enabled(module, False)
+                if not ok:
+                    raise RuntimeError(f"移除前停用失败: {error}")
             try:
+                journal.write_text(json.dumps({
+                    "rel": rec["rel"], "kind": rec.get("kind", "addon"),
+                    "name": effective_name(rec), "startup": bool(rec.get("startup")),
+                }, ensure_ascii=False), encoding="utf-8")
                 shutil.move(plugin_dir, target)
                 moved_to = target
             except Exception:
                 # A failed move must never become an irreversible delete.  Keep
                 # both the source and the DB record so the user can retry.
+                journal.unlink(missing_ok=True)
+                if was_enabled:
+                    bridge.set_enabled(module, True)
                 return None
         else:
             shutil.rmtree(plugin_dir, ignore_errors=True)
@@ -601,9 +594,69 @@ def remove_plugin(root: str, db: LibraryDB, key: str, to_trash: bool = True) -> 
     bridge.refresh_blender(deep=True)
     # 只解除本机绑定；总资料库条目保留（别名/分类/备注属于所有电脑，
     # 该插件在别的电脑上仍然安装着，重新安装到本机时也会自动连回）。
-    db.remove(key)
-    db.save()
+    try:
+        db.remove(key)
+        db.save()
+    except Exception:
+        if moved_to:
+            shutil.move(moved_to, plugin_dir)
+            journal.unlink(missing_ok=True)
+            bridge.refresh_blender(deep=True)
+            if was_enabled:
+                bridge.set_enabled(module, True)
+        db.load()
+        raise
     return moved_to
+
+
+def trash_entries(root: str) -> dict[str, dict]:
+    trash = Path(root, C.DIR_TRASH)
+    if not trash.is_dir() or trash.resolve().parent != Path(root).resolve():
+        return {}
+    entries = {}
+    for journal in sorted(trash.glob("*.json")):
+        try:
+            source = (trash / journal.stem).resolve()
+            if source.parent != trash.resolve() or not source.is_dir():
+                continue
+            entry = json.loads(journal.read_text(encoding="utf-8"))
+            if not isinstance(entry, dict):
+                continue
+            resolve_record_path(root, entry.get("rel"), entry.get("kind"))
+        except (OSError, ValueError):
+            continue
+        entries[journal.stem] = entry
+    return entries
+
+
+def restore_plugin(root: str, db: LibraryDB, trash_id: str) -> dict:
+    entry = trash_entries(root).get(trash_id)
+    if not entry:
+        raise ValueError("回收站条目已不存在")
+    trash = Path(root, C.DIR_TRASH)
+    source = trash / trash_id
+    dest = resolve_record_path(root, entry["rel"], entry["kind"])
+    if dest.exists():
+        raise ValueError("原安装路径已被占用，请先移动现有插件")
+    kind, reason = scan.validate_plugin(str(source))
+    if kind != entry["kind"]:
+        raise ValueError(reason or "回收站条目的插件类型不匹配")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(dest))
+    try:
+        meta = scan.read_meta(str(dest), kind) or {}
+        record = _build_entry(root, str(dest), kind, meta)
+        key = _link_entry(db, record)
+        result = db.get(key)
+        result.update(module=record["module"], startup=bool(entry.get("startup")))
+        db.save()
+    except Exception:
+        shutil.move(str(dest), str(source))
+        db.load()
+        raise
+    (trash / (trash_id + ".json")).unlink(missing_ok=True)
+    bridge.refresh_blender(deep=True)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +689,7 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
                 enabled_set.add(module)
             if ok:
                 rec["enabled"] = True
+                rec["startup_override"] = True
                 rec["last_error"] = ""
                 stats["enabled"] += 1
             else:
@@ -648,6 +702,7 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
             if ok:
                 enabled_set.discard(module)
                 rec["enabled"] = False
+                rec["startup_override"] = False
                 stats["disabled"] += 1
             else:
                 rec["last_error"] = err
@@ -659,81 +714,69 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
 # ---------------------------------------------------------------------------
 # 用压缩包替换库中已有插件（用于在线更新）
 # ---------------------------------------------------------------------------
-def replace_from_zip(rec: dict, zip_path: str, root: str, db: LibraryDB,
-                     version: str = "", defer_refresh: bool = False) -> dict:
-    """用 zip 里的内容替换库中已有插件，保留该记录的元数据与启用状态。
+def _replace_installed(rec: dict, source: str, target: str, root: str, db: LibraryDB,
+                       *, version: str = "", enable: bool = False, archive_source: str | None = None) -> dict:
+    kind = rec.get("kind") or scan.detect_kind(target)
+    metadata = scan.read_meta(source, kind) or {}
+    expected = rec.get("pkg_id") or rec.get("id")
+    if kind == C.KIND_EXTENSION and expected and metadata.get("id") != expected:
+        raise ValueError("更新包的扩展 ID 与已安装插件不一致")
+    if version and scan.compare_versions(metadata.get("version"), version) != 0:
+        raise ValueError("更新包版本与预览不一致")
+    module = rec.get("module", "")
+    was_enabled = bool(module and bridge.is_module_enabled(module))
+    if was_enabled:
+        ok, error = bridge.set_enabled(module, False)
+        if not ok:
+            raise RuntimeError(f"更新前停用失败: {error}")
 
-    保留原目录名（也就是扩展插件的模块名），避免破坏启用状态与外部引用。
-
-    defer_refresh=True 时不在每次替换后立刻刷新 Blender（批量更新时用，
-    由调用方在全部完成后统一刷新一次），可避免 N 次刷新造成的长时间卡顿。
-    """
+    plugin_id = rec["plugin_id"]
     try:
-        target = str(resolve_record_path(root, rec["rel"], rec.get("kind", "addon")))
-    except UnsafeLibraryPathError as exc:
-        raise ValueError(f"不安全的插件路径: {rec.get('rel', '')}") from exc
+        with _replace_tree_transactional(source, target, root, kind):
+            refreshed = dict(rec)
+            refreshed.update(_build_entry(root, target, kind, metadata, module=module))
+            clear_load_result(refreshed)
+            refreshed.update(enabled=False, update_available=False, latest_version="",
+                             latest_url="", last_error="", updated_at=now_iso())
+            if archive_source is not None:
+                refreshed["archive_source"] = archive_source
+            refreshed["compat"], refreshed["compat_detail"] = scan.blender_compat(
+                refreshed["blender_min"], refreshed["blender_max"])
+            bridge.refresh_blender(deep=True)
+            try:
+                if (was_enabled or enable) and module:
+                    ok, error = bridge.set_enabled(module, True)
+                    if not ok:
+                        raise RuntimeError(f"新版加载失败: {error}")
+                    refreshed["enabled"] = True
+                db.plugins[plugin_id] = refreshed
+                db.save()
+            except Exception:
+                if module and bridge.is_module_enabled(module):
+                    bridge.set_enabled(module, False)
+                raise
+    except Exception as exc:
+        db.load()
+        bridge.refresh_blender(deep=True)
+        if was_enabled:
+            ok, error = bridge.set_enabled(module, True)
+            if not ok:
+                raise RuntimeError(f"{exc}；已恢复原文件，但原版重新启用失败: {error}") from exc
+        raise
+    return refreshed
+
+
+def replace_from_zip(rec: dict, zip_path: str, root: str, db: LibraryDB,
+                     version: str = "", archive_source: str = "") -> dict:
+    """Validate, replace and reload while the original installation remains recoverable."""
+    target = str(resolve_record_path(root, rec["rel"], rec.get("kind", "addon")))
     if not os.path.isdir(target):
         raise ValueError(f"库中找不到插件目录: {rec['rel']}")
-
     info = scan.inspect_zip(zip_path)
     if not info:
         raise ValueError("压缩包中没有可识别的插件")
-
-    was_enabled = bridge.is_module_enabled(rec.get("module", ""))
-    module = rec.get("module", "")
-    if was_enabled:
-        ok, err = bridge.set_enabled(module, False)
-        if not ok:
-            raise RuntimeError(f"更新前停用失败: {err}")
-
-    tmp = tempfile.mkdtemp(prefix="pm_replace_")
-    try:
-        extract_archive(zip_path, tmp)
-        src = os.path.join(tmp, info["prefix"]) if info["prefix"] else tmp
-
-        # 在临时目录中验证完整内容后再交换，失败时保留旧版本。
-        _replace_tree_transactional(src, target, root, rec.get("kind") or info["kind"])
-    except Exception:
-        if was_enabled:
-            bridge.set_enabled(module, True)
-        raise
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    # 重新读取元数据，更新记录中源自插件的字段（用户字段一律保留）
-    kind = scan.detect_kind(target) or rec.get("kind")
-    meta = scan.read_meta(target, kind) or {}
-    rec["kind"] = kind
-    rec["name"] = meta.get("name") or rec.get("name") or rec.get("folder_name")
-    rec["version"] = scan.version_str(version) or meta.get("version") or rec.get("version")
-    rec["blender_min"] = meta.get("blender_min", rec.get("blender_min", ""))
-    rec["blender_max"] = meta.get("blender_max", rec.get("blender_max", ""))
-    _c = scan.blender_compat(rec["blender_min"], rec["blender_max"])
-    rec["compat"], rec["compat_detail"] = _c
-    rec["author"] = meta.get("author", rec.get("author", ""))
-    rec["description"] = meta.get("description", rec.get("description", ""))
-    rec["auto_category"] = meta.get("category", rec.get("auto_category", ""))
-    rec["auto_tags"] = meta.get("tags", rec.get("auto_tags", []))
-    rec["metadata_fingerprint"] = scan.metadata_fingerprint(target, kind)
-    if kind == C.KIND_EXTENSION:
-        rec["issues"] = scan.manifest_issues(target)
-    rec["update_available"] = False
-    rec["latest_version"] = ""
-    rec["latest_url"] = ""
-    rec["last_error"] = ""
-    rec["enabled"] = was_enabled
-    rec["updated_at"] = now_iso()
-    db.plugins[rec["plugin_id"]] = rec
-    if defer_refresh:
-        return rec
-    db.save()
-
-    bridge.refresh_blender()
-    if was_enabled and module:
-        # 更新后重新启用（旧模块可能已失效，需重新加载）
-        ok, err = bridge.set_enabled(module, True)
-        rec["enabled"] = bridge.is_module_enabled(module)
-        rec["restore_error"] = "" if ok else (err or "更新后重新启用失败")
-        db.plugins[rec["plugin_id"]] = rec
-        db.save()
-    return rec
+    with tempfile.TemporaryDirectory(prefix="pm_replace_") as temporary:
+        extract_archive(zip_path, temporary)
+        source = os.path.join(temporary, info["prefix"]) if info["prefix"] else temporary
+        return _replace_installed(rec, source, target, root, db,
+                                  version=version, archive_source=archive_source)

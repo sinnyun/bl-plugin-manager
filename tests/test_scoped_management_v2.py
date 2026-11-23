@@ -48,7 +48,7 @@ class ScopedManagementTests(unittest.TestCase):
             )
             mod.machine_config = machine_api
             mod.bridge = bridge
-            mod.LibraryDB = lambda value: types.SimpleNamespace(all=lambda: records)
+            mod.LibraryDB = lambda value: types.SimpleNamespace(all=lambda: records, save=lambda: None)
 
             report = mod.activate(root)
             self.assertEqual("ACTIVE", report["state"])
@@ -87,7 +87,8 @@ class ScopedManagementTests(unittest.TestCase):
                 is_module_enabled=lambda module: False,
             )
             mod.LibraryDB = lambda value: types.SimpleNamespace(
-                all=lambda: [{"key": "addons/a", "module": "a"}])
+                all=lambda: [{"key": "addons/a", "module": "a"},
+                             {"key": "addons/missing", "module": "missing", "missing": True}])
             mod.sync_to_profile(root)
             self.assertEqual({"addons/missing"}, set(store.load("device-a")["enabled_plugins"]))
 

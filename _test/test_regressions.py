@@ -304,15 +304,15 @@ def case_list_compatibility_display(_root: str) -> None:
         compat="ok", supported="unknown", load_state="", compat_detail="支持 4.2.0 ~ 5.2.0",
         max_version_text="≤ 5.2.0")
     check("list display compatible", ui._compat_display(ok) ==
-          ("✓ 已实测可启动", "最高 ≤ 5.2.0", False))
+          ("实测可启动", "最高 ≤ 5.2.0", False))
     check("list display too-new", ui._compat_display(too_new) ==
-          ("✗ 当前 Blender 不兼容", "最高 ≤ 5.0.0", True))
+          ("版本不兼容", "最高 ≤ 5.0.0", True))
     check("list display unknown", ui._compat_display(unknown) ==
-          ("? 未声明，未实测", "最高 不限", False))
+          ("未测", "未声明上限", False))
     check("list display load-failed", ui._compat_display(failed) ==
-          ("✗ 启动测试失败", "最高 ≤ 5.2.0", True))
+          ("启动失败", "最高 ≤ 5.2.0", True))
     check("list display untested", ui._compat_display(untested) ==
-          ("? 声明兼容，未实测", "最高 ≤ 5.2.0", False))
+          ("声明兼容 · 未测", "最高 ≤ 5.2.0", False))
 
 
 class _FakeCompatApi:

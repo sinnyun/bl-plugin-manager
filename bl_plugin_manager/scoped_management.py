@@ -34,14 +34,27 @@ def _records(root: str) -> list[dict]:
 def _current_intent(root: str, existing: set[str] | None = None) -> set[str]:
     api = _bridge()
     intent = set(existing or ())
-    for record in _records(root):
+    db = LibraryDB(root)
+    changed = False
+    for record in db.all():
         key, module = record.get("key", ""), record.get("module", "")
-        if not key or not module:
+        if not key or not module or record.get("missing"):
             continue
-        if api.is_module_enabled(module):
+        enabled = api.is_module_enabled(module)
+        if enabled != bool(record.get("enabled")):
+            record["enabled"] = enabled
+            changed = True
+        if "startup_override" in record:
+            if enabled == record["startup_override"]:
+                continue
+            record.pop("startup_override")
+            changed = True
+        if enabled:
             intent.add(key)
-        else:
+        elif not (record.get("last_error") or record.get("restore_error")):
             intent.discard(key)
+    if changed:
+        db.save()
     return intent
 
 
@@ -104,18 +117,43 @@ def sync_to_profile(root: str) -> dict:
                       script_directories=config["script_directories"])
 
 
-def record_activation(root: str, plugin_key: str, enabled: bool) -> dict:
+def record_activations(root: str, keys, enabled: bool) -> None:
     device_id, device_name, _local = _identity()
-    return DeviceProfileStore(root).update_enabled(
-        device_id, device_name, plugin_key, enabled)
+    store = DeviceProfileStore(root)
+    profile = store.load(device_id)
+    intent = set(profile["enabled_plugins"])
+    if enabled:
+        intent.update(keys)
+    else:
+        intent.difference_update(keys)
+    store.save(device_id, device_name, intent, repositories=profile["repositories"],
+               script_directories=profile["script_directories"])
+
+
+def record_activation(root: str, plugin_key: str, enabled: bool) -> None:
+    record_activations(root, (plugin_key,), enabled)
+
+
+def transfer_activation(root: str, origin: str, target: str) -> None:
+    device_id, device_name, _local = _identity()
+    store = DeviceProfileStore(root)
+    profile = store.load(device_id)
+    intent = set(profile["enabled_plugins"])
+    if origin in intent:
+        intent.discard(origin)
+        intent.add(target)
+        store.save(device_id, device_name, intent, repositories=profile["repositories"],
+                   script_directories=profile["script_directories"])
 
 
 def _apply_activation(root: str, desired: set[str]) -> list[dict]:
     api = _bridge()
     failures = []
-    for record in _records(root):
+    db = LibraryDB(root)
+    changed = False
+    for record in db.all():
         key, module = record.get("key", ""), record.get("module", "")
-        if not key or not module or module == C.ADDON_ID:
+        if not key or not module or record.get("missing") or module == C.ADDON_ID:
             continue
         target = key in desired
         if api.is_module_enabled(module) == target:
@@ -123,10 +161,15 @@ def _apply_activation(root: str, desired: set[str]) -> list[dict]:
         ok, error = api.set_enabled(module, target)
         if not ok:
             failures.append({"key": key, "target": target, "error": error})
+        record["enabled"] = api.is_module_enabled(module)
+        record["last_error"] = "" if ok else error or "无法应用启用意图"
+        changed = True
+    if changed:
+        db.save()
     return failures
 
 
-def activate(root: str) -> dict:
+def activate(root: str, after_mount=None) -> dict:
     """Apply this device profile, creating it from current scoped state once."""
     root = os.path.abspath(root)
     device_id, device_name, _local = _identity()
@@ -150,6 +193,8 @@ def activate(root: str) -> dict:
                 script_directories=config["script_directories"],
             )
         _bridge().apply_scoped_configuration(profile)
+        if after_mount is not None:
+            after_mount()
         failures = _apply_activation(root, set(profile["enabled_plugins"]))
         setter = getattr(_bridge(), "set_managed_library_root", None)
         if setter:
@@ -161,13 +206,70 @@ def activate(root: str) -> dict:
         return {"state": "ERROR", "failures": [{"error": str(exc)}]}
 
 
+def activate_library(root: str, *, resume: bool = False) -> dict:
+    """Validate the target before changing Blender and restore the old scope on failure."""
+    from . import library
+
+    root = os.path.abspath(root)
+    previous = machine_config.load()
+    previous_root = previous.get("library_path")
+    is_switch = bool(previous.get("management_enabled") and previous_root
+                     and os.path.normcase(os.path.abspath(previous_root)) != os.path.normcase(root))
+    unavailable = not os.path.isdir(root)
+    if unavailable and (resume or (previous.get("management_enabled") and not is_switch)):
+        raise RuntimeError("插件库离线，请恢复目录后重连")
+    info = library.inspect_target(root)
+    if error := library.target_error(info):
+        raise RuntimeError(error)
+    database = LibraryDB(root, use_cache=False)
+    if database.status in {"CORRUPT", "UNSUPPORTED"}:
+        raise RuntimeError(f"插件库资料不可写（{database.status}），原文件已保留")
+    api = _bridge()
+    api.ensure_library_dirs(root)
+    status = database.prepare()
+    if status != "OK":
+        raise RuntimeError(f"插件库资料不可写（{status}），原文件已保留")
+    result = (library.connect_library(root, database, move_flat=False)
+              if not resume and not info["is_library"] and info["flat_plugins"] else {})
+
+    def rescan():
+        library.sync_library(root, LibraryDB(root))
+
+    original_config = api.capture_scoped_configuration()
+    original_enabled = api.enabled_modules()
+    target_modules = set()
+    try:
+        if is_switch:
+            stopped = deactivate(previous_root)
+            if stopped["state"] != "INACTIVE":
+                raise RuntimeError(f"停止原插件库失败: {stopped['failures'][:3]}")
+        outcome = activate(root, after_mount=rescan)
+        target_modules = {rec.get("module") for rec in _records(root)}
+        if not api.is_registered(root):
+            raise RuntimeError(f"挂载未完成: {outcome['failures'][:3]}")
+        # 插件自身加载失败应保留启用意图并报告；目录和仓库仍可正常使用。
+        if not machine_config.load().get("management_enabled"):
+            raise RuntimeError(f"启用管理失败: {outcome['failures'][:3]}")
+    except Exception:
+        for module in (api.enabled_modules() - original_enabled) & target_modules:
+            api.set_enabled(module, False)
+        api.apply_scoped_configuration(original_config)
+        for module in original_enabled - api.enabled_modules():
+            api.set_enabled(module, True)
+        api.set_managed_library_root(previous_root if previous.get("management_enabled") else "")
+        machine_config.save(previous)
+        raise
+    return {**result, **outcome, "migration": getattr(database, "migration_report", None)}
+
+
 def deactivate(root: str) -> dict:
     """Persist current intent, disable managed add-ons, and reset only owned scopes."""
     root = os.path.abspath(root)
     failures = []
     try:
-        sync_to_profile(root)
-        failures.extend(_apply_activation(root, set()))
+        if os.path.isdir(root):
+            sync_to_profile(root)
+            failures.extend(_apply_activation(root, set()))
         _bridge().reset_scoped_configuration()
         setter = getattr(_bridge(), "set_managed_library_root", None)
         if setter:

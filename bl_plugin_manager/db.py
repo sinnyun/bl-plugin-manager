@@ -26,6 +26,9 @@
 from __future__ import annotations
 
 import os
+import json
+import tempfile
+from copy import deepcopy
 
 from . import constants as C
 from .storage import catalog as catalog_store
@@ -49,7 +52,13 @@ _V2_RUNTIME_FIELDS = frozenset({
     "latest_url", "latest_hash", "latest_size", "latest_website",
     # 来源与合规检查结果：origin_path 是本机绝对路径，只存本机。
     "origin", "origin_path", "imported_at", "issues",
+    "version", "blender_min", "blender_max", "archive_source", "load_environment",
+    "latest_repo", "update_source_required",
+    "startup_override",
 })
+_INSTALL_FIELDS = ("version", "blender_min", "blender_max", "metadata_fingerprint")
+_LOAD_RESULT_FIELDS = ("load_state", "load_error", "residue", "restore_error", "load_environment")
+_ABSENT = object()
 
 # 本机绑定字段：plugin_id -> 相对路径，随运行状态一起保存在本机。
 _BINDING_FIELDS = frozenset({"rel"})
@@ -96,6 +105,18 @@ def _environment() -> str:
     return f"{os.name}-python-{sys.version_info.major}.{sys.version_info.minor}"
 
 
+def compatibility_environment() -> str:
+    import sys
+    blender = sys.modules.get("bpy")
+    version = getattr(getattr(blender, "app", None), "version", ())
+    return f"{_environment()}-blender-{'.'.join(map(str, version))}"
+
+
+def clear_load_result(record: dict) -> None:
+    for field in _LOAD_RESULT_FIELDS:
+        record.pop(field, None)
+
+
 # 用户字段的缺省值。无论记录是由导入、扫描还是旧库迁移产生，视图都必须提供
 # 这些字段：界面与调用方按字段直接读取（如 rec["note"]），缺失会直接报错。
 _USER_DEFAULTS = {
@@ -115,6 +136,31 @@ def _with_user_defaults(record: dict) -> dict:
     return record
 
 
+def _merge_changes(base: dict, edited: dict, latest: dict, conflicts=None, path=()) -> dict:
+    """Apply only this handle's changes to the latest values."""
+    result = dict(latest)
+    for key in dict.fromkeys((*base, *edited)):
+        old = base.get(key, _ABSENT)
+        new = edited.get(key, _ABSENT)
+        if new == old:
+            continue
+        current = latest.get(key, _ABSENT)
+        field_path = (*path, key)
+        if isinstance(new, dict) and isinstance(current, dict) and (old is _ABSENT or isinstance(old, dict)):
+            result[key] = _merge_changes(old if isinstance(old, dict) else {}, new, current,
+                                         conflicts, field_path)
+        elif (conflicts is not None and current != old and current != new
+              and key not in {"updated_at", "created_at", "order"}):
+            conflicts.append({"field": ".".join(map(str, field_path)),
+                              "current": None if current is _ABSENT else current,
+                              "proposed": None if new is _ABSENT else new})
+        elif new is _ABSENT:
+            result.pop(key, None)
+        else:
+            result[key] = new
+    return result
+
+
 class LibraryDB:
     """总资料库 + 本机绑定 + 本机运行状态的读写视图。"""
 
@@ -128,6 +174,7 @@ class LibraryDB:
         if not use_cache:
             json_cache.invalidate()
         self.status = "MISSING"
+        self.migration_report = None
         self.loaded_signature = None
         self._bindings: dict[str, str] = {}
         self._runtime: dict[str, dict] = {}
@@ -141,13 +188,17 @@ class LibraryDB:
     # -- 读取 --------------------------------------------------------------
     def load(self) -> None:
         status = self.catalog.load()
+        self._catalog_baseline = deepcopy(self.catalog.plugins) if status == "OK" else {}
+        legacy_status = self.catalog.legacy_status() if status != "OK" else "MISSING"
+        self._bindings, self._runtime = {}, {}
         if status == "OK":
             self.status = "OK"
-        elif status == "CORRUPT" or self.catalog.legacy_is_corrupt():
+        elif status in {"CORRUPT", "UNSUPPORTED"} or legacy_status in {"CORRUPT", "UNSUPPORTED"}:
             # 资料库本身损坏，或旧库损坏：只读，绝不覆盖（保存会被拒绝）。
-            self.status = "CORRUPT"
+            self.status = status if status != "MISSING" else legacy_status
             self.data = _empty_view()
             self.loaded_signature = self.catalog.loaded_signature
+            self._baseline = self._split()
             return
         else:
             self.status = "MISSING"
@@ -155,6 +206,7 @@ class LibraryDB:
 
         if status != "OK":
             self.data = _empty_view()
+            self._baseline = self._split()
             return
 
         library_id = str(self.catalog.data.get("library_id") or "")
@@ -176,6 +228,8 @@ class LibraryDB:
             runtime = self._runtime.get(plugin_id)
             if isinstance(runtime, dict):
                 record.update(runtime)
+            if record.get("load_environment") and record["load_environment"] != compatibility_environment():
+                clear_load_result(record)
             record.setdefault("missing", False)
             if not record.get("name"):
                 record["name"] = record["folder_name"]
@@ -188,6 +242,7 @@ class LibraryDB:
             "categories": [dict(item) for item in self.catalog.categories],
             "plugins": plugins,
         }
+        self._baseline = deepcopy(self._split())
 
     def _load_local(self, library_id: str) -> tuple[dict, dict]:
         state = self._state_store(library_id).load()
@@ -205,33 +260,63 @@ class LibraryDB:
 
     # -- 写入 --------------------------------------------------------------
     def save(self) -> None:
-        if self.status == "CORRUPT":
-            raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
+        if self.status in {"CORRUPT", "UNSUPPORTED"}:
+            raise CorruptDatabaseError(f"插件资料库不可写 ({self.status}): {self.path}")
 
+        previous_id = self.catalog.data.get("library_id")
         if self.catalog.status != "OK":
             # 显式写入即视为初始化（首次连接/导入前可能尚未调用 initialize）。
             report = self.catalog.initialize()
-            if report.status == "CORRUPT":
-                self.status = "CORRUPT"
-                raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
+            if report.status not in {"READY", "CREATED"}:
+                self.status = report.status
+                raise CorruptDatabaseError(f"插件资料库不可写 ({self.status}): {self.path}")
         else:
             # 本进程内可能有多个句柄先后写入同一文件，同步软件也可能在外部替换
             # 文件。先重新读取最新内容，再把自己的记录合并上去，这样既不会误报
             # 冲突，也不会把对方新增的记录整体覆盖掉。
             self.catalog.refresh_if_stale()
             if self.catalog.status != "OK":
-                self.status = "CORRUPT"
-                raise CorruptDatabaseError(f"拒绝覆盖损坏数据库: {self.path}")
+                self.status = self.catalog.status
+                raise CorruptDatabaseError(f"插件资料库不可写 ({self.status}): {self.path}")
 
-        catalog_plugins, bindings, runtime = self._split()
-        self.catalog.data["plugins"] = catalog_plugins
-        self.catalog.data["categories"] = [dict(item) for item in self.data["categories"]]
-        self.catalog.save()
+        library_id = str(self.catalog.data["library_id"])
+        if previous_id and previous_id != library_id:
+            raise catalog_store.CatalogConflictError("库标识已变更，请重新打开插件库后再保存")
+        current = self._split()
+        old_shared, old_bindings, old_runtime = self._baseline
+        shared, bindings, runtime = current
+        existing = {"plugins": self.catalog.plugins,
+                    "categories": {item["id"]: item for item in self.catalog.categories}}
+        conflicts = []
+        # 本机解绑只影响本机状态。共享记录仅在调用方实际修改字段时写回。
+        merged = _merge_changes(old_shared, shared, existing, conflicts)
+        if conflicts:
+            path = self._state_store(library_id).path.parent
+            path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path,
+                                             prefix="catalog-conflict-", suffix=".json",
+                                             delete=False) as proposal:
+                json.dump({"library": self.path, "conflicts": conflicts}, proposal,
+                          ensure_ascii=False, indent=2)
+            raise catalog_store.CatalogConflictError(
+                f"共享资料已被修改，请刷新。两份修改已记录在 {proposal.name}")
+        if merged != existing:
+            self.catalog.data["plugins"] = merged["plugins"]
+            self.catalog.data["categories"] = list(merged["categories"].values())
+            try:
+                self.catalog.save()
+            except catalog_store.CatalogConflictError:
+                self.catalog.load()
+                raise
 
-        library_id = str(self.catalog.data.get("library_id") or "")
-        self._state_store(library_id).save(
-            {"schema": 2, "bindings": bindings, "plugins": runtime})
-        self._bindings, self._runtime = bindings, runtime
+        if bindings != old_bindings or runtime != old_runtime:
+            latest_bindings, latest_runtime = self._load_local(library_id)
+            self._bindings = _merge_changes(old_bindings, bindings, latest_bindings)
+            self._runtime = _merge_changes(old_runtime, runtime, latest_runtime)
+            self._state_store(library_id).save(
+                {"schema": 2, "bindings": self._bindings, "plugins": self._runtime})
+        self._baseline = deepcopy(current)
+        self._catalog_baseline = deepcopy(shared["plugins"])
         self.status = "OK"
         self.loaded_signature = self.catalog.loaded_signature
         self.data["library_id"] = library_id
@@ -242,7 +327,7 @@ class LibraryDB:
 
         以资料库既有条目为底，保证本机未安装的条目不会被这次写入抹掉。
         """
-        catalog_plugins = {pid: dict(rec) for pid, rec in self.catalog.plugins.items()}
+        catalog_plugins = dict(self._catalog_baseline)
         bindings: dict[str, str] = {}
         runtime: dict[str, dict] = {}
         for plugin_id, record in self.data["plugins"].items():
@@ -255,7 +340,8 @@ class LibraryDB:
             fields = {field: record[field] for field in _V2_RUNTIME_FIELDS if field in record}
             if fields:
                 runtime[plugin_id] = fields
-        return catalog_plugins, bindings, runtime
+        categories = {item["id"]: dict(item) for item in self._category_records()}
+        return {"plugins": catalog_plugins, "categories": categories}, bindings, runtime
 
     # -- 初始化与迁移 ------------------------------------------------------
     def prepare(self) -> str:
@@ -264,23 +350,19 @@ class LibraryDB:
         幂等；目录已由调用方确认是插件库（不是无关目录）时才能调用。返回
         ``OK`` / ``CORRUPT``。迁移完成后旧文件被归档为只读。
         """
-        if self.status == "CORRUPT":
-            return "CORRUPT"
+        if self.status in {"CORRUPT", "UNSUPPORTED"}:
+            return self.status
         report = self.catalog.initialize()
-        if report.status == "CORRUPT":
-            self.status = "CORRUPT"
-            return "CORRUPT"
+        if report.status not in {"READY", "CREATED"}:
+            self.status = report.status
+            return self.status
         self.load()
         if self.catalog.legacy_path.exists():
-            legacy = None
-            try:
-                legacy = self.catalog.read_legacy()
-            except (OSError, ValueError):
-                legacy = None
-            if isinstance(legacy, dict):
-                self.absorb_legacy(legacy)
+            legacy = self.catalog.read_legacy()
+            if legacy is not None:
+                self.migration_report = self.absorb_legacy(legacy)
                 self.save()
-            self.catalog.archive_legacy()
+                self.catalog.archive_legacy()
         return "OK"
 
     # -- 记录访问 ----------------------------------------------------------
@@ -309,10 +391,10 @@ class LibraryDB:
         self.plugins[key] = current
         return current
 
-    def merge_scan(self, entries: list[dict]) -> dict:
+    def merge_scan(self, entries: list[dict], *, complete: bool = True, persist: bool = True) -> dict:
         """把本机扫描结果连接到总资料库，并写入本机绑定。"""
-        if self.status == "CORRUPT":
-            raise CorruptDatabaseError(f"拒绝写入损坏数据库: {self.path}")
+        if self.status in {"CORRUPT", "UNSUPPORTED"}:
+            raise CorruptDatabaseError(f"插件资料库不可写 ({self.status}): {self.path}")
         from .services.catalog_sync import link_scan, slug
 
         # 本机当前仍然存在、且已被既有绑定占用的目录名。用于区分“插件搬家”
@@ -325,6 +407,7 @@ class LibraryDB:
         result = link_scan(self.catalog.plugins, self._bindings, entries,
                            occupied_folders=occupied)
         previous_bindings = set(self._bindings)
+        scanned = {entry["rel"]: entry for entry in entries}
         for plugin_id in result.present:
             record = result.plugins[plugin_id]
             record["key"] = plugin_id
@@ -333,7 +416,15 @@ class LibraryDB:
             runtime = self._runtime.get(plugin_id)
             if isinstance(runtime, dict):
                 record.update(runtime)
-            record.setdefault("missing", False)
+            entry = scanned[record["rel"]]
+            if any(field in entry and entry[field] != record.get(field) for field in _INSTALL_FIELDS):
+                clear_load_result(record)
+            if record.get("load_environment") and record["load_environment"] != compatibility_environment():
+                clear_load_result(record)
+            for field in _INSTALL_FIELDS:
+                if field in entry:
+                    record[field] = entry[field]
+            record["missing"] = False
             if not record.get("name"):
                 record["name"] = record["folder_name"]
             _with_user_defaults(record)
@@ -347,14 +438,14 @@ class LibraryDB:
             record["plugin_id"] = plugin_id
             record["rel"] = rel
             record["folder_name"] = os.path.basename(os.path.normpath(rel))
-            record["missing"] = True
             runtime = self._runtime.get(plugin_id)
             if isinstance(runtime, dict):
                 record.update(runtime)
+            if complete:
+                record["missing"] = True
             if not record.get("name"):
                 record["name"] = record["folder_name"]
             self.data["plugins"][plugin_id] = _with_user_defaults(record)
-        self.catalog.data["plugins"] = result.plugins
         self._bindings = result.bindings
         self.assignments = dict(result.assignment)
         missing = sum(1 for rec in self.data["plugins"].values() if rec.get("missing"))
@@ -367,7 +458,8 @@ class LibraryDB:
             "total": result.total,
             "new_bindings": len(set(result.bindings) - previous_bindings),
         }
-        self.save()
+        if persist:
+            self.save()
         return self.plugins
 
     def remove(self, key: str) -> None:
@@ -382,6 +474,30 @@ class LibraryDB:
 
     def all(self) -> list[dict]:
         return list(self.plugins.values())
+
+    def relink_options(self, key: str) -> dict:
+        source = self.get(key)
+        if not source or source.get("kind") != "addon" or source.get("missing"):
+            return {}
+        return {pid: record for pid, record in self.catalog.plugins.items()
+                if pid != key and record.get("kind") == "addon"
+                and (pid not in self.bindings or (self.get(pid) or {}).get("missing"))}
+
+    def relink_addon(self, key: str, target: str) -> dict:
+        """Apply a user-confirmed catalog identity to the current installation."""
+        portable = self.relink_options(key).get(target)
+        if not portable:
+            raise ValueError("该资料不能关联，或已绑定到本机另一项安装")
+        record = dict(self.get(key))
+        for field in ("display_name", "category", "category_id", "tags", "note", "favorite", "source_url"):
+            if field in portable:
+                record[field] = portable[field]
+        for field in ("names", "folders"):
+            record[field] = sorted(set(record.get(field, ())) | set(portable.get(field, ())))
+        self.remove(key)
+        rebound = self.upsert(target, record)
+        self.save()
+        return rebound
 
     # -- 分类（共享，存于总资料库） ----------------------------------------
     @property
@@ -517,16 +633,7 @@ class LibraryDB:
         if entries:
             result = link_scan(self.catalog.plugins, self._bindings, entries)
             imported = 0
-            for rel, plugin_id in result.assignment.items():
-                old = plugins.get(plugin_id, {})
-                record = result.plugins[plugin_id]
-                # 旧数据里的用户字段只在资料库尚无该值时补入（资料库优先）。
-                for field in ("display_name", "category", "category_id", "tags",
-                              "note", "favorite", "created_at", "updated_at"):
-                    if old.get(field) not in (None, "", []) and record.get(field) in (None, "", []):
-                        record[field] = old[field]
-                imported += 1
-            self.catalog.data["plugins"] = result.plugins
+            old_by_path = {rel: plugins[key] for key, rel in bindings.items()}
             self._bindings = result.bindings
             # 组成视图记录并带上本机运行状态（含旧库的「自启」标记）。
             for plugin_id in result.present:
@@ -537,10 +644,13 @@ class LibraryDB:
                 record["rel"] = rel
                 record["folder_name"] = os.path.basename(os.path.normpath(rel))
                 record.update(self._runtime.get(plugin_id, {}))
-                old = plugins.get(plugin_id, {})
-                if "startup" in old:
-                    record["startup"] = bool(old["startup"])
-                self.data["plugins"][plugin_id] = record
+                old = old_by_path[rel]
+                for field in ("display_name", "category", "category_id", "tags", "note",
+                              "favorite", "created_at", "updated_at", "startup", *_INSTALL_FIELDS):
+                    if old.get(field) not in (None, "", []) and record.get(field) in (None, "", []):
+                        record[field] = old[field]
+                self.data["plugins"][plugin_id] = _with_user_defaults(record)
+                imported += 1
         else:
             imported = 0
 
@@ -548,6 +658,8 @@ class LibraryDB:
         if isinstance(legacy_cats, list) and legacy_cats:
             merged = {item.get("id"): dict(item) for item in self._category_records()}
             for item in legacy_cats:
+                if isinstance(item, str) and item and item != C.DEFAULT_CATEGORY:
+                    item = {"id": item, "name": item}
                 if isinstance(item, dict) and item.get("id") not in merged:
                     merged[item["id"]] = {
                         "id": str(item.get("id")),
@@ -555,4 +667,9 @@ class LibraryDB:
                         "order": int(item.get("order", len(merged))),
                     }
             self.data["categories"] = sorted(merged.values(), key=lambda c: c.get("order", 0))
+            names = {item["id"]: item["name"] for item in self.data["categories"]}
+            for plugin_id in result.present if entries else ():
+                record = self.plugins[plugin_id]
+                if record.get("category") == C.DEFAULT_CATEGORY and record.get("category_id") in names:
+                    record["category"] = names[record["category_id"]]
         return {"imported": imported, "bindings": len(self._bindings)}

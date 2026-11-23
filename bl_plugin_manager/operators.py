@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 import bpy
 from bpy.props import (
@@ -13,9 +15,11 @@ from bpy.props import (
 )
 from bpy.types import Operator
 
-from . import (bridge, compat_task, constants as C, library, migrate, scan,
-               scoped_management, store, updates, watcher)
-from .db import LibraryDB, now_iso
+from . import (archive_jobs, bridge, compat_task, constants as C, library, migrate, scan,
+               scoped_management, self_update, store, updates, watcher)
+from .db import LibraryDB, compatibility_environment, now_iso
+from .storage.catalog import CatalogConflictError
+from .tasks import TaskController
 from .security.paths import UnsafeLibraryPathError, resolve_record_path
 
 
@@ -28,9 +32,10 @@ def _prefs(context):
 
 def _db(context) -> LibraryDB | None:
     prefs = _prefs(context)
-    if not prefs or not prefs.library_path:
+    if not prefs or not prefs.library_path or not os.path.isdir(prefs.library_path):
         return None
-    return LibraryDB(prefs.library_path)
+    database = LibraryDB(prefs.library_path)
+    return database if database.status not in {"CORRUPT", "UNSUPPORTED"} else None
 
 
 def _selected(context) -> dict | None:
@@ -58,23 +63,84 @@ def _sync_device_config(prefs) -> str:
         return str(exc)
 
 
-def _initialize_schema2(root: str) -> LibraryDB:
-    """确保总资料库就绪，并把旧版 library.json 迁移进资料库。
-
-    调用方必须先确认目录是插件库（不是无关目录），否则会创建出空库。
-    """
-    db = LibraryDB(root, use_cache=False)
-    if db.prepare() == "CORRUPT":
-        raise RuntimeError("插件库元数据已损坏，已保持只读，未覆盖原文件")
-    return db
-
-
 class _PMBase(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
         return bridge.get_prefs() is not None
+
+
+_SELF_UPDATE_TASK = TaskController()
+
+
+def _fetch_self_update(installation, current, blender_version):
+    check = self_update.latest_release(current)
+    task = _SELF_UPDATE_TASK
+    if not check or task.cancelled:
+        return None
+    with tempfile.TemporaryDirectory(prefix="blpm-github-") as directory:
+        zip_path = Path(directory) / "release.zip"
+        ok, error = store.download(
+            check.url, str(zip_path), check.digest, check.size, cancelled=lambda: task.cancelled)
+        if not ok:
+            raise RuntimeError(error)
+        self_update.stage_update(installation, zip_path, check, blender_version,
+                                 cancelled=lambda: task.cancelled)
+    return check.tag
+
+
+def _self_update_tick():
+    prefs = bridge.get_prefs()
+    if not prefs:
+        _SELF_UPDATE_TASK.cancel()
+        return None
+    if _SELF_UPDATE_TASK.running:
+        return 0.2
+    prefs.self_update_busy = False
+    if _SELF_UPDATE_TASK.error:
+        prefs.self_update_status = f"更新失败：{_SELF_UPDATE_TASK.error}"
+    elif _SELF_UPDATE_TASK.result:
+        prefs.self_update_status = f"{_SELF_UPDATE_TASK.result} 已就绪，重启 Blender 后生效。"
+    else:
+        prefs.self_update_status = "GitHub 暂无比当前版本更新的正式发行包。"
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "PREFERENCES":
+                area.tag_redraw()
+    return None
+
+
+def shutdown_self_update():
+    _SELF_UPDATE_TASK.cancel()
+    if bpy.app.timers.is_registered(_self_update_tick):
+        bpy.app.timers.unregister(_self_update_tick)
+
+
+class PM_OT_github_update(Operator):
+    bl_idname = "plugin_manager.github_update"
+    bl_label = "检查并下载 GitHub 更新"
+    bl_description = "下载插件库管理器的正式发行包，已下载的新版将在下次启动时应用"
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        if not bpy.app.online_access:
+            return _report(self, False, "请先在 Blender 系统设置中允许联网")
+        if _SELF_UPDATE_TASK.running or bpy.app.timers.is_registered(_self_update_tick):
+            return _report(self, False, "正在检查 GitHub 更新")
+        try:
+            installation = self_update.installed_path(__file__, bpy.utils.user_resource("SCRIPTS"))
+            if self_update.pending_path(installation).exists():
+                return _report(self, True, "已有更新就绪，重启 Blender 后生效")
+            _SELF_UPDATE_TASK.start(_fetch_self_update, installation, C.ADDON_VERSION,
+                                    tuple(bpy.app.version))
+            bpy.app.timers.register(_self_update_tick, first_interval=0.2, persistent=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            _SELF_UPDATE_TASK.cancel()
+            return _report(self, False, str(error))
+        prefs.self_update_busy = True
+        prefs.self_update_status = "正在检查或下载 GitHub 更新…"
+        return _report(self, True, prefs.self_update_status)
 
 
 # ---------------------------------------------------------------------------
@@ -87,31 +153,45 @@ class PM_OT_setup_library(_PMBase):
 
     def execute(self, context):
         prefs = _prefs(context)
-        if not prefs.library_path:
-            return _report(self, False, "请先设置插件库路径")
-        # 智能连接：按目录实际内容决定建空库 / 保留已有 / 收编散落插件
+        path = prefs.pending_library_path or prefs.library_path
+        if not path:
+            return _report(self, False, "请先选择插件库目录")
+        if prefs.compat_running or prefs.archive_running:
+            return _report(self, False, "请先结束当前任务，再切换或重连")
+        _status("插件库：正在连接并扫描…")
         try:
-            res = library.connect_library(prefs.library_path, LibraryDB(prefs.library_path))
-        except OSError as exc:
-            return _report(self, False, f"无法创建插件库目录: {exc}")
-        if res.get("error"):
-            return _report(self, False, res["error"])
-        _status("插件库：正在挂载并扫描…")
-        try:
-            db = _initialize_schema2(prefs.library_path)
-            library.sync_library(prefs.library_path, db)
-            result = scoped_management.activate(prefs.library_path)
-            state = bridge.library_state(prefs.library_path, force=True)
+            result = scoped_management.activate_library(path)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return _report(self, False, str(exc))
         finally:
             _clear_status()
-        if result["state"] == "ERROR":
-            return _report(self, False, f"启用未完整完成: {result['failures'][:3]}")
-        n = len(res["imported"])
-        if res["created"]:
-            return _report(self, True, f"已创建空插件库并挂载: {prefs.library_path}")
-        if n:
-            return _report(self, True, f"已挂载插件库，并收编 {n} 个散落插件")
-        return _report(self, True, "插件库已启用并挂载到 Blender")
+        from . import items, preferences
+
+        preferences._LOADING_MACHINE_PATH = True
+        try:
+            prefs.library_path = path
+            prefs.pending_library_path = ""
+            prefs.library_preview = ""
+        finally:
+            preferences._LOADING_MACHINE_PATH = False
+        items.clear_selection()
+        items.rebuild_items(prefs)
+        msg = "已启用插件库管理"
+        if migration := result.get("migration"):
+            msg += f"；已迁移 {migration['imported']} 条旧资料"
+        if result.get("imported"):
+            msg += f"；已复制 {len(result['imported'])} 个插件到库内"
+        failures = result.get("failed", []) + result.get("failures", [])
+        if failures:
+            prefs.report_summary = f"{msg}；{len(failures)} 项需要处理"
+            prefs.report_items.clear()
+            for failure in failures:
+                item = prefs.report_items.add()
+                item.name = failure.get("key", "插件加载") if isinstance(failure, dict) else "导入失败"
+                item.detail = failure.get("error", "") if isinstance(failure, dict) else failure
+                item.status = "failed"
+            return _report(self, True, prefs.report_summary, kind="WARNING")
+        return _report(self, True, msg)
 
 
 class PM_OT_unify_store(_PMBase):
@@ -194,63 +274,44 @@ class PM_OT_pick_library_path(_PMBase):
     bl_description = "在侧边栏直接选择/更改插件库位置，随后自动侦测该目录内容"
 
     directory: StringProperty(subtype="DIR_PATH", default="")
-    move_flat: BoolProperty(name="收编散落插件（移动）", default=True)
-
+    cancel_preview: BoolProperty(options={"HIDDEN"})
     def invoke(self, context, event):
         prefs = _prefs(context)
-        self.directory = (prefs.library_path or "") if prefs else ""
+        if self.cancel_preview:
+            return self.execute(context)
+        self.directory = prefs.pending_library_path or prefs.library_path
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
         prefs = _prefs(context)
-        if not prefs:
-            return _report(self, False, "插件库未启用")
-        path = os.path.abspath(self.directory) if self.directory else ""
-        if not path:
+        if self.cancel_preview:
+            prefs.pending_library_path = ""
+            prefs.library_preview = ""
+            return {"FINISHED"}
+        if not self.directory:
             return _report(self, False, "未选择目录")
-
-        # 先在内存中连接：任何失败都不改动当前偏好，避免留下无效配置
-        db = LibraryDB(path)
+        path = os.path.abspath(self.directory)
         try:
-            res = library.connect_library(path, db, move_flat=self.move_flat)
+            info = library.inspect_target(path)
+            error = library.target_error(info)
+            database = LibraryDB(path)
         except OSError as exc:
-            return _report(self, False, f"无法创建插件库目录: {exc}")
-
-        if res.get("error"):
-            return _report(self, False, res["error"])
-
-        try:
-            db = _initialize_schema2(path)
-        except RuntimeError as exc:
-            return _report(self, False, str(exc))
-        info = res["info"]
-        prefs.library_path = path            # 触发 _on_library_path_update
-        if info["is_library"]:
-            library.sync_library(path, db)
-            msg = (f"已切换插件库: 原有 {info['addon_count']} 传统 + "
-                   f"{info['extension_count']} 扩展插件")
-        elif res["imported"]:
-            library.sync_library(path, db)
-            msg = f"已识别并收编 {len(res['imported'])} 个散落插件后挂载"
-        elif res["created"]:
-            library.sync_library(path, db)
-            msg = "已创建空插件库并挂载"
+            return _report(self, False, f"无法读取目录: {exc}")
+        if error:
+            return _report(self, False, error)
+        if database.status in {"CORRUPT", "UNSUPPORTED"}:
+            return _report(self, False, f"资料库不可写（{database.status}），原文件已保留")
+        prefs.pending_library_path = path
+        count = info["addon_count"] + info["extension_count"]
+        scattered = len(info["flat_plugins"])
+        if not info["exists"]:
+            prefs.library_preview = "新目录；启用管理时创建空库"
         else:
-            library.sync_library(path, db)
-            msg = "已挂载插件库"
-
-        result = scoped_management.activate(path)
-        state = bridge.library_state(path, force=True)
-
-        if res["failed"]:
-            msg += f"（{len(res['failed'])} 个收编失败，详见控制台）"
-        if result["state"] == "ERROR":
-            return _report(self, False, f"启用未完整完成: {result['failures'][:3]}")
-        from . import items
-
-        items.rebuild_items(prefs)
-        return _report(self, True, msg)
+            prefs.library_preview = f"库内 {count} 个插件；另有 {scattered} 个待复制"
+        if database.catalog.legacy_path.exists():
+            prefs.library_preview += "；启用时迁移旧资料"
+        return _report(self, True, "已选目录。确认预览后点击「启用管理」")
 
 
 class PM_OT_unmount_library(_PMBase):
@@ -265,6 +326,11 @@ class PM_OT_unmount_library(_PMBase):
         prefs = _prefs(context)
         if not prefs or not prefs.library_path:
             return _report(self, False, "插件库未就绪")
+        if prefs.compat_running or prefs.archive_running:
+            return _report(self, False, "请先结束当前任务")
+        from .storage import machine_config
+        if not machine_config.load().get("management_enabled"):
+            return _report(self, True, "插件库管理已停止")
         result = scoped_management.deactivate(prefs.library_path)
         if result["state"] == "ERROR":
             return _report(self, False, f"停止管理时存在失败: {result['failures'][:3]}")
@@ -300,8 +366,10 @@ class PM_OT_show_warnings(_PMBase):
     def execute(self, context):
         prefs = _prefs(context)
         state = bridge.library_state(prefs.library_path)
+        database = LibraryDB(prefs.library_path) if prefs.library_path else None
         lines = [
             f"库路径: {prefs.library_path}",
+            f"资料库: {database.status if database else '未配置'}",
             f"脚本目录已注册: {state['script_dir']}",
             f"扩展仓库已注册: {state['repo']}",
         ]
@@ -331,16 +399,19 @@ class PM_OT_toggle(_PMBase):
             return _report(self, False, "未找到插件")
         if not rec.get("module"):
             return _report(self, False, "无法解析插件模块名")
+        try:
+            scoped_management.record_activation(prefs.library_path, key, self.enable)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return _report(self, False, f"无法保存启用意图: {exc}")
+        if rec.get("missing"):
+            return _report(self, True, "已保存启用意图；插件文件恢复后可重新应用")
         ok, err = bridge.set_enabled(rec["module"], self.enable)
         rec["enabled"] = bridge.is_module_enabled(rec["module"])
+        rec.pop("startup_override", None)
         # 记录/清除上次启用失败的原因，便于在详情里排查
         rec["last_error"] = "" if ok else (err or "未知错误")
         db.save()
         if ok:
-            try:
-                scoped_management.record_activation(prefs.library_path, key, self.enable)
-            except Exception as exc:
-                return _report(self, False, f"插件状态已改变，但设备启用清单保存失败: {exc}")
             verb = "已启用" if self.enable else "已停用"
             return _report(self, True, f"{verb}: {library.effective_name(rec)}")
         return _report(self, False, f"操作失败: {err}")
@@ -407,6 +478,8 @@ class PM_OT_verify_compat(_PMBase):
             return _report(self, False, "插件库未就绪")
         if getattr(prefs, "compat_running", False):
             return _report(self, False, "已有测试任务在运行，请等待完成或先取消")
+        if prefs.archive_running:
+            return _report(self, False, "请先结束安装或更新任务")
 
         selection = compat_task.select_targets(
             list(db.plugins.items()), bridge.enabled_modules(),
@@ -486,6 +559,7 @@ def _compat_tick():
         if outcome is not None:
             record = db.get(outcome.key) or {}
             record.update(outcome.fields)
+            record["load_environment"] = compatibility_environment()
             record["key"] = outcome.key
             db.plugins[outcome.key] = record
             # 每步落盘：取消或异常时已完成的结果不丢。
@@ -685,9 +759,7 @@ def _target_keys(prefs, single_key: str, use_selection: bool) -> list[str]:
     from . import items
 
     if use_selection:
-        keys = items.all_selected_keys()
-        if keys:
-            return keys
+        return items.all_selected_keys()
     if single_key:
         return [single_key]
     if prefs.selected_key:
@@ -759,7 +831,6 @@ class PM_OT_select_all(_PMBase):
         from . import items
 
         if self.value:
-            items.clear_selection()
             for it in prefs.plugin_items:
                 items.set_selected(it.key, True)
         else:
@@ -769,6 +840,37 @@ class PM_OT_select_all(_PMBase):
         _redraw()
         n = sum(1 for it in prefs.plugin_items if it.selected)
         return _report(self, True, f"已勾选 {n} 个" if self.value else "已取消全选")
+
+
+def _set_plugins_enabled(operator, prefs, db, records, enabled):
+    if not records:
+        return _report(operator, False, "没有可操作的插件")
+    try:
+        scoped_management.record_activations(prefs.library_path, (rec["key"] for rec in records), enabled)
+    except (OSError, RuntimeError, ValueError) as error:
+        return _report(operator, False, f"无法保存启用意图: {error}")
+    done = skipped = failed = 0
+    for record in records:
+        module = record.get("module")
+        if not module or record.get("missing"):
+            skipped += 1
+            continue
+        ok, error = bridge.set_enabled(module, enabled)
+        record["enabled"] = bridge.is_module_enabled(module)
+        record["last_error"] = "" if ok else error or "未知错误"
+        record.pop("startup_override", None)
+        if ok:
+            done += 1
+        else:
+            failed += 1
+    db.save()
+    from . import items
+
+    items.rebuild_items(prefs)
+    _redraw()
+    action = "启用" if enabled else "停用"
+    message = f"已{action} {done} 项；失败 {failed}，仅保存意图 {skipped}"
+    return _report(operator, True, message, kind="WARNING" if failed or skipped else "INFO")
 
 
 class PM_OT_batch_enable(_PMBase):
@@ -785,27 +887,8 @@ class PM_OT_batch_enable(_PMBase):
         keys = _target_keys(prefs, "", True)
         if not keys:
             return _report(self, False, "请先勾选要操作的插件")
-        ok_n = fail_n = 0
-        for k in keys:
-            rec = db.get(k)
-            if not rec or not rec.get("module"):
-                continue
-            ok, err = bridge.set_enabled(rec["module"], self.value)
-            rec["enabled"] = bridge.is_module_enabled(rec["module"])
-            rec["last_error"] = "" if ok else (err or "未知错误")
-            ok_n += 1 if ok else 0
-            fail_n += 0 if ok else 1
-        db.save()
-        sync_error = _sync_device_config(prefs)
-        from . import items
-
-        items.rebuild_items(prefs)
-        verb = "启用" if self.value else "停用"
-        _redraw()
-        msg = f"已批量{verb} {ok_n} 个" + (f"，{fail_n} 个失败" if fail_n else "")
-        if sync_error:
-            return _report(self, False, msg + f"；设备配置保存失败: {sync_error}")
-        return _report(self, True, msg)
+        return _set_plugins_enabled(self, prefs, db,
+                                    [db.plugins[key] for key in keys if key in db.plugins], self.value)
 
 
 class PM_OT_batch_set_category(_PMBase):
@@ -885,19 +968,10 @@ class PM_OT_enable_pack(_PMBase):
         db = _db(context)
         if not db:
             return _report(self, False, "插件库未就绪")
-        cat = prefs.active_category
-        count, fail = 0, 0
-        for rec in db.plugins.values():
-            if (rec.get("category") or C.DEFAULT_CATEGORY) != cat:
-                continue
-            ok, _ = bridge.set_enabled(rec.get("module", ""), True)
-            rec["enabled"] = bridge.is_module_enabled(rec.get("module", ""))
-            count += 1 if ok else 0
-            fail += 0 if ok else 1
-        db.save()
-        sync_error = _sync_device_config(prefs)
-        msg = f"已启用 {count} 个插件" + (f"，{fail} 个失败" if fail else "")
-        return _report(self, not sync_error, msg + (f"；设备配置保存失败: {sync_error}" if sync_error else ""))
+        records = [rec for rec in db.plugins.values()
+                   if (rec.get("category") or C.DEFAULT_CATEGORY) == prefs.active_category]
+        return _set_plugins_enabled(self, prefs, db, records, True)
+
 
 
 class PM_OT_disable_pack(_PMBase):
@@ -910,18 +984,10 @@ class PM_OT_disable_pack(_PMBase):
         db = _db(context)
         if not db:
             return _report(self, False, "插件库未就绪")
-        cat = prefs.active_category
-        count = 0
-        for rec in db.plugins.values():
-            if (rec.get("category") or C.DEFAULT_CATEGORY) != cat:
-                continue
-            ok, _ = bridge.set_enabled(rec.get("module", ""), False)
-            rec["enabled"] = bridge.is_module_enabled(rec.get("module", ""))
-            count += 1 if ok else 0
-        db.save()
-        sync_error = _sync_device_config(prefs)
-        msg = f"已停用 {count} 个插件"
-        return _report(self, not sync_error, msg + (f"；设备配置保存失败: {sync_error}" if sync_error else ""))
+        records = [rec for rec in db.plugins.values()
+                   if (rec.get("category") or C.DEFAULT_CATEGORY) == prefs.active_category]
+        return _set_plugins_enabled(self, prefs, db, records, False)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1036,13 +1102,30 @@ class PM_OT_scan_inbox(_PMBase):
     bl_label = "扫描投放区"
     bl_description = "手动检查投放区(inbox)与库根目录，导入新插件并列出每项结果"
 
+    def invoke(self, context, event):
+        prefs = _prefs(context)
+        if not _db(context):
+            return _report(self, False, "插件库不可写")
+        self._candidates = watcher.preview_paths(prefs.library_path)
+        if not self._candidates:
+            return _report(self, True, "投放区没有待处理的文件夹或 ZIP")
+        return context.window_manager.invoke_props_dialog(self, width=500)
+
+    def draw(self, context):
+        self.layout.label(text=f"检查 {len(self._candidates)} 项；成功导入后移走投放源")
+        for path in self._candidates[:8]:
+            self.layout.label(text=os.path.basename(path))
+        if len(self._candidates) > 8:
+            self.layout.label(text=f"另有 {len(self._candidates) - 8} 项")
+
     def execute(self, context):
         prefs = _prefs(context)
         db = _db(context)
         if not prefs or not db:
             return _report(self, False, "插件库未就绪")
         try:
-            res = watcher.scan_inbox(prefs.library_path, db, move=True)
+            res = watcher.scan_inbox(prefs.library_path, db, move=True,
+                                     allowed=getattr(self, "_candidates", None))
         except Exception as exc:
             return _report(self, False, f"扫描失败: {exc}")
         _fill_report(prefs, res)
@@ -1169,7 +1252,11 @@ class PM_OT_remove(_PMBase):
     key: StringProperty(default="")
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
+        return context.window_manager.invoke_props_dialog(self, width=480)
+
+    def draw(self, context):
+        self.layout.label(text="将插件文件移入库内回收站，可按原位置恢复")
+        self.layout.label(text="如果同步整个库，移除可能传播到其它设备", icon="INFO")
 
     def execute(self, context):
         prefs = _prefs(context)
@@ -1179,7 +1266,10 @@ class PM_OT_remove(_PMBase):
         if not rec:
             return _report(self, False, "未找到插件")
         name = library.effective_name(rec)
-        moved = library.remove_plugin(prefs.library_path, db, key, to_trash=True)
+        try:
+            moved = library.remove_plugin(prefs.library_path, db, key, to_trash=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _report(self, False, f"移除失败: {exc}")
         # A failed move leaves both the source directory and DB record intact.
         # Do not report success in that case.
         if moved is None and db.get(key) is not None:
@@ -1188,6 +1278,80 @@ class PM_OT_remove(_PMBase):
             prefs.selected_key = ""
         tail = f"（已移到回收站: {os.path.basename(moved)}）" if moved else ""
         return _report(self, True, f"已移除 {name}{tail}")
+
+
+_TRASH_CHOICES = []
+
+
+def _trash_choices(self, context):
+    prefs = _prefs(context)
+    entries = library.trash_entries(prefs.library_path) if prefs and prefs.library_path else {}
+    _TRASH_CHOICES[:] = [(key, item.get("name") or key, item["rel"]) for key, item in entries.items()]
+    return _TRASH_CHOICES
+
+
+class PM_OT_restore_plugin(_PMBase):
+    bl_idname = "plugin_manager.restore_plugin"
+    bl_label = "从回收站恢复"
+    trash_id: EnumProperty(name="插件", items=_trash_choices)
+
+    def invoke(self, context, event):
+        if not _trash_choices(self, context):
+            return _report(self, True, "回收站没有可恢复的插件")
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        prefs, db = _prefs(context), _db(context)
+        if not db:
+            return _report(self, False, "插件库不可写")
+        try:
+            restored = library.restore_plugin(prefs.library_path, db, self.trash_id)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _report(self, False, f"恢复失败: {exc}")
+        _redraw()
+        return _report(self, True, f"已恢复 {library.effective_name(restored)} 到原目录")
+
+
+_RELINK_CHOICES = []
+
+
+def _relink_choices(self, context):
+    prefs, db = _prefs(context), _db(context)
+    records = db.relink_options(self.key or prefs.selected_key) if db else {}
+    _RELINK_CHOICES[:] = [
+        (key, library.effective_name(record), f"{record.get('author', '')} · {key}")
+        for key, record in records.items()
+    ]
+    return _RELINK_CHOICES
+
+
+class PM_OT_relink_addon(_PMBase):
+    bl_idname = "plugin_manager.relink_addon"
+    bl_label = "关联已有插件资料"
+    key: StringProperty(options={"HIDDEN"})
+    target: EnumProperty(name="关联资料", items=_relink_choices)
+
+    def invoke(self, context, event):
+        self.key = self.key or _prefs(context).selected_key
+        if not _relink_choices(self, context):
+            return _report(self, True, "没有其它可关联的传统插件资料")
+        return context.window_manager.invoke_props_dialog(self, width=430)
+
+    def execute(self, context):
+        prefs, db = _prefs(context), _db(context)
+        if not db:
+            return _report(self, False, "插件库不可写")
+        try:
+            db.relink_addon(self.key, self.target)
+        except (RuntimeError, OSError, ValueError) as error:
+            return _report(self, False, str(error))
+        prefs.selected_key = self.target
+        try:
+            scoped_management.transfer_activation(prefs.library_path, self.key, self.target)
+        except (RuntimeError, OSError, ValueError) as error:
+            return _report(self, True, f"已关联资料；设备启用清单未更新: {error}", kind="WARNING")
+        _redraw()
+        return _report(self, True, "已关联资料，保留原安装位置")
 
 
 # ---------------------------------------------------------------------------
@@ -1209,70 +1373,76 @@ class PM_OT_check_updates(_PMBase):
         return _report(self, True, f"发现 {stats['updates']} 个可更新（已比对 {stats['checked']} 个）")
 
 
+def _update_requests(db):
+    requests = []
+    for rec in db.plugins.values():
+        if not (rec.get("update_available") and rec.get("latest_url")
+                and rec.get("archive_source") and not rec.get("missing")):
+            continue
+        package = {"id": rec.get("pkg_id") or rec["id"], "name": library.effective_name(rec),
+                   "version": rec["latest_version"], "source": rec["archive_source"],
+                   "repo": rec.get("latest_repo", ""), "archive_url": rec["latest_url"],
+                   "archive_hash": rec.get("latest_hash", ""), "archive_size": rec.get("latest_size", 0)}
+        requests.append((package, rec["key"], rec.get("version", "")))
+    return requests
+
+
 class PM_OT_update_all(_PMBase):
     bl_idname = "plugin_manager.update_all"
-    bl_label = "一键更新全部"
-    bl_description = "把库中所有检测到可更新的插件更新到最新版本"
+    bl_label = "预览批量更新"
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
+        db = _db(context)
+        self._preview_root = _prefs(context).library_path
+        self._requests = _update_requests(db) if db else []
+        if not self._requests:
+            return _report(self, False, "没有来源已确认的更新，请先检查更新或在商店确认来源")
+        return context.window_manager.invoke_props_dialog(self, width=550)
+
+    def draw(self, context):
+        self.layout.label(text=f"将替换当前库中的 {len(self._requests)} 个扩展")
+        self.layout.label(text="先备份；当前文件目录的外部同步也可能传播替换")
+        for pkg, _key, version in self._requests[:10]:
+            self.layout.label(text=f"{pkg['name']} · {version} → {pkg['version']} · {pkg['repo']}")
+        if len(self._requests) > 10:
+            self.layout.label(text=f"另有 {len(self._requests) - 10} 项")
 
     def execute(self, context):
-        prefs = _prefs(context)
-        db = _db(context)
-        if not prefs or not db:
-            return _report(self, False, "插件库未就绪")
-        targets = [r for r in db.plugins.values() if r.get("update_available")]
-        if not targets:
-            return _report(self, True, "没有可更新的插件")
-        ok = fail = 0
-        errs = []
-        _status(f"插件库：正在更新 {len(targets)} 个插件…")
-        # 批量更新：逐个替换但**不逐个刷新** Blender（每次刷新约 0.25s，
-        # N 个插件累计会长时间冻结界面），全部完成后统一刷新一次。
-        for rec in targets:
-            pkg = {
-                "id": rec.get("id", ""),
-                "version": rec.get("latest_version", ""),
-                "archive_url": rec.get("latest_url", ""),
-                "archive_hash": rec.get("latest_hash", ""),
-                "archive_size": rec.get("latest_size", 0),
-                "website": rec.get("latest_website", ""),
-            }
-            success, err = store.update_record(rec, pkg, prefs.library_path, db,
-                                               defer_refresh=True)
-            if success:
-                ok += 1
-            else:
-                fail += 1
-                errs.append(f"{rec.get('name')}: {err}")
-        # 统一：保存一次、刷新一次、重建列表一次
-        _clear_status()
-        db.save()
-        bridge.invalidate_module_index()
-        bridge.refresh_blender()
-        # Deferred replacements temporarily disable previously enabled plugins;
-        # restore those states only after the single shared refresh.
-        for rec in targets:
-            if rec.get("enabled") and rec.get("module") and not bridge.is_module_enabled(rec["module"]):
-                ok_restore, err_restore = bridge.set_enabled(rec["module"], True)
-                rec["enabled"] = bridge.is_module_enabled(rec["module"])
-                rec["restore_error"] = "" if ok_restore else (err_restore or "更新后重新启用失败")
-        db.save()
-        bridge.save_prefs()
-        from . import items
-
-        items.rebuild_items(prefs)
-        for e in errs[:10]:
-            print("[插件库] 更新失败:", e)
-        if fail:
-            return _report(self, False, f"更新完成：成功 {ok}，失败 {fail}（详见控制台）")
-        return _report(self, True, f"已更新 {ok} 个插件")
+        if (not getattr(self, "_requests", None)
+                or self._preview_root != _prefs(context).library_path):
+            return _report(self, False, "请先打开批量更新预览")
+        if not bpy.context.preferences.system.use_online_access:
+            return _report(self, False, "请先在 Blender 系统设置中允许联网")
+        try:
+            archive_jobs.start(_prefs(context), self._requests)
+        except (RuntimeError, ValueError) as error:
+            return _report(self, False, str(error))
+        return _report(self, True, "已开始下载更新")
 
 
-# ---------------------------------------------------------------------------
-# 在线商店
-# ---------------------------------------------------------------------------
+class PM_OT_cancel_archives(_PMBase):
+    bl_idname = "plugin_manager.cancel_archives"
+    bl_label = "取消安装或更新"
+
+    def execute(self, context):
+        archive_jobs.cancel()
+        return _report(self, True, "正在取消下载；已完成的安装或更新保留")
+
+
+class PM_OT_retry_archives(_PMBase):
+    bl_idname = "plugin_manager.retry_archives"
+    bl_label = "重试失败的安装或更新"
+
+    def execute(self, context):
+        if not bpy.context.preferences.system.use_online_access:
+            return _report(self, False, "请先在 Blender 系统设置中允许联网")
+        try:
+            archive_jobs.retry(_prefs(context))
+        except (RuntimeError, ValueError) as error:
+            return _report(self, False, str(error))
+        return _report(self, True, "正在重试失败项")
+
+
 class PM_OT_store_sync(_PMBase):
     bl_idname = "plugin_manager.store_sync"
     bl_label = "刷新商店目录"
@@ -1320,10 +1490,16 @@ class PM_OT_store_open(_PMBase):
         results = store.search(catalog, db, prefs.store_search,
                                only_compatible=prefs.store_only_compatible,
                                only_new=prefs.store_only_new)
-        layout.label(text=f"共 {len(results)} 个结果（显示前 40 个）")
-
+        page_size = 12
+        pages = max(1, (len(results) + page_size - 1) // page_size)
+        page = min(prefs.store_page, pages)
+        row = layout.row(align=True)
+        row.label(text=f"{len(results)} 个结果 · 第 {page}/{pages} 页")
+        row.prop(prefs, "store_page", text="转到")
+        if not results:
+            layout.label(text="没有匹配的扩展，请调整搜索或筛选", icon="INFO")
         box = layout.box()
-        for pkg in results[:40]:
+        for pkg in results[(page - 1) * page_size:page * page_size]:
             row = box.row(align=True)
             # 状态图标
             if pkg["installed"]:
@@ -1335,7 +1511,7 @@ class PM_OT_store_open(_PMBase):
             col.label(text=f"{pkg['name']}  {pkg['version']}")
             sub = col.row()
             sub.enabled = False
-            sub.label(text=(pkg.get("tagline") or "")[:66])
+            sub.label(text=f"{pkg['repo']} · {pkg.get('tagline') or ''}"[:85])
 
             if not store.is_compatible(pkg):
                 row.label(text="版本不兼容", icon="ERROR")
@@ -1343,11 +1519,13 @@ class PM_OT_store_open(_PMBase):
                 if scan.compare_versions(pkg["version"], pkg["installed_version"]) > 0:
                     op = row.operator("plugin_manager.store_install", text="更新", icon="FILE_REFRESH")
                     op.package_id = pkg["id"]
+                    op.source = pkg["source"]
                 else:
                     row.label(text="已安装")
             else:
                 op = row.operator("plugin_manager.store_install", text="安装", icon="IMPORT")
                 op.package_id = pkg["id"]
+                op.source = pkg["source"]
 
         row = layout.row(align=True)
         row.operator("plugin_manager.store_sync", icon="URL", text="刷新目录")
@@ -1385,36 +1563,56 @@ class PM_OT_store_install(_PMBase):
     bl_description = "从在线商店下载该扩展并安装到插件库"
 
     package_id: StringProperty(default="")
+    source: StringProperty(default="")
+    confirm_source: BoolProperty(name="确认使用所选仓库替换当前安装", default=False)
+
+    def _selection(self, context):
+        db = _db(context)
+        if not db:
+            raise ValueError("插件库未就绪")
+        packages = [pkg for pkg in _catalog_cache() if pkg["id"] == self.package_id
+                    and (not self.source or self.source == pkg["source"])]
+        if len(packages) != 1:
+            raise ValueError("请选择唯一的扩展和仓库")
+        pkg = packages[0]
+        if not store.is_compatible(pkg):
+            raise ValueError("该版本与当前 Blender 不兼容")
+        record = store.installed_map(db).get(pkg["id"].casefold())
+        if record and scan.compare_versions(pkg["version"], record.get("version")) <= 0:
+            raise ValueError("目标版本没有高于本机版本")
+        return pkg, record
+
+    def invoke(self, context, event):
+        try:
+            self._preview = self._selection(context)
+        except ValueError as error:
+            return _report(self, False, str(error))
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        pkg, record = self._preview
+        self.layout.label(text=f"{pkg['name']} · {pkg['repo']}")
+        self.layout.label(text=f"{record.get('version') if record else '未安装'} → {pkg['version']}")
+        self.layout.label(text="目标：当前插件库；文件修改可能随外部同步传播")
+        if record and pkg["source"] != record.get("archive_source"):
+            self.layout.label(text=f"当前来源：{record.get('archive_source') or '未记录'}", icon="INFO")
+            self.layout.prop(self, "confirm_source")
 
     def execute(self, context):
-        prefs = _prefs(context)
-        db = _db(context)
-        if not prefs or not db:
-            return _report(self, False, "插件库未就绪")
-        pkg = next((p for p in _catalog_cache() if p["id"] == self.package_id), None)
-        if not pkg:
-            return _report(self, False, f"商店目录中未找到 {self.package_id}")
-
-        # 已安装且版本更高 → 走替换更新，保留分类/备注/启用状态
-        inst = store.installed_map(db).get(pkg["id"].lower())
-        if inst:
-            if scan.compare_versions(pkg["version"], inst.get("version", "0")) <= 0:
-                return _report(self, True, f"{pkg['name']} 已是最新（{inst.get('version')}）")
-            ok, err = store.update_record(inst, pkg, prefs.library_path, db)
-            if not ok:
-                return _report(self, False, f"更新失败: {err}")
-            from . import items
-
-            items.rebuild_items(prefs)
-            return _report(self, True, f"{pkg['name']} 已更新到 {pkg['version']}")
-
-        ok, err, rec = store.install_package(pkg, prefs.library_path, db)
-        if not ok:
-            return _report(self, False, f"安装失败: {err}")
-        from . import items
-
-        items.rebuild_items(prefs)
-        return _report(self, True, f"已安装 {rec.get('name') or pkg['name']} {pkg['version']}")
+        try:
+            if not context.preferences.system.use_online_access:
+                raise ValueError("请先在 Blender 系统设置中允许联网")
+            pkg, record = self._selection(context)
+            if getattr(self, "_preview", None) != (pkg, record):
+                raise ValueError("请打开安装或更新预览并确认")
+            if record and pkg["source"] != record.get("archive_source") and not self.confirm_source:
+                raise ValueError("请确认所选仓库来源")
+            archive_jobs.start(_prefs(context), [
+                (pkg, record["key"] if record else "", record.get("version", "") if record else "")
+            ])
+        except (ValueError, RuntimeError) as error:
+            return _report(self, False, str(error))
+        return _report(self, True, "已开始下载")
 
 
 class PM_OT_clear_updates(_PMBase):
@@ -1765,6 +1963,8 @@ class PM_OT_edit_meta(Operator):
         db, rec = self._rec(context)
         if not rec:
             return {"CANCELLED"}
+        self.key = rec["key"]
+        self._opened_db = db
         self.display_name = rec.get("display_name", "")
         self.note = rec.get("note", "")
         self.category = rec.get("category", "") or C.DEFAULT_CATEGORY
@@ -1772,7 +1972,11 @@ class PM_OT_edit_meta(Operator):
         return context.window_manager.invoke_props_dialog(self, width=420)
 
     def execute(self, context):
-        db, rec = self._rec(context)
+        prefs = _prefs(context)
+        opened = getattr(self, "_opened_db", None)
+        if opened and opened.root != prefs.library_path:
+            return _report(self, False, "插件库已改变，请重新打开编辑")
+        db, rec = (opened, opened.get(self.key)) if opened else self._rec(context)
         if not rec:
             return _report(self, False, "未找到插件")
         rec["display_name"] = self.display_name.strip()
@@ -1781,7 +1985,10 @@ class PM_OT_edit_meta(Operator):
         rec["tags"] = [t.strip() for t in self.tags.split(",") if t.strip()]
         if rec["category"] != C.DEFAULT_CATEGORY:
             db.ensure_category(rec["category"])
-        db.save()
+        try:
+            db.save()
+        except CatalogConflictError as error:
+            return _report(self, False, str(error))
         from . import items
 
         prefs = _prefs(context)
@@ -1791,6 +1998,7 @@ class PM_OT_edit_meta(Operator):
 
 
 classes = (
+    PM_OT_github_update,
     PM_OT_setup_library,
     PM_OT_pick_library_path,
     PM_OT_unmount_library,
@@ -1816,8 +2024,12 @@ classes = (
     PM_OT_copy_report,
     PM_OT_open_report_log,
     PM_OT_remove,
+    PM_OT_restore_plugin,
+    PM_OT_relink_addon,
     PM_OT_check_updates,
     PM_OT_update_all,
+    PM_OT_cancel_archives,
+    PM_OT_retry_archives,
     PM_OT_unify_store,
     PM_OT_store_sync,
     PM_OT_store_open,

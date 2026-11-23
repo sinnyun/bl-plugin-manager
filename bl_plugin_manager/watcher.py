@@ -12,26 +12,6 @@ from . import constants as C, library, scan
 from .db import LibraryDB
 
 
-def _fingerprint(path: str) -> float:
-    """目录取 __init__ / manifest 的最近修改时间。"""
-    stamps = []
-    for name in (C.MANIFEST_NAME, C.LEGACY_INIT):
-        f = os.path.join(path, name)
-        if os.path.isfile(f):
-            try:
-                stamps.append(os.path.getmtime(f))
-            except OSError:
-                pass
-    return max(stamps) if stamps else 0.0
-
-
-def _describe(path: str) -> str:
-    """给报告用的简短描述。"""
-    if os.path.isfile(path):
-        return f"{path}"
-    return path
-
-
 def _handle_dir(path: str, name: str, root: str, db, result: dict, move: bool,
                 origin: str) -> None:
     if name in C.IGNORED_NAMES or name.startswith("."):
@@ -100,44 +80,43 @@ def _handle_zip(path: str, name: str, root: str, db, result: dict, origin: str,
         result["failed"] += 1
 
 
-def scan_inbox(root: str, db: LibraryDB, move: bool = True, enable: bool = False) -> dict:
-    """扫描投放区与库根目录，逐项记录结果。
+def _locations(root: str):
+    yield os.path.join(root, C.DIR_INBOX), "投放区"
+    yield root, "库根目录"
 
-    返回 dict：
-        imported / skipped / failed  计数
-        entries                      每项 {name, path, kind, status, detail}
-        scanned                      扫描的投放位置数
-    """
-    result = {"imported": 0, "skipped": 0, "failed": 0, "entries": [], "scanned": 0}
 
-    # 1) 标准投放区 <库>/inbox/
-    inbox = os.path.join(root, C.DIR_INBOX)
-    if os.path.isdir(inbox):
-        result["scanned"] += 1
-        try:
-            entries = sorted(os.scandir(inbox), key=lambda e: e.name.lower())
-        except OSError:
-            entries = []
-        for entry in entries:
-            if entry.is_dir():
-                _handle_dir(entry.path, entry.name, root, db, result, move, "投放区")
-            elif entry.is_file() and entry.name.lower().endswith(".zip"):
-                _handle_zip(entry.path, entry.name, root, db, result, "投放区", True)
-
-    # 2) 库根目录直接投放
-    if os.path.isdir(root):
-        result["scanned"] += 1
-        reserved = {C.DIR_ADDONS, C.DIR_EXTENSIONS, C.DIR_INBOX, C.DIR_TRASH, C.DIR_META}
-        try:
-            entries = sorted(os.scandir(root), key=lambda e: e.name.lower())
-        except OSError:
-            entries = []
-        for entry in entries:
-            if entry.name in reserved or entry.name.startswith("."):
+def _candidates(directory: str):
+    ignored = {C.DIR_ADDONS, C.DIR_EXTENSIONS, C.DIR_INBOX, C.DIR_TRASH, C.DIR_META}
+    with os.scandir(directory) as entries:
+        for entry in sorted(entries, key=lambda item: item.name.casefold()):
+            if entry.name in ignored or scan.is_ignored(entry.name):
                 continue
-            if entry.is_dir():
-                _handle_dir(entry.path, entry.name, root, db, result, move, "库根目录")
-            elif entry.is_file() and entry.name.lower().endswith(".zip"):
-                _handle_zip(entry.path, entry.name, root, db, result, "库根目录", True)
+            if os.path.dirname(os.path.realpath(entry.path)) != os.path.realpath(directory):
+                continue
+            is_folder = entry.is_dir()
+            if is_folder or (entry.is_file() and entry.name.lower().endswith(".zip")):
+                yield entry.path, entry.name, is_folder
 
+
+def preview_paths(root: str) -> list[str]:
+    return [path for directory, _origin in _locations(root) if os.path.isdir(directory)
+            for path, _name, _folder in _candidates(directory)]
+
+
+def scan_inbox(root: str, db: LibraryDB, move: bool = True, enable: bool = False,
+               *, allowed=None) -> dict:
+    """Process the previewed paths and report each import, skip or failure."""
+    result = {"imported": 0, "skipped": 0, "failed": 0, "entries": [], "scanned": 0}
+    allowed_paths = set(allowed) if allowed is not None else None
+    for directory, origin in _locations(root):
+        if not os.path.isdir(directory):
+            continue
+        result["scanned"] += 1
+        for path, name, is_folder in _candidates(directory):
+            if allowed_paths is not None and path not in allowed_paths:
+                continue
+            if is_folder:
+                _handle_dir(path, name, root, db, result, move, origin)
+            else:
+                _handle_zip(path, name, root, db, result, origin, move)
     return result

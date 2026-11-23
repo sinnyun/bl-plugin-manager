@@ -24,26 +24,12 @@ def _compat_display(item) -> tuple[str, str, bool]:
     Keep the untested state explicit so a plugin cannot look startable merely
     because its metadata says it targets the current Blender version.
     """
-    compat = getattr(item, "compat", "unknown")
-    load_state = getattr(item, "load_state", "")
-    alert = load_state == "failed" or compat in ("too_old", "too_new")
-    if load_state == "failed":
-        label = "✗ 启动测试失败"
-    elif compat in ("too_old", "too_new"):
-        label = "✗ 当前 Blender 不兼容"
-    elif load_state == "ok":
-        label = "✓ 已实测可启动"
-    elif compat == "ok":
-        label = "? 声明兼容，未实测"
-    else:
-        label = "? 未声明，未实测"
-
-    maximum = getattr(item, "max_version_text", "") or "不限"
-    if maximum == "不限":
-        maximum = "最高 不限"
-    elif not maximum.startswith("最高"):
-        maximum = f"最高 {maximum}"
-    return label, maximum, alert
+    state = items.compatibility_status(getattr(item, "compat", ""), getattr(item, "load_state", ""))
+    names = {"load_failed": "启动失败", "out_of_range": "版本不兼容",
+             "load_ok": "实测可启动", "declared": "声明兼容 · 未测", "unknown": "未测"}
+    maximum = getattr(item, "max_version_text", "")
+    maximum = f"最高 {maximum}" if maximum and maximum != "不限" else "未声明上限"
+    return names[state], maximum, state in {"load_failed", "out_of_range"}
 
 
 def _progress_bar(layout, factor, text):
@@ -67,57 +53,24 @@ class PM_UL_plugins(UIList):
                           emboss=False)
         op.key = item.key
 
-        # 启用开关（会话内是否加载）
         op = row.operator("plugin_manager.toggle", text="",
-                          icon="CHECKBOX_HLT" if item.enabled else "CHECKBOX_DEHLT",
-                          emboss=False)
-        op.key = item.key
-        op.enable = not item.enabled
+                          icon="PLAY" if item.enabled else "PAUSE", emboss=False)
+        op.key, op.enable = item.key, not item.enabled
 
-        # 自启标记（随 Blender 启动是否自动启用）
-        op = row.operator("plugin_manager.set_startup", text="",
-                          icon="RADIOBUT_ON" if item.startup else "RADIOBUT_OFF",
-                          emboss=False)
-        op.key = item.key
-        op.value = not item.startup
-        op.use_selection = False
-
-        # 状态：实测失败 / 版本不兼容 优先用醒目图标
+        row.label(text=item.display_name or item.name or item.key,
+                  icon="SOLO_ON" if item.favorite else "NONE")
+        label, _, warning = _compat_display(item)
+        icon = "ERROR" if warning else "NONE"
         if item.missing:
-            row.label(text="", icon="ERROR")
-        elif item.load_state == "failed":
-            row.label(text="", icon="CANCEL")
-        elif item.compat in ("too_new", "too_old"):
-            row.label(text="", icon="CANCEL")
+            label, icon, warning = "文件缺失", "ERROR", True
         elif item.last_error:
-            row.label(text="", icon="CANCEL")
-        elif item.update_available:
-            row.label(text="", icon="FILE_REFRESH")
-        else:
-            row.label(text="", icon="PLUGIN")
-
-        # 名称：显示名称（别名）为主，实际名以灰色附后
-        actual = item.name or item.folder_name or item.key
-        shown = item.display_name or actual
-        if item.favorite:
-            shown = "★ " + shown
-        row.label(text=shown)
-        if item.display_name and item.display_name != actual:
-            alias = row.row()
-            alias.enabled = False
-            alias.label(text=f"（{actual}）")
-
-        # 右侧：显示当前 Blender 兼容性和插件声明的最高支持版本；
-        # 插件自身版本保留在详情面板，不在列表行重复显示。
-        compat_label, max_label, compat_alert = _compat_display(item)
-        sub = row.column(align=True)
-        sub.alignment = "RIGHT"
-        sub.alert = compat_alert
-        sub.label(text=compat_label)
-        max_row = sub.row(align=True)
-        max_row.alignment = "RIGHT"
-        max_row.enabled = False
-        max_row.label(text=max_label)
+            label, icon, warning = "启用失败", "ERROR", True
+        elif item.update_available and not warning:
+            label, icon = "有更新", "FILE_REFRESH"
+        status = row.row(align=True)
+        status.alignment = "RIGHT"
+        status.alert = warning
+        status.label(text=label, icon=icon)
 
 
 class PM_UL_report(UIList):
@@ -159,7 +112,7 @@ class PM_MT_library(Menu):
             sub.enabled = False
             sub.label(text=prefs.library_path)
         layout.separator()
-        layout.operator("plugin_manager.setup_library", icon="LINKED", text="启用/修复挂载")
+        layout.operator("plugin_manager.pick_library_path", icon="FILEBROWSER", text="选择其它库…")
         layout.operator("plugin_manager.refresh", icon="FILE_REFRESH", text="刷新列表")
 
 
@@ -239,6 +192,8 @@ class PM_MT_plugin(Menu):
 
         layout.separator()
         layout.operator("plugin_manager.edit_meta", icon="GREASEPENCIL", text="编辑信息…")
+        if rec and rec.get("kind") == C.KIND_ADDON and not rec.get("missing"):
+            layout.operator("plugin_manager.relink_addon", icon="LINKED").key = key
         op = layout.operator("plugin_manager.open_folder", icon="FILE_FOLDER",
                              text="打开所在文件夹")
         op.key = key
@@ -263,99 +218,97 @@ class PM_PT_main(Panel):
             return
 
         items.maybe_rebuild(prefs)
+        if not PM_PT_main.draw_library_status(layout, prefs):
+            return
 
-        # --- 库状态（一行紧凑显示，详情收进菜单）---
-        box = layout.box()
-        row = box.row(align=True)
-        if prefs.library_path:
-            state = bridge.library_state(prefs.library_path)
-            try:
-                from .storage import machine_config
-                local = machine_config.load()
-                managed = bool(local.get("management_enabled"))
-            except Exception:
-                local, managed = {}, False
-            mounted = managed and state["script_dir"] and state["repo"]
-            name = os.path.basename(prefs.library_path.rstrip("\\/")) or prefs.library_path
-            row.label(text=name, icon="CHECKMARK" if mounted else "ERROR")
-            row.operator("plugin_manager.pick_library_path", text="", icon="FILEBROWSER")
-            row.operator("plugin_manager.setup_library", text="", icon="LINKED")
-            row.menu("PM_MT_library", text="", icon="DOWNARROW_HLT")
-            device_row = box.row(align=True)
-            device_row.prop(prefs, "device_name", text="设备")
-            if local.get("device_id"):
-                device_row.label(text=local["device_id"][:8])
+        row = layout.row(align=True)
+        row.operator("plugin_manager.scan_inbox", text="扫描投放区", icon="FILE_REFRESH")
+        row.operator("plugin_manager.import_zip", text="导入 ZIP", icon="IMPORT")
+        row = layout.row(align=True)
+        row.prop(prefs, "search", text="", icon="VIEWZOOM")
+        row.menu("PM_MT_category", text=prefs.active_category, icon="FILE_FOLDER")
+        filters = layout.row(align=True)
+        filters.prop(prefs, "only_enabled", text="已启用", toggle=True)
+        filters.prop(prefs, "only_updates", text="有更新", toggle=True)
+        filters.prop(prefs, "only_favorites", text="收藏", toggle=True)
+        filters.prop(prefs, "only_incompatible", text="有问题", toggle=True)
+
+        if len(prefs.plugin_items):
+            layout.template_list("PM_UL_plugins", "", prefs, "plugin_items", prefs, "active_index",
+                                 rows=9, sort_lock=True)
+            yes, no, unknown = _support_counts(prefs)
+            layout.label(text=f"当前结果 {len(prefs.plugin_items)} · 可启动 {yes} · 有问题 {no} · 未测 {unknown}")
         else:
-            row.label(text="未设置插件库位置", icon="ERROR")
-            row.operator("plugin_manager.pick_library_path", text="选择目录",
-                         icon="FILEBROWSER")
-            row.menu("PM_MT_library", text="", icon="DOWNARROW_HLT")
-
-        # 当前 Blender 版本（兼容范围以此为参照）
-        try:
-            cur = ".".join(str(v) for v in bpy.app.version)
-        except Exception:
-            cur = ""
-        if cur:
-            row = layout.row(align=True)
-            sub = row.row()
-            sub.enabled = False
-            sub.label(text=f"当前 Blender {cur}", icon="BLENDER")
-            yes_n, no_n, unk_n = _support_counts(prefs)
-            sub2 = row.row(align=True)
-            sub2.alignment = "RIGHT"
-            if no_n:
-                sub2.alert = True
-                sub2.label(text=f"✗{no_n}", icon="CANCEL")
-            if yes_n:
-                sub2.label(text=f"✓{yes_n}")
-            if unk_n and not (yes_n or no_n):
-                grey = sub2.row()
-                grey.enabled = False
-                grey.label(text=f"?{unk_n}")
-            # 一键测试（显眼入口）；任务运行时改为进度与取消
-            row = layout.row(align=True)
-            if prefs.compat_running:
-                row.operator("plugin_manager.cancel_compat", icon="X", text="取消测试")
-            else:
-                row.operator("plugin_manager.verify_compat", icon="CHECKMARK",
-                             text="一键测试插件支持")
+            filtered = (prefs.search or prefs.active_category not in ("", "全部")
+                        or any((prefs.only_enabled, prefs.only_updates, prefs.only_favorites,
+                                prefs.only_incompatible)))
+            layout.label(text="没有匹配的插件，请调整筛选" if filtered else "库内还没有插件，可导入或扫描投放区",
+                         icon="INFO")
 
         if prefs.compat_running:
             box = layout.box()
-            box.label(text=f"测试进度 {prefs.compat_done} / {prefs.compat_total}",
-                      icon="TIME")
+            box.label(text=f"启动测试 {prefs.compat_done}/{prefs.compat_total}", icon="TIME")
             if prefs.compat_current:
-                box.label(text=f"当前: {prefs.compat_current}")
+                box.label(text=prefs.compat_current)
             _progress_bar(box, prefs.compat_done / max(1, prefs.compat_total),
-                          f"{prefs.compat_done}/{prefs.compat_total}")
-            sub = box.row(align=True)
-            sub.label(text=f"✓ {prefs.compat_ok}　✗ {prefs.compat_fail}")
-            sub.operator("plugin_manager.cancel_compat", icon="X", text="取消")
+                          f"可启动 {prefs.compat_ok} · 失败 {prefs.compat_fail}")
             if prefs.compat_cancelling:
-                box.label(text="正在取消，等待当前插件处理结束…", icon="INFO")
+                box.label(text="等待当前插件处理结束…", icon="INFO")
+            else:
+                box.operator("plugin_manager.cancel_compat", icon="X", text="取消测试")
+        elif prefs.archive_running:
+            box = layout.box()
+            _progress_bar(box, prefs.archive_progress, prefs.archive_status)
+            if prefs.archive_cancelling:
+                box.label(text="正在取消下载…", icon="INFO")
+            else:
+                box.operator("plugin_manager.cancel_archives", icon="X", text="取消")
+        else:
+            layout.operator("plugin_manager.verify_compat", icon="CHECKMARK", text="测试插件能否启动…")
 
-        # --- 搜索 + 过滤（一行）---
+    @staticmethod
+    def draw_library_status(layout, prefs) -> bool:
+        from .storage import machine_config
+
+        root = prefs.library_path
+        if prefs.pending_library_path:
+            box = layout.box()
+            box.label(text=prefs.pending_library_path, icon="FILE_FOLDER")
+            box.label(text=prefs.library_preview)
+            box.label(text="将应用扩展仓库、脚本目录与本机插件启用清单")
+            row = box.row(align=True)
+            row.operator("plugin_manager.setup_library", text="启用管理", icon="LINKED")
+            row.operator("plugin_manager.pick_library_path", text="更换…", icon="FILEBROWSER")
+            row.operator("plugin_manager.pick_library_path", text="取消").cancel_preview = True
+            if not root:
+                return False
+        if not root:
+            layout.operator("plugin_manager.pick_library_path", text="选择插件库…", icon="FILEBROWSER")
+            return False
         row = layout.row(align=True)
-        row.prop(prefs, "search", text="", icon="VIEWZOOM")
-        row.prop(prefs, "only_enabled", text="", icon="CHECKBOX_HLT")
-        row.prop(prefs, "only_updates", text="", icon="FILE_REFRESH")
-        row.prop(prefs, "only_favorites", text="", icon="SOLO_ON")
-        row.prop(prefs, "only_incompatible", text="", icon="ERROR")
-
-        # --- 插件列表 ---
-        layout.template_list(
-            "PM_UL_plugins", "", prefs, "plugin_items", prefs, "active_index",
-            rows=9, sort_lock=True,
-        )
-
-        # --- 计数 + 分类入口（菜单，按需展开）---
-        row = layout.row(align=True)
-        row.label(text=f"{len(prefs.plugin_items)} 个插件")
-        sub = row.row(align=True)
-        sub.alignment = "RIGHT"
-        sub.menu("PM_MT_category",
-                 text=f"分类: {prefs.active_category}", icon="FILE_FOLDER")
+        name = os.path.basename(root.rstrip("\\/")) or root
+        if not os.path.isdir(root):
+            row.label(text="插件库离线", icon="ERROR")
+            row.operator("plugin_manager.setup_library", text="重连")
+            row.operator("plugin_manager.pick_library_path", text="更换…")
+            return False
+        if items.database_status(prefs) in {"CORRUPT", "UNSUPPORTED"}:
+            layout.label(text="资料库损坏或版本不受支持，原文件已保留", icon="ERROR")
+            layout.operator("plugin_manager.show_warnings", text="查看诊断")
+            return False
+        if not machine_config.load().get("management_enabled"):
+            row.label(text=f"{name} · 管理已停止", icon="UNLINKED")
+            row.operator("plugin_manager.setup_library", text="启用管理")
+            row.operator("plugin_manager.pick_library_path", text="更换…")
+            return False
+        if not bridge.is_registered(root):
+            row.label(text=f"{name} · 挂载未就绪", icon="ERROR")
+            row.operator("plugin_manager.setup_library", text="重连")
+            row.operator("plugin_manager.pick_library_path", text="更换…")
+            return False
+        row.label(text=name, icon="CHECKMARK")
+        row.menu("PM_MT_library", text="", icon="DOWNARROW_HLT")
+        return True
 
 
 class PM_PT_detail(Panel):
@@ -402,7 +355,7 @@ class PM_PT_detail(Panel):
         bmin = sel.get("blender_min", "")
         bmax = sel.get("blender_max", "")
         state, detail = _scan.blender_compat(bmin, bmax)
-        hi = _scan.max_version_label(bmax)          # 最高支持版本
+        hi = _scan.max_version_label(bmax) if bmax else "未声明上限"
         lo = _scan.version_str(bmin) or "不限"
         try:
             cur = ".".join(str(v) for v in bpy.app.version)
@@ -432,8 +385,10 @@ class PM_PT_detail(Panel):
                           icon="ERROR")
                 row.operator("plugin_manager.cleanup_residue", text="清理", icon="TRASH")
         elif sel.get("load_state") == "ok":
-            col.label(text="✓ 支持当前 Blender", icon="CHECKMARK")
+            col.label(text="已实测可启动", icon="CHECKMARK")
 
+        if sel.get("update_source_required"):
+            col.label(text="更新前需在商店确认来源", icon="INFO")
         if sel.get("update_available") and sel.get("latest_version"):
             col.label(text=f"可更新到 v{sel['latest_version']}", icon="FILE_REFRESH")
         if sel.get("last_error"):
@@ -458,7 +413,7 @@ class PM_PT_detail(Panel):
         op.key = sel.get("key", "")
         op.value = not sel.get("startup")
         op.use_selection = False
-        op = row.operator("plugin_manager.set_favorite", text="收藏", icon="SOLO_ON")
+        op = row.operator("plugin_manager.set_favorite", text="取消收藏" if sel.get("favorite") else "收藏", icon="SOLO_ON")
         op.key = sel.get("key", "")
         op.value = not sel.get("favorite")
 
@@ -486,17 +441,20 @@ class PM_PT_batch(Panel):
         prefs = bridge.get_prefs()
         if not prefs:
             return
-        n = sum(1 for it in prefs.plugin_items if it.selected)
+        n = len(items.all_selected_keys())
+        hidden = n - len(items.selected_keys(prefs))
+        layout.label(text=f"已勾选 {n} 个" + (f" · 筛选隐藏 {hidden} 个" if hidden else ""))
         row = layout.row(align=True)
-        row.label(text=f"已勾选 {n} 个", icon="PRESET")
-        row.operator("plugin_manager.select_all", text="全选", icon="CHECKMARK").value = True
-        row.operator("plugin_manager.select_all", text="清空", icon="X").value = False
+        row.operator("plugin_manager.select_all", text="全选当前结果").value = True
+        row.operator("plugin_manager.select_all", text="清空全部").value = False
 
-        row = layout.row(align=True)
+        actions = layout.column(align=True)
+        actions.enabled = bool(n)
+        row = actions.row(align=True)
         row.operator("plugin_manager.batch_enable", text="启用", icon="CHECKBOX_HLT").value = True
         row.operator("plugin_manager.batch_enable", text="停用", icon="CHECKBOX_DEHLT").value = False
         row.operator("plugin_manager.batch_set_category", text="归入分类…", icon="FILE_FOLDER")
-        row = layout.row(align=True)
+        row = actions.row(align=True)
         row.operator("plugin_manager.batch_set_startup", text="设为自启",
                      icon="RADIOBUT_ON").value = True
         row.operator("plugin_manager.batch_set_startup", text="取消自启",
@@ -533,15 +491,12 @@ class PM_PT_actions(Panel):
         row.operator("plugin_manager.store_open", icon="URL", text="浏览/安装")
         row.operator("plugin_manager.check_updates", icon="FILE_REFRESH", text="检查更新")
         row = col.row(align=True)
-        row.operator("plugin_manager.update_all", icon="TRIA_DOWN_BAR", text="一键更新全部")
+        row.operator("plugin_manager.update_all", icon="TRIA_DOWN_BAR", text="预览批量更新")
         row.operator("plugin_manager.store_sync", icon="FILE_REFRESH", text="")
 
-        st = bridge.library_state(prefs.library_path) if prefs.library_path else {}
-        if st.get("official"):
-            col.label(text="官方商店面板已与本库共用目录", icon="CHECKMARK")
-        else:
-            col.operator("plugin_manager.unify_store", icon="LINKED",
-                         text="让官方商店使用本插件库")
+        col.operator("plugin_manager.restore_plugin", text="从回收站恢复", icon="LOOP_BACK")
+        if prefs.archive_retry:
+            col.operator("plugin_manager.retry_archives", text="重试失败项", icon="FILE_REFRESH")
 
         layout.separator()
         row = layout.row(align=True)

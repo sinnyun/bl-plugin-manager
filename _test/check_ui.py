@@ -42,7 +42,7 @@ for op in ("plugin_manager.unmount_library", "plugin_manager.show_warnings",
     if op not in prefs_src:
         errors.append(f"偏好设置缺少维护/迁移入口: {op}")
 
-# 列表行必须展示兼容性与最高版本信息，而不是插件自身版本号。
+# 紧凑列表只展示主要状态；完整范围与自启放在详情。
 ui_tree = ast.parse(ui_src)
 plugin_draw_src = ""
 for node in ast.walk(ui_tree):
@@ -51,8 +51,10 @@ for node in ast.walk(ui_tree):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "draw_item":
                 plugin_draw_src = ast.get_source_segment(ui_src, child) or ""
                 break
-if "当前 Blender 兼容" not in plugin_draw_src or "最高" not in plugin_draw_src:
-    errors.append("PM_UL_plugins.draw_item 未显示兼容性和最高支持版本")
+if "_compat_display" not in plugin_draw_src or "文件缺失" not in plugin_draw_src:
+    errors.append("PM_UL_plugins.draw_item 未显示兼容性与缺失状态")
+if "plugin_manager.set_startup" in plugin_draw_src:
+    errors.append("列表行不应显示独立自启控件")
 if "item.version" in plugin_draw_src:
     errors.append("PM_UL_plugins.draw_item 不应显示插件自身版本号")
 
@@ -92,7 +94,7 @@ for attr in re.findall(r'"plugin_manager\.([a-z_]+)"', prefs_src):
 
 # 4) operators.py 中所有 _report 调用都返回集合形式（返回类型正确性由运行期保证）
 # 5) __init__.py 注册的模块都提供 classes
-for mod in re.findall(r"^_modules = \(([^)]*)\)", init_src, re.M):
+for mod in re.findall(r"^\s*_modules = \(([^)]*)\)", init_src, re.M):
     pass
 
 # 6) 确认所有 operators 的 classes 元组包含全部 Operator 子类

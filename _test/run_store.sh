@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
-# 在线商店测试（需联网）：下载、安装、更新、保留用户字段。
-set -u
-BL="${BLENDER_EXE:-/c/Program Files (x86)/Steam/steamapps/common/Blender/blender.exe}"
-REPO="E:/AI/geren/chajian_guanliqi"
-ROOT="$(mktemp -d)"
-mkdir -p "$ROOT/config" "$ROOT/scripts/addons"
-cp -r "$REPO/bl_plugin_manager" "$ROOT/scripts/addons/"
-rm -rf "$ROOT/scripts/addons/bl_plugin_manager/__pycache__"
-
-BLENDER_USER_CONFIG="$(cygpath -w "$ROOT/config")" \
-BLENDER_USER_SCRIPTS="$(cygpath -w "$ROOT/scripts")" \
-  "$BL" --background --factory-startup \
-  --python "$(cygpath -w "$REPO/_test/test_store.py")" 2>&1 \
-  | grep -E "@@STORE@@|Traceback|Error"
-
-rm -rf "$ROOT"
+# Run the isolated store check through the maintained Windows runner.
+set -euo pipefail
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if command -v cygpath >/dev/null 2>&1; then
+  repo="$(cygpath -w "$repo")"
+fi
+exec powershell.exe -ExecutionPolicy Bypass -File "$repo/_test/run_regressions.ps1" -Suite store "$@"

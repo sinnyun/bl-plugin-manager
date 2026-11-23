@@ -23,19 +23,19 @@ def resolve_record_path(root: str | os.PathLike[str], rel: str, kind: str) -> Pa
         raise UnsafeLibraryPathError("absolute or drive-qualified record path")
     normalized = rel.replace("\\", "/")
     parts = [part for part in normalized.split("/") if part not in ("", ".")]
-    if not parts or ".." in parts:
+    if len(parts) < 2 or ".." in parts:
         raise UnsafeLibraryPathError("parent traversal in record path")
     if parts[0].casefold() != _ROOTS[kind].casefold():
         raise UnsafeLibraryPathError("record path kind does not match its container")
 
     library = Path(root).resolve()
     candidate = (library.joinpath(*parts)).resolve()
-    container = (library / _ROOTS[kind]).resolve()
+    container = library / _ROOTS[kind]
     try:
         common = Path(os.path.commonpath((str(candidate), str(container))))
     except ValueError as exc:
         raise UnsafeLibraryPathError("record path uses a different volume") from exc
-    if common != container:
+    if common != container or candidate == container:
         raise UnsafeLibraryPathError("record path escapes plugin container")
     return candidate
 

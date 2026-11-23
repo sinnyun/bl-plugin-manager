@@ -16,6 +16,7 @@ import ssl
 import tempfile
 import urllib.error
 import urllib.request
+from urllib.parse import urljoin, urlsplit
 
 import bpy
 
@@ -31,78 +32,92 @@ CHUNK = 262144
 # ---------------------------------------------------------------------------
 # 目录
 # ---------------------------------------------------------------------------
-def _repo_index_files() -> list[tuple[str, str]]:
-    """返回 [(仓库名, index.json 路径)]。"""
+def _repo_index_files() -> list[tuple[str, str, str, str]]:
     out = []
     try:
         repos = bpy.context.preferences.extensions.repos
     except Exception:
         return out
     for repo in repos:
+        if not getattr(repo, "enabled", True):
+            continue
         directory = getattr(repo, "custom_directory", "") or getattr(repo, "directory", "")
         if not directory:
             continue
         path = os.path.join(directory, ".blender_ext", "index.json")
         if os.path.isfile(path):
-            out.append((getattr(repo, "name", "") or getattr(repo, "module", ""), path))
+            module = getattr(repo, "module", "")
+            remote = getattr(repo, "remote_url", "") if getattr(repo, "use_remote_url", False) else ""
+            out.append((remote or module, getattr(repo, "name", "") or module, remote, path))
     return out
 
 
-def read_catalog() -> list[dict]:
-    """合并所有仓库索引，返回可用扩展列表（同 id 取版本最高者）。"""
-    best: dict[str, dict] = {}
-    for repo_name, path in _repo_index_files():
+def read_catalog(*, include_unavailable: bool = False) -> list[dict]:
+    """Preserve offers from different repositories, even for the same extension ID."""
+    best = {}
+    for source, repo_name, remote, path in _repo_index_files():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             continue
-        for item in (data.get("data") or []):
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            continue
+        for item in data["data"]:
+            if not isinstance(item, dict):
+                continue
             pid = item.get("id")
-            if not pid or not item.get("archive_url"):
+            if not isinstance(pid, str) or not pid:
+                continue
+            archive = item.get("archive_url") or ""
+            if not isinstance(archive, str):
+                continue
+            archive = urljoin(remote, archive) if remote and archive else archive
+            try:
+                if not isinstance(archive, str) or urlsplit(archive).scheme not in {"https", "http"}:
+                    archive = ""
+                size = int(item.get("archive_size") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not archive and not include_unavailable:
                 continue
             pkg = {
                 "id": pid,
-                "name": item.get("name") or pid,
+                "name": str(item.get("name") or pid),
                 "version": scan.version_str(item.get("version")),
-                "tagline": item.get("tagline", ""),
-                "tags": [str(t) for t in (item.get("tags") or [])],
+                "tagline": str(item.get("tagline") or ""),
+                "tags": [str(t) for t in item["tags"]] if isinstance(item.get("tags"), list) else [],
                 "type": item.get("type", ""),
-                "archive_url": item.get("archive_url", ""),
-                "archive_hash": item.get("archive_hash", ""),
-                "archive_size": int(item.get("archive_size") or 0),
+                "archive_url": archive,
+                "archive_hash": str(item.get("archive_hash") or ""),
+                "archive_size": size,
                 "blender_version_min": scan.version_str(item.get("blender_version_min")),
+                "blender_version_max": scan.version_str(item.get("blender_version_max")),
                 "website": item.get("website", ""),
-                "maintainer": item.get("maintainer", ""),
+                "maintainer": str(item.get("maintainer") or ""),
                 "license": item.get("license") or [],
                 "repo": repo_name,
+                "source": source,
             }
-            cur = best.get(pid)
+            key = (pid.casefold(), source)
+            cur = best.get(key)
             if cur is None or scan.compare_versions(pkg["version"], cur["version"]) > 0:
-                best[pid] = pkg
-    return sorted(best.values(), key=lambda p: (p["name"] or "").lower())
+                best[key] = pkg
+    return sorted(best.values(), key=lambda p: (p["name"].casefold(), p["repo"].casefold()))
 
 
 def is_compatible(pkg: dict, blender_version: tuple | None = None) -> bool:
-    """该扩展要求的最低 Blender 版本是否满足当前版本。"""
-    if blender_version is None:
-        blender_version = bpy.app.version
-    need = scan.version_key(pkg.get("blender_version_min"))
-    if not any(need):
-        return True
-    need = need[: len(blender_version)]
-    cur = tuple(blender_version[: len(need)])
-    return need <= cur
+    return scan.blender_compat(pkg.get("blender_version_min"), pkg.get("blender_version_max"),
+                               blender_version)[0] not in {"too_old", "too_new"}
 
 
 def installed_map(db: LibraryDB) -> dict:
     """id / 文件夹名 → 库内记录，用于判断"已安装"。"""
     m = {}
     for rec in db.plugins.values():
-        if rec.get("id"):
-            m[str(rec["id"]).lower()] = rec
-        if rec.get("folder_name"):
-            m[str(rec["folder_name"]).lower()] = rec
+        package_id = rec.get("pkg_id") or rec.get("id")
+        if rec.get("kind") == C.KIND_EXTENSION and not rec.get("missing") and package_id:
+            m[str(package_id).casefold()] = rec
     return m
 
 
@@ -130,7 +145,8 @@ def search(catalog: list[dict], db: LibraryDB, query: str = "",
                 continue
         out.append({**pkg,
                     "installed": bool(rec),
-                    "installed_version": (rec or {}).get("version", "")})
+                    "installed_version": (rec or {}).get("version", ""),
+                    "installed_source": (rec or {}).get("archive_source", "")})
     return out
 
 
@@ -146,7 +162,7 @@ def _sha256_file(path: str) -> str:
 
 
 def download(url: str, dest: str, expected_hash: str = "", expected_size: int = 0,
-             progress=None) -> tuple[bool, str]:
+             progress=None, cancelled=None) -> tuple[bool, str]:
     """下载 archive_url 到 dest，校验大小与 sha256。返回 (成功, 错误)。"""
     if not url:
         return False, "缺少下载地址"
@@ -158,11 +174,15 @@ def download(url: str, dest: str, expected_hash: str = "", expected_size: int = 
             got = 0
             with open(dest, "wb") as f:
                 while True:
+                    if cancelled and cancelled():
+                        return False, "下载已取消"
                     chunk = resp.read(CHUNK)
                     if not chunk:
                         break
-                    f.write(chunk)
                     got += len(chunk)
+                    if expected_size and got > expected_size:
+                        return False, "下载大小超过仓库记录"
+                    f.write(chunk)
                     if progress and total:
                         progress(min(99, int(got * 100 / total)))
     except urllib.error.HTTPError as exc:
@@ -188,60 +208,63 @@ def download(url: str, dest: str, expected_hash: str = "", expected_size: int = 
 # ---------------------------------------------------------------------------
 # 安装 / 更新
 # ---------------------------------------------------------------------------
+def download_package(pkg: dict, progress=None, cancelled=None) -> str:
+    """Stage a verified download. The caller owns the returned temporary file."""
+    with tempfile.NamedTemporaryFile(prefix="pm_store_", suffix=".zip", delete=False) as file:
+        path = file.name
+    try:
+        ok, error = download(pkg.get("archive_url", ""), path,
+                             pkg.get("archive_hash", ""), int(pkg.get("archive_size") or 0),
+                             progress, cancelled)
+        if not ok or (cancelled and cancelled()):
+            raise RuntimeError(error or "下载已取消")
+        return path
+    except Exception:
+        os.remove(path)
+        raise
+
+
+def apply_package(pkg: dict, path: str, root: str, db: LibraryDB,
+                  record: dict | None = None, *, enable: bool = False) -> dict:
+    if record is not None:
+        return library.replace_from_zip(record, path, root, db, version=pkg.get("version", ""),
+                                        archive_source=pkg.get("source", ""))
+    rec = library.import_zip(path, root, db, enable=enable, origin="在线商店",
+                             origin_path=pkg.get("website", ""), expected_id=pkg.get("id", ""),
+                             expected_version=pkg.get("version", ""))
+    rec["source_url"] = pkg.get("website", "") or rec.get("source_url", "")
+    rec["archive_source"] = pkg.get("source", "")
+    db.save()
+    return rec
+
+
 def install_package(pkg: dict, root: str, db: LibraryDB, enable: bool = False,
                     progress=None) -> tuple[bool, str, dict | None]:
-    """从商店安装一个扩展到插件库。返回 (成功, 错误, 记录)。"""
-    tmp = tempfile.mktemp(prefix="pm_store_", suffix=".zip")
+    """Synchronous service entry used by the isolated store checks."""
+    path = None
     try:
-        ok, err = download(pkg.get("archive_url", ""), tmp,
-                           pkg.get("archive_hash", ""), int(pkg.get("archive_size") or 0),
-                           progress)
-        if not ok:
-            return False, err, None
-        rec = library.import_zip(tmp, root, db, enable=enable,
-                                 origin="在线商店", origin_path=pkg.get("website", ""))
-        if pkg.get("id") and not rec.get("id"):
-            rec["id"] = pkg["id"]
-        rec["origin"] = "在线商店"
-        rec["source_url"] = pkg.get("website", "") or rec.get("source_url", "")
-        db.plugins[rec["plugin_id"]] = rec
-        db.save()
-        return True, "", rec
+        path = download_package(pkg, progress)
+        return True, "", apply_package(pkg, path, root, db, enable=enable)
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}", None
+        return False, str(exc), None
     finally:
-        try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+        if path:
+            os.remove(path)
 
 
-def update_record(rec: dict, pkg: dict, root: str, db: LibraryDB,
-                  progress=None, defer_refresh: bool = False) -> tuple[bool, str]:
-    """把库中已有插件更新到 pkg 指定的新版本（保留分类/备注/启用/自启）。
-
-    defer_refresh=True 供批量更新使用：不逐个刷新 Blender，由调用方最后统一刷新。
-    """
-    tmp = tempfile.mktemp(prefix="pm_upd_", suffix=".zip")
+def update_record(record: dict, pkg: dict, root: str, db: LibraryDB,
+                  progress=None) -> tuple[bool, str]:
+    """Run a confirmed update from a synchronous service caller."""
+    path = None
     try:
-        ok, err = download(pkg.get("archive_url", ""), tmp,
-                           pkg.get("archive_hash", ""), int(pkg.get("archive_size") or 0),
-                           progress)
-        if not ok:
-            return False, err
-        new_rec = library.replace_from_zip(rec, tmp, root, db,
-                                           version=pkg.get("version", ""),
-                                           defer_refresh=defer_refresh)
-        return True, new_rec.get("version", "")
+        path = download_package(pkg, progress)
+        updated = apply_package(pkg, path, root, db, record)
+        return True, updated.get("version", "")
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        return False, str(exc)
     finally:
-        try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+        if path:
+            os.remove(path)
 
 
 def sync_indexes() -> tuple[bool, str]:

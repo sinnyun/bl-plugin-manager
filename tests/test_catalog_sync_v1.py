@@ -78,11 +78,11 @@ class LinkScanTests(unittest.TestCase):
         mod = _module()
         catalog = {"addon:old-name": {
             "plugin_id": "addon:old-name", "kind": "addon",
-            "name": "Old Name", "display_name": "我的别名",
+            "name": "Old Name", "display_name": "我的别名", "author": "Same author",
             "category": "工具", "names": ["old-name"], "folders": ["SameFolder"],
         }}
         result = mod.link_scan(catalog, {}, [
-            _entry("addons/SameFolder", "New Name"),
+            {**_entry("addons/SameFolder", "New Name"), "author": "Same author"},
         ])
         self.assertEqual(len(result.plugins), 1, "改名不得产生重复条目")
         self.assertEqual(result.present, {"addon:old-name"})

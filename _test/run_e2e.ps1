@@ -18,6 +18,7 @@ $scripts = Join-Path $tempRoot "scripts"
 $scratch = Join-Path $tempRoot "tmp"
 $outLog = Join-Path $tempRoot "e2e.log"
 $errLog = Join-Path $tempRoot "e2e.err"
+$oldResources = $env:BLENDER_USER_RESOURCES
 try {
     New-Item -ItemType Directory -Force -Path $config, $scripts, $scratch, (Join-Path $scripts "addons") | Out-Null
     Copy-Item -LiteralPath (Join-Path $repo "bl_plugin_manager") -Destination (Join-Path $scripts "addons\bl_plugin_manager") -Recurse
@@ -26,14 +27,15 @@ try {
     $oldMachineConfig = $env:BL_PLUGIN_MANAGER_MACHINE_CONFIG
     $oldLocalState = $env:BL_PLUGIN_MANAGER_LOCAL_STATE
     $oldExpectedRoot = $env:BL_PLUGIN_MANAGER_EXPECTED_TEST_ROOT
+    $env:BLENDER_USER_RESOURCES = $tempRoot
     $env:BLENDER_USER_CONFIG = $config; $env:BLENDER_USER_SCRIPTS = $scripts
     $env:TEMP = $scratch; $env:TMP = $scratch
     $env:BL_PLUGIN_MANAGER_MACHINE_CONFIG = Join-Path $tempRoot "machine.json"
     $env:BL_PLUGIN_MANAGER_LOCAL_STATE = Join-Path $tempRoot "local-state.json"
     $env:BL_PLUGIN_MANAGER_EXPECTED_TEST_ROOT = $tempRoot
     $proc = Start-Process -FilePath $BlenderExe -ArgumentList @(
-        "--background", "--factory-startup", "--python-exit-code", "1",
-        "--python", (Join-Path $repo "_test\test_e2e.py")
+        "--background", "--factory-startup", "--offline-mode", "--python-exit-code", "1",
+        "--python", ('"{0}"' -f (Join-Path $repo "_test\test_e2e.py"))
     ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     Get-Content -LiteralPath $outLog, $errLog -ErrorAction SilentlyContinue |
         Select-String -Pattern '^\[PASS\]|^\[FAIL\]|===SUMMARY===|^\{|Traceback|^  File |^[A-Za-z]*Error' |
@@ -46,6 +48,7 @@ try {
     Write-Host "E2E suite passed: $($summary.total) checks."
 }
 finally {
+    if ($null -eq $oldResources) { Remove-Item Env:BLENDER_USER_RESOURCES -ErrorAction SilentlyContinue } else { $env:BLENDER_USER_RESOURCES = $oldResources }
     if ($null -ne $oldConfig) { $env:BLENDER_USER_CONFIG = $oldConfig } else { Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue }
     if ($null -ne $oldScripts) { $env:BLENDER_USER_SCRIPTS = $oldScripts } else { Remove-Item Env:BLENDER_USER_SCRIPTS -ErrorAction SilentlyContinue }
     if ($null -ne $oldTemp) { $env:TEMP = $oldTemp } else { Remove-Item Env:TEMP -ErrorAction SilentlyContinue }

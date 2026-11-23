@@ -3,8 +3,9 @@
 任何"定义了但无处调用"的操作符，就是简化时丢失的功能入口。
 """
 import re
+from pathlib import Path
 
-BASE = r"E:\AI\geren\chajian_guanliqi\bl_plugin_manager"
+BASE = Path(__file__).resolve().parents[1] / "bl_plugin_manager"
 ops_src = open(f"{BASE}/operators.py", encoding="utf-8").read()
 ui_src = open(f"{BASE}/ui.py", encoding="utf-8").read()
 pref_src = open(f"{BASE}/preferences.py", encoding="utf-8").read()
@@ -70,3 +71,4 @@ for m in missing_must:
 print("\n=== 结论 ===")
 ok = not unreachable and not undefined and not missing_must
 print("功能完整" if ok else "存在缺口，见上")
+raise SystemExit(0 if ok else 1)

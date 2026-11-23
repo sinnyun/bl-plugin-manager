@@ -8,12 +8,15 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$BlenderExe = $env:BLENDER_EXE
+    [string]$BlenderExe = $env:BLENDER_EXE,
+    [ValidateSet("regressions", "store", "ui")]
+    [string]$Suite = "regressions"
 )
 
 $ErrorActionPreference = "Stop"
 $oldConfig = $env:BLENDER_USER_CONFIG
 $oldScripts = $env:BLENDER_USER_SCRIPTS
+$oldResources = $env:BLENDER_USER_RESOURCES
 $oldTemp = $env:TEMP
 $oldTmp = $env:TMP
 $oldMachineConfig = $env:BL_PLUGIN_MANAGER_MACHINE_CONFIG
@@ -43,6 +46,7 @@ try {
     New-Item -ItemType Directory -Force -Path $config, $scripts, $scratch, (Split-Path -Parent $addonTarget) | Out-Null
     Copy-Item -LiteralPath (Join-Path $repo "bl_plugin_manager") -Destination $addonTarget -Recurse
 
+    $env:BLENDER_USER_RESOURCES = $tempRoot
     $env:BLENDER_USER_CONFIG = $config
     $env:BLENDER_USER_SCRIPTS = $scripts
     $env:TEMP = $scratch
@@ -50,17 +54,35 @@ try {
     $env:BL_PLUGIN_MANAGER_MACHINE_CONFIG = Join-Path $tempRoot "machine.json"
     $env:BL_PLUGIN_MANAGER_LOCAL_STATE = Join-Path $tempRoot "local-state.json"
     $env:BL_PLUGIN_MANAGER_EXPECTED_TEST_ROOT = $tempRoot
-    $script = Join-Path $repo "_test\test_regressions.py"
+    $testFile = @{
+        regressions = "test_regressions.py"
+        store = "test_store.py"
+        ui = "test_ui_smoke.py"
+    }[$Suite]
+    $script = Join-Path (Join-Path $repo "_test") $testFile
     $proc = Start-Process -FilePath $BlenderExe -ArgumentList @(
-        "--background", "--factory-startup", "--python-exit-code", "1", "--python", $script
+        "--background", "--factory-startup", "--offline-mode", "--python-exit-code", "1", "--python", ('"{0}"' -f $script)
     ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError ($log + ".err")
 
     Get-Content -LiteralPath $log, ($log + ".err") -ErrorAction SilentlyContinue |
-        Select-String -Pattern '^\[PASS\]|^\[FAIL\]|===REGRESSION SUMMARY===|^\{|Traceback|^  File |^[A-Za-z]*Error' |
+        Select-String -Pattern '^\[PASS\]|^\[FAIL\]|^===|^\{|Traceback|^  File |^[A-Za-z]*Error' |
         ForEach-Object { $_.Line }
 
     if ($proc.ExitCode -ne 0) {
         throw "Blender regression process failed with exit code $($proc.ExitCode)."
+    }
+    if ($Suite -eq "store") {
+        if (-not (Select-String -LiteralPath $log -Pattern '^===STORE_INTEGRATION_OK===$')) {
+            throw "Store integration suite did not emit its success marker."
+        }
+        return
+    }
+    if ($Suite -eq "ui") {
+        $uiResult = @(Select-String -LiteralPath $log -Pattern '^\{"errors"' | ForEach-Object { $_.Line })
+        if (-not $uiResult -or ($uiResult[-1] | ConvertFrom-Json).errors.Count -ne 0) {
+            throw "UI smoke suite failed or did not emit its summary."
+        }
+        return
     }
     $summaryLines = @(Select-String -LiteralPath $log -Pattern '^\{"total"' | ForEach-Object { $_.Line })
     if ($summaryLines.Count -eq 0) {
@@ -74,6 +96,7 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if ($null -eq $oldResources) { Remove-Item Env:BLENDER_USER_RESOURCES -ErrorAction SilentlyContinue } else { $env:BLENDER_USER_RESOURCES = $oldResources }
     if ($null -eq $oldConfig) {
         Remove-Item Env:BLENDER_USER_CONFIG -ErrorAction SilentlyContinue
     } else {

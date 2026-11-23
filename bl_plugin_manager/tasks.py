@@ -19,18 +19,23 @@ class TaskController:
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
 
-    def start(self, job: Callable, *args, **kwargs) -> None:
-        if self._thread and self._thread.is_alive():
+    def start(self, job: Callable, *args, discard=None, **kwargs) -> None:
+        if self.running:
             raise RuntimeError("task already running")
         self.state = "running"
         self.result = None
         self.error = ""
+        self.progress = 0.0
         self._cancel.clear()
 
         def run():
             try:
-                self.result = job(*args, **kwargs)
-                self.state = "cancelling" if self._cancel.is_set() else "succeeded"
+                result = job(*args, **kwargs)
+                self.result = result
+                if self._cancel.is_set() and discard:
+                    discard(result)
+                    self.result = None
+                self.state = "cancelled" if self._cancel.is_set() else "succeeded"
             except Exception as exc:
                 self.error = str(exc)
                 self.state = "failed"
@@ -50,4 +55,8 @@ class TaskController:
     @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
 
