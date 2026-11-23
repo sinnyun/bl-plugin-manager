@@ -98,13 +98,12 @@ class SelfUpdateTests(unittest.TestCase):
 
             def locked_stage_rename(src, dst):
                 if ".bl_plugin_manager-stage-" in str(src):
-                    err = PermissionError(13, "Access is denied", str(src), 5, str(dst))
+                    err = PermissionError("Access is denied")
                     err.winerror = 5
                     raise err
                 return real_rename(src, dst)
 
-            with patch.object(mod.os, "name", "nt"), \
-                 patch.object(mod, "_WIN_RETRY_DELAYS", (0.0, 0.0)), \
+            with patch.object(mod, "_WIN_RETRY_DELAYS", (0.0, 0.0)), \
                  patch.object(mod.os, "rename", side_effect=locked_stage_rename):
                 mod.stage_update(installed, archive, offer, (5, 2, 4))
 

@@ -21,20 +21,19 @@ _WIN_LOCK_ERRORS = frozenset({5, 32})
 
 
 def _is_windows_lock_error(exc: OSError) -> bool:
-    return os.name == "nt" and getattr(exc, "winerror", None) in _WIN_LOCK_ERRORS
+    return getattr(exc, "winerror", None) in _WIN_LOCK_ERRORS
 
 
 def _move_with_retry(src: Path, dst: Path, *, use_replace: bool = False) -> None:
     op = os.replace if use_replace else os.rename
-    delays = _WIN_RETRY_DELAYS if os.name == "nt" else ()
-    for attempt in range(len(delays) + 1):
+    for attempt in range(len(_WIN_RETRY_DELAYS) + 1):
         try:
             op(src, dst)
             return
         except PermissionError as exc:
-            if not _is_windows_lock_error(exc) or attempt >= len(delays):
+            if not _is_windows_lock_error(exc) or attempt >= len(_WIN_RETRY_DELAYS):
                 raise
-            time.sleep(delays[attempt])
+            time.sleep(_WIN_RETRY_DELAYS[attempt])
 
 
 def _stage_to_pending(package: Path, pending: Path) -> None:
