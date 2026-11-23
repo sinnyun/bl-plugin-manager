@@ -23,7 +23,7 @@ def _bridge():
 
 
 def _identity() -> tuple[str, str, dict]:
-    local = machine_config.load()
+    local = machine_config.initialize()
     return local["device_id"], local["device_name"], local
 
 
@@ -211,7 +211,7 @@ def activate_library(root: str, *, resume: bool = False) -> dict:
     from . import library
 
     root = os.path.abspath(root)
-    previous = machine_config.load()
+    previous = machine_config.initialize()
     previous_root = previous.get("library_path")
     is_switch = bool(previous.get("management_enabled") and previous_root
                      and os.path.normcase(os.path.abspath(previous_root)) != os.path.normcase(root))

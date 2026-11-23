@@ -23,7 +23,7 @@ class ScopedManagementTests(unittest.TestCase):
                 "library_path": root, "management_enabled": False,
             }
             machine_api = types.SimpleNamespace(
-                load=lambda: dict(machine),
+                initialize=lambda: dict(machine),
                 save=lambda changes: machine.update(changes),
             )
             state = {"addons/a": True, "addons/b": False}
@@ -75,7 +75,7 @@ class ScopedManagementTests(unittest.TestCase):
             store = mod.DeviceProfileStore(root)
             store.save("device-a", "工作站", {"addons/missing", "addons/a"},
                        repositories=[], script_directories=[])
-            mod.machine_config = types.SimpleNamespace(load=lambda: {
+            mod.machine_config = types.SimpleNamespace(initialize=lambda: {
                 "device_id": "device-a", "device_name": "工作站",
                 "library_path": root, "management_enabled": True,
             })

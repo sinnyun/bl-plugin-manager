@@ -111,7 +111,7 @@ def _on_device_name_update(self, context):
     try:
         from .storage import machine_config
         from .storage.device_profiles import DeviceProfileStore
-        local = machine_config.load()
+        local = machine_config.initialize()
         machine_config.save({"device_name": self.device_name.strip()})
         root = local.get("library_path")
         if root and os.path.isdir(root):
@@ -227,11 +227,9 @@ class PMAddonPreferences(AddonPreferences):
         # --- 设备与库 ---
         col = layout.column()
         col.prop(self, "device_name")
-        try:
-            from .storage import machine_config
-            col.label(text=f"设备 ID: {machine_config.load()['device_id'][:12]}")
-        except Exception:
-            pass
+        from .storage import machine_config
+        device_id = machine_config.load()["device_id"]
+        col.label(text=f"设备 ID: {device_id[:12]}" if device_id else "设备 ID 暂不可用")
         if self.library_path:
             col.label(text=self.library_path, icon="FILE_FOLDER")
         col.operator("plugin_manager.pick_library_path", text="选择插件库…", icon="FILEBROWSER")

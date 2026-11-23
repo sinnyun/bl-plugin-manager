@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 3, 1),
+    "version": (2, 3, 2),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -92,7 +92,7 @@ else:
         if prefs:
             try:
                 from .storage import machine_config
-                local = machine_config.load()
+                local = machine_config.initialize()
                 path = local.get("library_path")
                 preferences._LOADING_MACHINE_PATH = True
                 try:
@@ -102,7 +102,7 @@ else:
                 finally:
                     preferences._LOADING_MACHINE_PATH = False
             except Exception as exc:
-                print("[插件库] 读取本机插件库路径失败:", exc)
+                print("[插件库] 初始化本机配置失败:", exc)
         if not prefs or not local or not local.get("management_enabled"):
             return
         if not os.path.isdir(prefs.library_path):
