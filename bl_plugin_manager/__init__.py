@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 5, 4),
+    "version": (2, 5, 5),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -16,6 +16,7 @@ bl_info = {
 }
 
 import importlib
+import inspect
 import os
 
 _PM_WAS_IMPORTED = "bpy" in globals()
@@ -72,29 +73,68 @@ else:
 
     _modules = (preferences, operators, ui)
     _registered = []
+    _LAST_SYNC_SNAPSHOT = None
+
+
+    def _current_sync_snapshot(root: str):
+        """Pure in-memory snapshot of Blender's enabled addons & managed scopes (zero disk/network I/O)."""
+        return (
+            root,
+            frozenset(bridge.enabled_modules()),
+            bridge.capture_scoped_configuration(),
+        )
+
+
+    def _is_blender_exit_or_reload() -> bool:
+        """Return True when unregister() is triggered by Blender shutdown or script reload.
+
+        Exiting Blender calls ``addon_utils.disable_all()`` (from ``_on_exit``),
+        which must NOT deactivate library management or wipe ``management_enabled``.
+        Explicitly disabling this add-on in Preferences calls ``addon_utils.disable()``
+        directly (outside ``disable_all``) and still cleanly deactivates & unmounts.
+        """
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back if frame else None
+            while frame is not None:
+                code = frame.f_code
+                fname = (code.co_filename or "").replace("\\", "/")
+                if code.co_name in {"disable_all", "reset_all"} and fname.endswith("addon_utils.py"):
+                    return True
+                if code.co_name == "_on_exit":
+                    return True
+                frame = frame.f_back
+            return False
+        finally:
+            del frame
 
 
     def _sync_manager_state():
-        """Mirror native-panel changes into the active device profile."""
+        """Mirror native-panel changes into the active device profile (idle = zero network I/O)."""
+        global _LAST_SYNC_SNAPSHOT
         if library_jobs.running():
             return 2.0
         try:
             from .storage import machine_config
             local = machine_config.load()
             root = local.get("library_path")
-            if (local.get("management_enabled") and root and bridge.managed_library_root() == root
-                    and os.path.isdir(root)):
-                scoped_management.sync_to_profile(root)
-                prefs = bridge.get_prefs()
-                if prefs is not None:
-                    items.maybe_rebuild(prefs)
+            if local.get("management_enabled") and root and bridge.managed_library_root() == root:
+                snap = _current_sync_snapshot(root)
+                if snap == _LAST_SYNC_SNAPSHOT:
+                    return 2.0
+                if os.path.isdir(root):
+                    scoped_management.sync_to_profile(root)
+                    _LAST_SYNC_SNAPSHOT = _current_sync_snapshot(root)
+                    prefs = bridge.get_prefs()
+                    if prefs is not None:
+                        items.maybe_rebuild(prefs)
         except Exception as exc:
             print("[插件库] 同步原生配置失败:", exc)
         return 2.0
 
 
-    def _bootstrap_prefs():
-        """Load machine-local identity and resume only an explicitly active library."""
+    def _load_local_prefs():
+        """Fast local-only preference hydration (<1ms, reads only local SSD machine.json)."""
         prefs = bridge.get_prefs()
         local = None
         if prefs:
@@ -112,12 +152,27 @@ else:
                     preferences._LOADING_MACHINE_PATH = False
             except Exception as exc:
                 print("[插件库] 初始化本机配置失败:", exc)
+        return prefs, local
+
+
+    def _bootstrap_prefs():
+        """Load machine-local identity and resume only an explicitly active library."""
+        prefs, local = _load_local_prefs()
         if not prefs or not local or not local.get("management_enabled"):
             return
         try:
             library_jobs.start(prefs, prefs.library_path, mode="resume")
         except Exception as exc:
             print("[插件库] 初始化库失败:", exc)
+
+
+    def _deferred_startup():
+        """Deferred post-boot hook: resumes the library in background after Blender opens."""
+        try:
+            _bootstrap_prefs()
+        except Exception as exc:
+            print("[插件库] 延迟恢复插件库失败:", exc)
+        return None
 
 
     def _apply_launch_sync():
@@ -147,12 +202,15 @@ else:
 
 
     def register():
+        global _LAST_SYNC_SNAPSHOT
+        _LAST_SYNC_SNAPSHOT = None
         try:
             for mod in _modules:
                 for cls in getattr(mod, "classes", ()):
                     bpy.utils.register_class(cls)
                     _registered.append(cls)
-            _bootstrap_prefs()
+            # 仅在注册阶段读取本机轻量配置并挂载零 I/O 的原生中文名钩子（<1ms），不阻塞启动
+            _load_local_prefs()
             try:
                 native_names.install()
             except Exception as exc:
@@ -169,27 +227,31 @@ else:
                     pass
             _registered.clear()
             raise
-        # 同步原生偏好设置变化（2 秒轮询，不再另启延迟覆盖自启的冲突计时器）
+        # 延迟到 Blender 启动完成后再挂载原生中文名与后台恢复插件库，避免拖慢程序启动
+        for fn in (_deferred_startup, _sync_manager_state):
+            try:
+                bpy.app.timers.unregister(fn)
+            except Exception:
+                pass
         try:
-            bpy.app.timers.unregister(_sync_manager_state)
+            bpy.app.timers.register(_deferred_startup, first_interval=0.25)
         except Exception:
-            pass
+            # 无计时器环境（极简测试上下文）降级为立即挂载
+            _deferred_startup()
         try:
-            bpy.app.timers.register(_sync_manager_state, first_interval=2.0, persistent=True)
+            bpy.app.timers.register(_sync_manager_state, first_interval=3.0, persistent=True)
         except Exception:
             pass
         print(f"[插件库] 已启用 v{C.ADDON_VERSION_STR}（投放区为手动扫描）")
 
 
     def unregister():
-        try:
-            bpy.app.timers.unregister(_sync_manager_state)
-        except Exception:
-            pass
-        try:
-            bpy.app.timers.unregister(_apply_launch_sync)
-        except Exception:
-            pass
+        global _LAST_SYNC_SNAPSHOT
+        for fn in (_deferred_startup, _sync_manager_state, _apply_launch_sync):
+            try:
+                bpy.app.timers.unregister(fn)
+            except Exception:
+                pass
         try:
             native_names.uninstall()
         except Exception as exc:
@@ -209,11 +271,19 @@ else:
             local = machine_config.load()
             root = local.get("library_path")
             if local.get("management_enabled") and root:
-                result = scoped_management.deactivate(root)
-                if result["state"] == "ERROR":
-                    print("[插件库] 停用时存在失败:", result["failures"])
+                if _is_blender_exit_or_reload():
+                    # Blender 正常退出或重载脚本：保留管理状态，仅同步有变化的启用意图
+                    if bridge.managed_library_root() == root and os.path.isdir(root):
+                        if _current_sync_snapshot(root) != _LAST_SYNC_SNAPSHOT:
+                            scoped_management.sync_to_profile(root)
+                else:
+                    # 用户在偏好设置中显式停用本插件：完整撤销接管并恢复默认
+                    result = scoped_management.deactivate(root)
+                    if result["state"] == "ERROR":
+                        print("[插件库] 停用时存在失败:", result["failures"])
         except Exception as exc:
-            print("[插件库] 撤销插件库挂载失败:", exc)
+            print("[插件库] 退出/停用处理失败:", exc)
+        _LAST_SYNC_SNAPSHOT = None
         for cls in reversed(_registered):
             try:
                 bpy.utils.unregister_class(cls)

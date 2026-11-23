@@ -155,6 +155,27 @@ def unify_store_with_library(root: str) -> dict:
     return out
 
 
+_STATE_CACHE: dict = {}
+_DIR_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+_DIR_EXISTS_TTL = 3.0
+
+
+def dir_exists_cached(root: str, *, force: bool = False) -> bool:
+    """Check ``os.path.isdir(root)`` with short TTL caching to avoid UI stalls on network drives."""
+    if not root:
+        return False
+    import time
+
+    now = time.monotonic()
+    if not force:
+        hit = _DIR_EXISTS_CACHE.get(root)
+        if hit is not None and (now - hit[0]) < _DIR_EXISTS_TTL:
+            return hit[1]
+    exists = os.path.isdir(root)
+    _DIR_EXISTS_CACHE[root] = (now, exists)
+    return exists
+
+
 def library_state(root: str, force: bool = False) -> dict:
     """库的挂载状态。
 
@@ -163,15 +184,11 @@ def library_state(root: str, force: bool = False) -> dict:
     * official  ：指向库 extensions 的是否正是「官方商店」仓库（这样官方面板
                   与本插件共用同一目录，下载/更新都进库管理）。
 
-    面板 draw 会频繁调用，故结果按「脚本目录数 + 仓库数」做廉价缓存。
+    面板 draw 会频繁调用，故结果按「脚本目录数 + 仓库数」与目录存在 TTL 做廉价缓存。
     """
     if not root:
         return {"script_dir": False, "repo": False, "official": False}
-    # A stale Blender preference can still contain our old script/repository
-    # entries after a synced drive is disconnected or a library is moved.
-    # Treat that state as offline instead of presenting a false "connected"
-    # status in the manager UI.
-    if not os.path.isdir(root):
+    if not dir_exists_cached(root, force=force):
         return {"script_dir": False, "repo": False, "official": False}
 
     try:
@@ -204,11 +221,9 @@ def library_state(root: str, force: bool = False) -> dict:
     return state
 
 
-_STATE_CACHE: dict = {}
-
-
 def invalidate_state_cache() -> None:
     _STATE_CACHE.clear()
+    _DIR_EXISTS_CACHE.clear()
 
 
 def is_registered(root: str) -> bool:
@@ -248,6 +263,13 @@ def capture_scoped_configuration() -> dict:
 
 def apply_scoped_configuration(config: dict) -> None:
     """Replace only repositories and custom script directories from a profile."""
+    if capture_scoped_configuration() == {
+        "repositories": [dict(r) for r in config.get("repositories", [])],
+        "script_directories": [dict(s) for s in config.get("script_directories", [])],
+    }:
+        invalidate_state_cache()
+        return
+
     repos = bpy.context.preferences.extensions.repos
     for repo in list(repos):
         if getattr(repo, "module", "") not in C.BUILTIN_REPO_MODULES:

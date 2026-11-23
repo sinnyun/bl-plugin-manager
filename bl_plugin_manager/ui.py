@@ -660,7 +660,7 @@ class PM_PT_main(Panel):
             return False
         row = layout.row(align=True)
         name = os.path.basename(root.rstrip("\\/")) or root
-        if not os.path.isdir(root):
+        if not bridge.dir_exists_cached(root):
             row.label(text="插件库离线", icon="ERROR")
             row.operator("plugin_manager.setup_library", text="重连")
             row.operator("plugin_manager.pick_library_path", text="更换…")

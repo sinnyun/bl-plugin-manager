@@ -9,10 +9,31 @@ from . import constants as C, native_names, scan
 from .db import LibraryDB
 from .services import groups as group_service, presets as preset_service
 
-# 轻量节流：避免 N 面板高频重绘时反复读取库文件
-_LAST = {"t": 0.0, "sig": None}
+# 轻量节流：避免 N 面板高频重绘时反复在网络盘上 stat 库文件
+_LAST = {"t": 0.0, "sig": None, "ui_sig": None}
+_STAT_INTERVAL = 2.5
 _local_state = ("", "")
 _database_status = ("", "MISSING")
+
+
+def _ui_signature(prefs):
+    """纯内存 UI 筛选与会话状态签名（零磁盘/网络 I/O）。"""
+    return (
+        prefs.library_path,
+        prefs.active_category,
+        getattr(prefs, "active_preset_filter", ""),
+        getattr(prefs, "kind_filter", "all"),
+        getattr(prefs, "enabled_filter", "enabled" if prefs.only_enabled else "all"),
+        getattr(prefs, "startup_filter", "all"),
+        getattr(prefs, "issue_filter", "only" if prefs.only_incompatible else "all"),
+        prefs.only_favorites,
+        prefs.only_updates,
+        prefs.only_enabled,
+        prefs.only_incompatible,
+        prefs.search,
+        preset_service._PENDING_PROMPT_KEY,
+        tuple(sorted(preset_service.TEMP_KEYS)),
+    )
 
 
 def _signature(prefs):
@@ -29,35 +50,26 @@ def _signature(prefs):
                 db_sigs.append((st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size))
             except OSError:
                 db_sigs.append(None)
-    return (
-        prefs.library_path,
-        prefs.active_category,
-        getattr(prefs, "active_preset_filter", ""),
-        getattr(prefs, "kind_filter", "all"),
-        getattr(prefs, "enabled_filter", "enabled" if prefs.only_enabled else "all"),
-        getattr(prefs, "startup_filter", "all"),
-        getattr(prefs, "issue_filter", "only" if prefs.only_incompatible else "all"),
-        prefs.only_favorites,
-        prefs.only_updates,
-        prefs.only_enabled,
-        prefs.only_incompatible,
-        prefs.search,
-        preset_service._PENDING_PROMPT_KEY,
-        tuple(sorted(preset_service.TEMP_KEYS)),
-        tuple(db_sigs),
-    )
+    return (*_ui_signature(prefs), tuple(db_sigs))
 
 
 def maybe_rebuild(prefs, force: bool = False) -> None:
-    """在 draw 中调用：只有筛选条件或数据库文件签名变化才重建。"""
+    """在 draw 中调用：UI 筛选变化立即刷新，网络盘文件签名检查按 2.5 秒节流。"""
     if getattr(prefs, "library_job_running", False):
         return
-    sig = _signature(prefs)
     now = time.time()
-    if not force and sig == _LAST["sig"]:
+    ui_sig = _ui_signature(prefs)
+    if (not force
+            and _LAST.get("ui_sig") == ui_sig
+            and _LAST.get("sig") is not None
+            and (now - _LAST.get("t", 0.0)) < _STAT_INTERVAL):
+        return
+    sig = _signature(prefs)
+    _LAST["t"] = now
+    _LAST["ui_sig"] = ui_sig
+    if not force and sig == _LAST.get("sig"):
         return
     _LAST["sig"] = sig
-    _LAST["t"] = now
     rebuild_items(prefs)
 
 
@@ -241,6 +253,8 @@ def rebuild_items(prefs) -> list[str]:
             prefs.manual_prompt_name = ""
     native_names.invalidate_cache()
     _LAST["sig"] = _signature(prefs)
+    _LAST["ui_sig"] = _ui_signature(prefs)
+    _LAST["t"] = time.time()
     return keys
 
 

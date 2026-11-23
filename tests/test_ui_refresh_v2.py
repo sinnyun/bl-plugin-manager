@@ -38,6 +38,22 @@ class UIRefreshTests(unittest.TestCase):
                 mod.maybe_rebuild(prefs)
                 self.assertEqual(rebuild.call_count, 1)
 
+    def test_native_names_ttl_cache_avoids_repeated_network_stats(self):
+        native = importlib.import_module("bl_plugin_manager.native_names")
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / ".pm").mkdir()
+            (Path(root) / ".pm" / "catalog.json").write_text("{}", encoding="utf-8")
+            native.invalidate_cache()
+            native._CACHE["sig"] = (root, (1, 2), "", None)
+            native._CACHE["checked_at"] = 100.0
+            native._CACHE["by_module"] = {"demo": "示例"}
+            native._CACHE["by_pkg_id"] = {}
+            with patch.object(native.time, "monotonic", return_value=101.0), \
+                 patch.object(native.os.path, "isdir", side_effect=AssertionError("should not stat within TTL")):
+                by_mod, _ = native._load_alias_maps(root)
+            self.assertEqual(by_mod, {"demo": "示例"})
+            native.invalidate_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

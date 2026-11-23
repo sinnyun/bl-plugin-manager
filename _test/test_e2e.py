@@ -409,7 +409,18 @@ r = setup_library()
 check("explicit re-enable restores device configuration",
       r == {"FINISHED"} and PM.bridge.is_registered(lib))
 
-# 禁用管理器必须恢复默认；重新加载管理器本身不能隐式接管。
+# 正常退出 Blender（addon_utils.disable_all）必须保留 management_enabled，下次启动可自动恢复。
+PM.__addon_enabled__ = True
+import addon_utils as _au
+from bl_plugin_manager.storage import machine_config as _mc_exit
+_au.disable_all()
+check("blender exit via disable_all preserves management_enabled",
+      _mc_exit.load().get("management_enabled") is True,
+      str(_mc_exit.load()))
+PM.register()
+prefs = bpy.context.preferences.addons[PM.constants.ADDON_ID].preferences
+
+# 显式禁用管理器必须恢复默认；重新加载管理器本身不能隐式接管。
 PM.unregister()
 check("addon disable unmounts managed library", not PM.bridge.is_registered(lib),
       str(PM.bridge.library_state(lib)))

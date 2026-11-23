@@ -56,11 +56,24 @@ def _read(path: Path) -> dict:
     return result
 
 
+_LOAD_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
 def load() -> dict:
-    """Read the saved configuration, with empty identity on unavailable storage."""
+    """Read the saved configuration with cheap stat caching; empty identity if unavailable."""
+    path = config_path()
+    key = str(path)
     try:
-        return _read(config_path())
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = _LOAD_CACHE.get(key)
+        if hit and hit[0] == sig:
+            return dict(hit[1])
+        data = _read(path)
+        _LOAD_CACHE[key] = (sig, dict(data))
+        return data
     except (OSError, ValueError):
+        _LOAD_CACHE.pop(key, None)
         return _defaults()
 
 
@@ -83,7 +96,9 @@ def save(data: dict) -> None:
     current = initialize()
     current.update({key: data[key] for key in _SETTINGS if key in data})
     _validate(current)
-    _write(config_path(), current)
+    path = config_path()
+    _write(path, current)
+    _LOAD_CACHE.pop(str(path), None)
 
 
 def _write(path: Path, current: dict, *, create: bool = False) -> None:

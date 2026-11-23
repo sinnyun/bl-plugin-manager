@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 STYLE_ORIG_CN = "orig_cn"   # "Original Name (中文名)" — default
 STYLE_CN_ORIG = "cn_orig"   # "中文名 (Original Name)"
@@ -53,9 +54,11 @@ def format_native_name(original: str, alias: str, style: str = STYLE_ORIG_CN) ->
 # ---------------------------------------------------------------------------
 _CACHE = {
     "sig": None,
+    "checked_at": 0.0,
     "by_module": {},
     "by_pkg_id": {},
 }
+_STAT_TTL = 3.0
 
 _HOOK_STATE = {
     "installed": False,
@@ -70,6 +73,7 @@ _HOOK_STATE = {
 
 def invalidate_cache() -> None:
     _CACHE["sig"] = None
+    _CACHE["checked_at"] = 0.0
     _CACHE["by_module"] = {}
     _CACHE["by_pkg_id"] = {}
 
@@ -85,8 +89,20 @@ def _stat_sig(path: str):
 
 
 def _load_alias_maps(library_path: str) -> tuple[dict[str, str], dict[str, str]]:
-    """Build ``(module -> alias, pkg_id -> alias)`` maps with cheap stat caching."""
-    if not library_path or not os.path.isdir(library_path):
+    """Build ``(module -> alias, pkg_id -> alias)`` maps with TTL + stat caching.
+
+    Avoids hitting network-drive ``os.stat`` on every UI redraw when scrolling
+    Blender's Preferences → Add-ons or Get Extensions panels.
+    """
+    if not library_path:
+        return {}, {}
+    now = time.monotonic()
+    prev_sig = _CACHE["sig"]
+    if prev_sig and prev_sig[0] == library_path and (now - _CACHE["checked_at"]) < _STAT_TTL:
+        return _CACHE["by_module"], _CACHE["by_pkg_id"]
+
+    if not os.path.isdir(library_path):
+        _CACHE["checked_at"] = now
         return {}, {}
     from . import constants as C
     from .db import LibraryDB
@@ -94,13 +110,14 @@ def _load_alias_maps(library_path: str) -> tuple[dict[str, str], dict[str, str]]
     cat_path = os.path.join(library_path, C.DIR_META, C.DB_FILENAME)
     cat_sig = _stat_sig(cat_path)
     if cat_sig is None:
+        _CACHE["checked_at"] = now
         return {}, {}
 
     # Check if we already cached this library+catalog+local-state revision.
-    prev_sig = _CACHE["sig"]
     if prev_sig and prev_sig[0] == library_path and prev_sig[1] == cat_sig:
         state_path = prev_sig[2]
         if _stat_sig(state_path) == prev_sig[3]:
+            _CACHE["checked_at"] = now
             return _CACHE["by_module"], _CACHE["by_pkg_id"]
 
     db = LibraryDB(library_path)
@@ -124,6 +141,7 @@ def _load_alias_maps(library_path: str) -> tuple[dict[str, str], dict[str, str]]
             by_module[folder] = alias
 
     _CACHE["sig"] = (library_path, cat_sig, state_path, _stat_sig(state_path))
+    _CACHE["checked_at"] = now
     _CACHE["by_module"] = by_module
     _CACHE["by_pkg_id"] = by_pkg_id
     return by_module, by_pkg_id
@@ -246,13 +264,16 @@ def _find_bl_extension_ui():
 
 
 def install() -> dict:
-    """Attach reversible runtime display wrappers to Blender's Add-ons & Get Extensions UI."""
+    """Attach reversible runtime display wrappers to Blender's Add-ons & Get Extensions UI.
+
+    Performs zero disk or network I/O during installation so Blender startup stays fast.
+    """
     if _HOOK_STATE["installed"]:
-        return status()
+        return status(compute_count=False)
     mod = _find_bl_extension_ui()
     if mod is None:
         _HOOK_STATE["error"] = "未检测到 bl_pkg 扩展界面模块"
-        return status()
+        return status(compute_count=False)
 
     _HOOK_STATE["bl_extension_ui"] = mod
     _HOOK_STATE["error"] = ""
@@ -324,7 +345,7 @@ def install() -> dict:
         _HOOK_STATE["extensions_hooked"] = True
 
     _HOOK_STATE["installed"] = bool(_HOOK_STATE["addons_hooked"] or _HOOK_STATE["extensions_hooked"])
-    return status()
+    return status(compute_count=False)
 
 
 def uninstall() -> None:
@@ -353,10 +374,10 @@ def uninstall() -> None:
     invalidate_cache()
 
 
-def status() -> dict:
+def status(*, compute_count: bool = True) -> dict:
     enabled, style, root = _active_settings()
     mapped = 0
-    if enabled and root:
+    if compute_count and enabled and root:
         try:
             by_module, by_pkg_id = _load_alias_maps(root)
             mapped = len(set(by_module) | set(by_pkg_id))
