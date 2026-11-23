@@ -7,12 +7,53 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+_WIN_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.35, 0.5)
+_WIN_LOCK_ERRORS = frozenset({5, 32})
+
+
+def _is_windows_lock_error(exc: OSError) -> bool:
+    return os.name == "nt" and getattr(exc, "winerror", None) in _WIN_LOCK_ERRORS
+
+
+def _move_with_retry(src: Path, dst: Path, *, use_replace: bool = False) -> None:
+    op = os.replace if use_replace else os.rename
+    delays = _WIN_RETRY_DELAYS if os.name == "nt" else ()
+    for attempt in range(len(delays) + 1):
+        try:
+            op(src, dst)
+            return
+        except PermissionError as exc:
+            if not _is_windows_lock_error(exc) or attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+
+
+def _stage_to_pending(package: Path, pending: Path) -> None:
+    """Move verified package directory to ``pending``, surviving Windows AV/indexer locks."""
+    try:
+        _move_with_retry(package, pending, use_replace=False)
+        return
+    except PermissionError as exc:
+        if not _is_windows_lock_error(exc):
+            raise
+    # On Windows, AV/indexer read handles block directory rename (WinError 5/32)
+    # without blocking read-copy. Copy to a fresh sibling dir and publish atomically.
+    copy_dir = pending.with_name(f".{PACKAGE}-copy-{uuid.uuid4().hex[:8]}")
+    try:
+        shutil.copytree(package, copy_dir)
+        _move_with_retry(copy_dir, pending, use_replace=False)
+    except Exception:
+        shutil.rmtree(copy_dir, ignore_errors=True)
+        raise
 
 
 PACKAGE = "bl_plugin_manager"
@@ -130,7 +171,11 @@ def stage_update(installation: Path, archive: Path, release: Release, blender_ve
     pending = pending_path(installation)
     if pending.exists():
         raise ValueError("已有更新等待安装，请先重启 Blender")
-    with tempfile.TemporaryDirectory(prefix=f".{PACKAGE}-stage-", dir=installation.parent) as stage:
+    with tempfile.TemporaryDirectory(
+        prefix=f".{PACKAGE}-stage-",
+        dir=installation.parent,
+        ignore_cleanup_errors=True,
+    ) as stage:
         root = Path(stage)
         extract_archive(archive, root, max_total_bytes=MAX_ZIP_SIZE * 2)
         package = root / PACKAGE
@@ -141,7 +186,7 @@ def stage_update(installation: Path, archive: Path, release: Release, blender_ve
         for file in package.rglob("*.py"):
             compile(file.read_bytes(), str(file), "exec")
         if not (cancelled and cancelled()):
-            os.rename(package, pending)
+            _stage_to_pending(package, pending)
 
 
 def activate_pending(installation: Path, current: tuple, blender_version: tuple) -> Path | None:
@@ -151,22 +196,22 @@ def activate_pending(installation: Path, current: tuple, blender_version: tuple)
     if _package_version(pending, blender_version) <= current:
         return None
     backup = installation.with_name(f".{PACKAGE}-previous-{'-'.join(map(str, current))}-{uuid.uuid4().hex[:8]}")
-    os.replace(installation, backup)
+    _move_with_retry(installation, backup, use_replace=True)
     try:
-        os.replace(pending, installation)
+        _move_with_retry(pending, installation, use_replace=True)
     except OSError:
-        os.replace(backup, installation)
+        _move_with_retry(backup, installation, use_replace=True)
         raise
     return backup
 
 
 def restore_installation(installation: Path, backup: Path) -> None:
     failed = installation.with_name(f".{PACKAGE}-failed-{uuid.uuid4().hex[:8]}")
-    os.replace(installation, failed)
+    _move_with_retry(installation, failed, use_replace=True)
     try:
-        os.replace(backup, installation)
+        _move_with_retry(backup, installation, use_replace=True)
     except OSError:
-        os.replace(failed, installation)
+        _move_with_retry(failed, installation, use_replace=True)
         raise
 
 

@@ -75,3 +75,39 @@ class SelfUpdateTests(unittest.TestCase):
             self.assertEqual((old / "__init__.py").read_text(encoding="utf-8"), "old installation")
             self.assertIn("2, 4, 0", (installed / "__init__.py").read_text(encoding="utf-8"))
             self.assertIsNone(mod.activate_pending(installed, (2, 4, 0), (5, 2, 4)))
+
+    def test_stage_update_recovers_from_windows_winerror_5_rename_lock(self):
+        mod = updater()
+        with tempfile.TemporaryDirectory() as workspace:
+            parent = Path(workspace) / "addons"
+            installed = parent / "bl_plugin_manager"
+            installed.mkdir(parents=True)
+            (installed / "__init__.py").write_text("old installation", encoding="utf-8")
+            archive = Path(workspace) / "release.zip"
+            with zipfile.ZipFile(archive, "w") as package:
+                package.writestr("bl_plugin_manager/__init__.py",
+                                 'bl_info = {"version": (2, 4, 0), "blender": (4, 2, 0)}\n')
+                package.writestr("bl_plugin_manager/constants.py", 'ADDON_VERSION = (2, 4, 0)\n')
+            release = payload()
+            asset = release["assets"][0]
+            asset.update(size=archive.stat().st_size,
+                         digest="sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest())
+            offer = mod.release_offer(release, (2, 3, 1))
+
+            real_rename = mod.os.rename
+
+            def locked_stage_rename(src, dst):
+                if ".bl_plugin_manager-stage-" in str(src):
+                    err = PermissionError(13, "Access is denied", str(src), 5, str(dst))
+                    err.winerror = 5
+                    raise err
+                return real_rename(src, dst)
+
+            with patch.object(mod.os, "name", "nt"), \
+                 patch.object(mod, "_WIN_RETRY_DELAYS", (0.0, 0.0)), \
+                 patch.object(mod.os, "rename", side_effect=locked_stage_rename):
+                mod.stage_update(installed, archive, offer, (5, 2, 4))
+
+            pending = mod.pending_path(installed)
+            self.assertTrue(pending.is_dir())
+            self.assertIn("2, 4, 0", (pending / "__init__.py").read_text(encoding="utf-8"))
