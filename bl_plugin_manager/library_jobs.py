@@ -62,11 +62,19 @@ def start(prefs, root, *, mode="connect") -> None:
     except Exception:
         bpy.app.timers.unregister(_tick)
         raise
+    from . import constants as C
+    has_legacy = os.path.isfile(os.path.join(root, C.DIR_META, C.LEGACY_DB_FILENAME))
     _job = LibraryJob(root, paths, mode, worker)
     prefs.library_job_running = True
     prefs.library_job_failed = False
-    prefs.library_job_status = ("正在后台检查插件库…" if mode == "preview"
-                                else "正在后台读取插件库并迁移旧资料…")
+    if mode == "preview":
+        prefs.library_job_status = "正在后台检查插件库…"
+    elif has_legacy:
+        prefs.library_job_status = "正在后台迁移旧资料库并扫描插件…"
+    elif mode == "resume":
+        prefs.library_job_status = "正在后台增量校验插件库…"
+    else:
+        prefs.library_job_status = "正在后台增量扫描插件库…"
     _redraw()
 
 

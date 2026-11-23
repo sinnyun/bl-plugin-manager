@@ -387,16 +387,10 @@ def import_path(path: str, root: str, db: LibraryDB, move: bool = False,
 _LIB_SUBDIRS = (C.DIR_ADDONS, C.DIR_EXTENSIONS, C.DIR_INBOX, C.DIR_TRASH, C.DIR_META)
 
 
-def inspect_target(path: str) -> dict:
+def inspect_target(path: str, *, scan_flat: bool = True) -> dict:
     """检查目标目录的现状，决定后续动作（建空库 / 扫描 / 收编）。
 
-    返回：
-        exists          目录是否存在
-        is_plugin       目录本身就是一个插件
-        is_library      已含 addons/ 或 extensions/ 的插件库
-        addon_count     addons/ 下的插件数
-        extension_count extensions/ 下的插件数
-        flat_plugins    直接散落在根目录下的插件（文件夹或 zip）
+    ``scan_flat=False`` 用于已建库的启动恢复场景，跳过根目录散放文件与 ZIP 探测。
     """
     path = os.path.abspath(path) if path else ""
     info = {
@@ -411,6 +405,9 @@ def inspect_target(path: str) -> dict:
     info["is_plugin"] = scan.detect_kind(path) is not None
     info["is_library"] = any(os.path.isfile(os.path.join(path, C.DIR_META, name))
                              for name in (C.DB_FILENAME, C.LEGACY_DB_FILENAME))
+    if not scan_flat and info["is_library"] and not info["is_plugin"]:
+        return info
+
     try:
         info["is_empty"] = not any(True for _ in os.scandir(path))
     except OSError:
@@ -428,6 +425,9 @@ def inspect_target(path: str) -> dict:
         info["extension_count"] = sum(
             1 for e in os.scandir(ext_dir) if e.is_dir() and not scan.is_ignored(e.name)
         )
+
+    if not scan_flat:
+        return info
 
     # 根目录下直接散落的插件：转入 addons/ 或 extensions/
     try:
@@ -490,24 +490,87 @@ def connect_library(root: str, db: LibraryDB, move_flat: bool = True) -> dict:
     return result
 
 
-def scan_library_entries(root: str) -> list[dict]:
-    """Read plugin metadata from disk without consulting Blender."""
-    entries = []
+def _cached_entry_from_record(rel: str, kind: str, folder: str, rec: dict,
+                              fp: list) -> dict:
+    """Build a scan entry directly from cached metadata when file fingerprint is unchanged."""
+    return {
+        "rel": rel,
+        "kind": kind,
+        "pkg_id": rec.get("pkg_id") or rec.get("id") or "",
+        "id": rec.get("id") or rec.get("pkg_id") or "",
+        "name": rec.get("name") or folder,
+        "folder_name": folder,
+        "version": rec.get("version", ""),
+        "blender_min": rec.get("blender_min", ""),
+        "blender_max": rec.get("blender_max", ""),
+        "pkg_type": rec.get("pkg_type", ""),
+        "author": rec.get("author", ""),
+        "description": rec.get("description", ""),
+        "auto_category": rec.get("auto_category", "") or C.DEFAULT_CATEGORY,
+        "auto_tags": list(rec.get("auto_tags") or []),
+        "doc_url": rec.get("doc_url", ""),
+        "location": rec.get("location", ""),
+        "metadata_fingerprint": fp,
+        "issues": list(rec.get("issues") or []),
+        "_unchanged": True,
+    }
 
+
+def scan_library_entries(root: str, existing_db: LibraryDB | None = None,
+                         *, skip_unchanged: bool = True) -> list[dict]:
+    """Read plugin metadata from disk incrementally without consulting Blender.
+
+    When ``existing_db`` is supplied and ``skip_unchanged=True``, each plugin's
+    metadata file (``blender_manifest.toml`` / ``__init__.py``) is checked with a
+    single ``stat()`` fingerprint. Unchanged plugins reuse cached metadata with
+    zero file reads or AST/TOML parsing—dramatically faster on network drives.
+    """
+    cached_by_rel: dict[str, dict] = {}
+    if skip_unchanged and existing_db is not None:
+        for rec in existing_db.plugins.values():
+            rel = rec.get("rel") or ""
+            if rel and rec.get("kind") in (C.KIND_ADDON, C.KIND_EXTENSION):
+                cached_by_rel[rel] = rec
+
+    entries = []
     for kind, base in ((C.KIND_ADDON, os.path.join(root, C.DIR_ADDONS)),
                        (C.KIND_EXTENSION, os.path.join(root, C.DIR_EXTENSIONS))):
-        for entry in scan.scan_dir(base, kind_hint=kind):
-            if not entry["valid"]:
+        if not os.path.isdir(base):
+            continue
+        try:
+            subdirs = sorted(
+                (e for e in os.scandir(base) if e.is_dir() and not scan.is_ignored(e.name)),
+                key=lambda e: e.name.lower(),
+            )
+        except OSError:
+            continue
+        for sub in subdirs:
+            abs_dir = sub.path
+            folder = sub.name
+            key = rel_key(root, abs_dir)
+            fp = scan.metadata_fingerprint(abs_dir, kind)
+
+            # Fast incremental hit: metadata file mtime & size unchanged -> skip parsing!
+            prev = cached_by_rel.get(key)
+            if (prev is not None and fp and prev.get("kind") == kind
+                    and prev.get("metadata_fingerprint") == fp):
+                entries.append(_cached_entry_from_record(key, kind, folder, prev, fp))
                 continue
-            meta = entry["meta"] or {}
-            folder = os.path.basename(os.path.normpath(entry["abs"]))
-            key = rel_key(root, entry["abs"])
+
+            # Cache miss: new or modified plugin -> parse metadata once.
+            detected = scan.detect_kind(abs_dir)
+            if detected is None:
+                continue
+            if detected != kind:
+                fp = scan.metadata_fingerprint(abs_dir, detected)
+            meta = scan.read_meta(abs_dir, detected) or {}
+            issues = (scan.manifest_issues(abs_dir)
+                      if detected == C.KIND_EXTENSION else [])
             entries.append({
                 "rel": key,
-                "kind": kind,
+                "kind": detected,
                 "pkg_id": meta.get("id", ""),
                 "id": meta.get("id", ""),
-                # scan_dir 的 entry["name"] 是**目录名**；插件声明名在 meta 中。
                 "name": meta.get("name") or folder,
                 "folder_name": folder,
                 "version": meta.get("version", ""),
@@ -520,16 +583,15 @@ def scan_library_entries(root: str) -> list[dict]:
                 "auto_tags": meta.get("tags", []) or [],
                 "doc_url": meta.get("doc_url", ""),
                 "location": meta.get("location", ""),
-                "metadata_fingerprint": scan.metadata_fingerprint(entry["abs"], kind),
-                "issues": (scan.manifest_issues(entry["abs"])
-                           if kind == C.KIND_EXTENSION else []),
+                "metadata_fingerprint": fp,
+                "issues": issues,
             })
     return entries
 
 
 def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
-    """Scan installed plugins and link them to the catalog."""
-    entries = scan_library_entries(root)
+    """Scan installed plugins incrementally and link them to the catalog."""
+    entries = scan_library_entries(root, existing_db=db, skip_unchanged=skip_unchanged)
     db.merge_scan(entries)
     return apply_scan_runtime(root, db, entries)
 

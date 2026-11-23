@@ -179,6 +179,11 @@ powershell -ExecutionPolicy Bypass -File _test/run_regressions.ps1 -Suite ui
 
 详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-13-machine-local-library-path-design.md`、`docs/superpowers/specs/2026-09-18-master-catalog-design.md` 和 `docs/superpowers/specs/2026-09-15-compatibility-task-and-settings-design.md`。
 
+## 2.4.3 优化
+
+- 新增基于元数据文件指纹的增量扫描：启动恢复与刷新时仅解析新增或改动过的插件，跳过未变更插件的文件读取与 AST/TOML 解析（网络盘扫描显著提速）。
+- 启动恢复且已是插件库时跳过根目录散放文件探测，并修正后台状态文案：仅存在旧版 `library.json` 时才提示迁移旧资料库。
+
 ## 2.4.2 改进
 
 - 工作分组列表顶部新增固定默认行「全部插件」，点击整行即可在「全部插件」与任意工作分组间顺畅切换筛选且高亮同步。

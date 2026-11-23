@@ -528,10 +528,11 @@ class LibraryDB:
         self._bindings = result.bindings
         self.assignments = dict(result.assignment)
         missing = sum(1 for rec in self.data["plugins"].values() if rec.get("missing"))
+        unchanged = sum(1 for entry in entries if entry.get("_unchanged"))
         self.scan_stats = {
             "added": result.added,
-            "updated": result.matched,
-            "unchanged": 0,
+            "updated": max(0, result.matched - unchanged),
+            "unchanged": unchanged,
             "missing": missing,
             "renamed": result.renamed,
             "total": result.total,

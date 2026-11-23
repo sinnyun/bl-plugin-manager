@@ -227,7 +227,7 @@ def prepare_library(root: str, previous: dict, load_environment: str, *, resume:
     unavailable = not os.path.isdir(root)
     if unavailable and (resume or (previous.get("management_enabled") and not is_switch)):
         raise RuntimeError("插件库离线，请恢复目录后重连")
-    info = library.inspect_target(root)
+    info = library.inspect_target(root, scan_flat=not resume)
     if error := library.target_error(info):
         raise RuntimeError(error)
     database = LibraryDB(root, use_cache=False, load_environment=load_environment)
@@ -238,7 +238,9 @@ def prepare_library(root: str, previous: dict, load_environment: str, *, resume:
     if status != "OK":
         raise RuntimeError(f"插件库资料不可写（{status}），原文件已保留")
     needs_import = not resume and not info["is_library"] and bool(info["flat_plugins"])
-    entries = None if needs_import else library.scan_library_entries(root)
+    entries = None if needs_import else library.scan_library_entries(
+        root, existing_db=database, skip_unchanged=True,
+    )
     if entries is not None:
         database.merge_scan(entries, persist=False)
     return PreparedLibrary(root, previous, database, entries)
