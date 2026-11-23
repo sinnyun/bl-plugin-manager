@@ -179,6 +179,11 @@ powershell -ExecutionPolicy Bypass -File _test/run_regressions.ps1 -Suite ui
 
 详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-13-machine-local-library-path-design.md`、`docs/superpowers/specs/2026-09-18-master-catalog-design.md` 和 `docs/superpowers/specs/2026-09-15-compatibility-task-and-settings-design.md`。
 
+## 2.4.4 修复
+
+- 外部插件收编新增扫描 Blender 默认用户插件目录（`scripts/addons`）与默认本地扩展仓库（`user_default`），自动过滤更新残留备份目录（如 `*_backup_temp`）与管理器自身；收编默认移动并自动停用源模块，避免原位置重复显示。
+- 扫描/收编明细同步写入扫描报告并自动刷新列表；主面板底部拆分显示库内插件数、内置链接数与缺失数，计数更直观。
+
 ## 2.4.3 优化
 
 - 新增基于元数据文件指纹的增量扫描：启动恢复与刷新时仅解析新增或改动过的插件，跳过未变更插件的文件读取与 AST/TOML 解析（网络盘扫描显著提速）。

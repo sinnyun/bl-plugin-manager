@@ -2049,7 +2049,7 @@ class PM_OT_open_folder(Operator):
 class PM_OT_scan_candidates(_PMBase):
     bl_idname = "plugin_manager.scan_candidates"
     bl_label = "扫描现有插件"
-    bl_description = "扫描 Blender 现有脚本目录与本地扩展仓库，列出可收编的插件（自动检测内置冲突）"
+    bl_description = "扫描 Blender 默认用户插件目录、自定义脚本目录与本地扩展仓库（含 User Default）"
 
     def execute(self, context):
         prefs = _prefs(context)
@@ -2057,22 +2057,49 @@ class PM_OT_scan_candidates(_PMBase):
         if not prefs or not db:
             return _report(self, False, "插件库未就绪")
         cands = migrate.collect_candidates(prefs.library_path, db)
+        ready = [c for c in cands if not c.get("already") and not c.get("builtin_conflict")]
+        already = sum(1 for c in cands if c.get("already"))
         conflicts = sum(1 for c in cands if c.get("builtin_conflict"))
-        usable = len(cands) - conflicts
-        prefs.candidate_count = usable
-        tail = f"（另有 {conflicts} 个与 Blender 内置插件同名将自动跳过）" if conflicts else ""
-        return _report(self, True, f"发现 {usable} 个可收编插件{tail}")
+        prefs.candidate_count = len(ready)
+
+        # 写入扫描报告，方便用户逐条查看可收编项与跳过原因
+        prefs.report_items.clear()
+        for c in cands:
+            it = prefs.report_items.add()
+            it.name = c.get("name") or c.get("folder") or ""
+            it.path = c.get("path") or ""
+            it.kind = c.get("kind") or "-"
+            if c.get("builtin_conflict"):
+                it.status = "skipped"
+                it.detail = f"与 Blender 内置插件同名（{c.get('source', '')}）"
+            elif c.get("already"):
+                it.status = "skipped"
+                it.detail = f"库内已有同名插件（{c.get('source', '')}）"
+            else:
+                it.status = "imported"
+                it.detail = f"可收编 · {c.get('source', '')}"
+        summary = f"可收编 {len(ready)} 个"
+        if already:
+            summary += f"，库内已有 {already} 个"
+        if conflicts:
+            summary += f"，内置冲突 {conflicts} 个"
+        prefs.report_summary = summary
+        return _report(self, True, summary)
 
 
 class PM_OT_import_candidates(_PMBase):
     bl_idname = "plugin_manager.import_candidates"
     bl_label = "收编全部"
-    bl_description = "把扫描到的插件全部导入插件库（自动跳过与 Blender 内置同名的冲突插件）"
+    bl_description = "把扫描到的外部插件导入插件库（自动跳过库内已有项与内置冲突）"
 
-    move: BoolProperty(name="移动而非复制", default=False)
+    move: BoolProperty(
+        name="移动而非复制（避免原位置重复显示）",
+        description="推荐勾选：把外部插件移入插件库并清空原处副本，防止 Blender 列表里出现两个同名插件",
+        default=True,
+    )
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
+        return context.window_manager.invoke_props_dialog(self, width=380)
 
     def execute(self, context):
         prefs = _prefs(context)
@@ -2081,8 +2108,22 @@ class PM_OT_import_candidates(_PMBase):
             return _report(self, False, "插件库未就绪")
         cands = migrate.collect_candidates(prefs.library_path, db)
         stats = migrate.import_candidates(prefs.library_path, db, cands, move=self.move)
+        prefs.candidate_count = 0
+        prefs.report_items.clear()
+        for d in stats.get("details") or ():
+            it = prefs.report_items.add()
+            it.name = d.get("name", "")
+            it.path = d.get("path", "")
+            it.kind = d.get("kind", "-")
+            it.status = d.get("status", "skipped")
+            it.detail = d.get("detail", "")
+        from . import items
+        items.rebuild_items(prefs)
+        _redraw()
         extra = f"，内置冲突跳过 {stats['conflicts']} 个" if stats.get("conflicts") else ""
-        self.report({"INFO"}, f"收编 {stats['ok']} 个，跳过 {stats['skip']}，失败 {stats['fail']}{extra}")
+        msg = f"收编 {stats['ok']} 个，跳过 {stats['skip']}，失败 {stats['fail']}{extra}"
+        prefs.report_summary = msg
+        self.report({"INFO"}, msg)
         for err in stats["errors"][:5]:
             print("[插件库] 收编跳过/失败:", err)
         return {"FINISHED"}

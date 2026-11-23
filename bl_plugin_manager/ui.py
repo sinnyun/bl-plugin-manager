@@ -416,10 +416,14 @@ class PM_PT_main(Panel):
             )
             enabled_cnt = sum(1 for it in prefs.plugin_items if it.enabled)
             builtin_cnt = sum(1 for it in prefs.plugin_items if it.kind == C.KIND_BUILTIN)
+            missing_cnt = sum(1 for it in prefs.plugin_items if it.missing)
+            lib_cnt = len(prefs.plugin_items) - builtin_cnt - missing_cnt
             yes, no, _ = _support_counts(prefs)
-            summary = f"显示 {len(prefs.plugin_items)} · 已启 {enabled_cnt}"
+            summary = f"库内 {lib_cnt} · 已启 {enabled_cnt}"
             if builtin_cnt:
-                summary += f" · 内置 {builtin_cnt}"
+                summary += f" · 内置链接 {builtin_cnt}"
+            if missing_cnt:
+                summary += f" · 缺失 {missing_cnt}"
             if no:
                 summary += f" · 问题 {no}"
             elif yes:
