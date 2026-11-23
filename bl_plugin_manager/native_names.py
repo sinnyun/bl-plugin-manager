@@ -55,10 +55,12 @@ def format_native_name(original: str, alias: str, style: str = STYLE_ORIG_CN) ->
 _CACHE = {
     "sig": None,
     "checked_at": 0.0,
+    "epoch": 0,
     "by_module": {},
     "by_pkg_id": {},
 }
-_STAT_TTL = 3.0
+_PATCHED_MAP_CACHE: dict[tuple, dict] = {}
+_STAT_TTL = 30.0
 
 _HOOK_STATE = {
     "installed": False,
@@ -74,8 +76,49 @@ _HOOK_STATE = {
 def invalidate_cache() -> None:
     _CACHE["sig"] = None
     _CACHE["checked_at"] = 0.0
+    _CACHE["epoch"] += 1
     _CACHE["by_module"] = {}
     _CACHE["by_pkg_id"] = {}
+    _PATCHED_MAP_CACHE.clear()
+
+
+def _extract_alias_maps(db) -> tuple[dict[str, str], dict[str, str]]:
+    from . import constants as C
+
+    by_module: dict[str, str] = {}
+    by_pkg_id: dict[str, str] = {}
+    for rec in db.plugins.values():
+        alias = (rec.get("display_name") or "").strip()
+        if not alias:
+            continue
+        module = (rec.get("module") or "").strip()
+        if module:
+            by_module[module] = alias
+        pkg_id = (rec.get("pkg_id") or rec.get("id") or "").strip()
+        if pkg_id and rec.get("kind") == C.KIND_EXTENSION:
+            by_pkg_id[pkg_id] = alias
+        folder = (rec.get("folder_name") or "").strip()
+        if folder and rec.get("kind") in (C.KIND_ADDON, C.KIND_BUILTIN) and folder not in by_module:
+            by_module[folder] = alias
+    return by_module, by_pkg_id
+
+
+def warm_from_db(library_path: str, db) -> None:
+    """Pre-populate alias maps from an already-loaded LibraryDB (zero extra disk/network I/O)."""
+    if not library_path or db is None:
+        return
+    by_module, by_pkg_id = _extract_alias_maps(db)
+    library_id = str(db.data.get("library_id") or "")
+    state_path = str(db._state_store(library_id).path) if library_id else ""
+    now = time.monotonic()
+    changed = (by_module != _CACHE["by_module"] or by_pkg_id != _CACHE["by_pkg_id"])
+    _CACHE["sig"] = (library_path, None, state_path, None)
+    _CACHE["checked_at"] = now
+    _CACHE["by_module"] = by_module
+    _CACHE["by_pkg_id"] = by_pkg_id
+    if changed:
+        _CACHE["epoch"] += 1
+        _PATCHED_MAP_CACHE.clear()
 
 
 def _stat_sig(path: str):
@@ -123,43 +166,33 @@ def _load_alias_maps(library_path: str) -> tuple[dict[str, str], dict[str, str]]
     db = LibraryDB(library_path)
     library_id = str(db.data.get("library_id") or "")
     state_path = str(db._state_store(library_id).path) if library_id else ""
-    by_module: dict[str, str] = {}
-    by_pkg_id: dict[str, str] = {}
+    by_module, by_pkg_id = _extract_alias_maps(db)
 
-    for rec in db.plugins.values():
-        alias = (rec.get("display_name") or "").strip()
-        if not alias:
-            continue
-        module = (rec.get("module") or "").strip()
-        if module:
-            by_module[module] = alias
-        pkg_id = (rec.get("pkg_id") or rec.get("id") or "").strip()
-        if pkg_id and rec.get("kind") == C.KIND_EXTENSION:
-            by_pkg_id[pkg_id] = alias
-        folder = (rec.get("folder_name") or "").strip()
-        if folder and rec.get("kind") in (C.KIND_ADDON, C.KIND_BUILTIN) and folder not in by_module:
-            by_module[folder] = alias
-
+    changed = (by_module != _CACHE["by_module"] or by_pkg_id != _CACHE["by_pkg_id"])
     _CACHE["sig"] = (library_path, cat_sig, state_path, _stat_sig(state_path))
     _CACHE["checked_at"] = now
     _CACHE["by_module"] = by_module
     _CACHE["by_pkg_id"] = by_pkg_id
+    if changed:
+        _CACHE["epoch"] += 1
+        _PATCHED_MAP_CACHE.clear()
     return by_module, by_pkg_id
 
 
-def _active_settings() -> tuple[bool, str, str]:
-    """Return ``(enabled, style, library_path)`` from current add-on preferences."""
+def _active_settings() -> tuple[bool, bool, str, str]:
+    """Return ``(enabled, extensions_enabled, style, library_path)`` from preferences."""
     try:
         from . import bridge
         prefs = bridge.get_prefs()
     except Exception:
         prefs = None
     if prefs is None:
-        return False, STYLE_ORIG_CN, ""
+        return False, False, STYLE_ORIG_CN, ""
     enabled = bool(getattr(prefs, "native_display_names", True))
+    ext_enabled = enabled and bool(getattr(prefs, "native_display_names_extensions", True))
     style = str(getattr(prefs, "native_name_style", STYLE_ORIG_CN) or STYLE_ORIG_CN)
     root = str(getattr(prefs, "library_path", "") or "")
-    return enabled, style, root
+    return enabled, ext_enabled, style, root
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +315,7 @@ def install() -> dict:
     orig_addons = getattr(mod, "addons_panel_draw_items", None)
     if callable(orig_addons) and not getattr(orig_addons, "_pm_native_name_wrapped", False):
         def _wrapped_addons_draw_items(*args, **kwargs):
-            enabled, style, root = _active_settings()
+            enabled, _ext_enabled, style, root = _active_settings()
             if not enabled or not root:
                 return orig_addons(*args, **kwargs)
             restores: list[tuple[dict, str]] = []
@@ -290,10 +323,17 @@ def install() -> dict:
                 by_module, by_pkg_id = _load_alias_maps(root)
                 if by_module or by_pkg_id:
                     if "addon_extension_manifest_map" in kwargs:
+                        src_map = kwargs["addon_extension_manifest_map"]
+                        cache_key = ("addons", id(src_map), len(src_map) if isinstance(src_map, dict) else 0,
+                                     _CACHE["epoch"], style)
+                        cached = _PATCHED_MAP_CACHE.get(cache_key)
+                        if cached is None:
+                            cached = patch_extension_manifest_map(src_map, by_module, by_pkg_id, style)
+                            if len(_PATCHED_MAP_CACHE) > 24:
+                                _PATCHED_MAP_CACHE.clear()
+                            _PATCHED_MAP_CACHE[cache_key] = cached
                         kwargs = dict(kwargs)
-                        kwargs["addon_extension_manifest_map"] = patch_extension_manifest_map(
-                            kwargs["addon_extension_manifest_map"], by_module, by_pkg_id, style,
-                        )
+                        kwargs["addon_extension_manifest_map"] = cached
                     addon_modules = kwargs.get("addon_modules")
                     if addon_modules is not None:
                         import addon_utils
@@ -318,23 +358,31 @@ def install() -> dict:
         _HOOK_STATE["orig_addons_draw_items"] = orig_addons
         _HOOK_STATE["addons_hooked"] = True
 
-    # 2) Hook Preferences -> Get Extensions visible item stream (covers search + rendering)
+    # 2) Hook Preferences -> Get Extensions visible item stream (O(1) memoized per redraw)
     filter_cls = getattr(mod, "ExtensionUI_FilterParams", None)
     orig_visible = getattr(filter_cls, "extension_ui_visible", None) if filter_cls is not None else None
     prefix_fn = getattr(mod, "pkg_repo_module_prefix", None)
     if (filter_cls is not None and callable(orig_visible) and callable(prefix_fn)
             and not getattr(orig_visible, "_pm_native_name_wrapped", False)):
         def _wrapped_extension_ui_visible(self_params, repo_index, pkg_manifest_local, pkg_manifest_remote):
-            enabled, style, root = _active_settings()
-            if enabled and root and isinstance(pkg_manifest_local, dict) and pkg_manifest_local:
+            _enabled, ext_enabled, style, root = _active_settings()
+            if ext_enabled and root and isinstance(pkg_manifest_local, dict) and pkg_manifest_local:
                 try:
                     by_module, by_pkg_id = _load_alias_maps(root)
                     if by_module or by_pkg_id:
                         repos = getattr(self_params, "repos_all", ())
                         repo_prefix = prefix_fn(repos[repo_index]) if 0 <= repo_index < len(repos) else ""
-                        pkg_manifest_local = patch_local_manifest_dict(
-                            pkg_manifest_local, repo_prefix, by_module, by_pkg_id, style,
-                        )
+                        cache_key = ("ext", id(pkg_manifest_local), len(pkg_manifest_local),
+                                     _CACHE["epoch"], repo_prefix, style)
+                        cached = _PATCHED_MAP_CACHE.get(cache_key)
+                        if cached is None:
+                            cached = patch_local_manifest_dict(
+                                pkg_manifest_local, repo_prefix, by_module, by_pkg_id, style,
+                            )
+                            if len(_PATCHED_MAP_CACHE) > 24:
+                                _PATCHED_MAP_CACHE.clear()
+                            _PATCHED_MAP_CACHE[cache_key] = cached
+                        pkg_manifest_local = cached
                 except Exception:
                     pass
             return orig_visible(self_params, repo_index, pkg_manifest_local, pkg_manifest_remote)
@@ -375,7 +423,7 @@ def uninstall() -> None:
 
 
 def status(*, compute_count: bool = True) -> dict:
-    enabled, style, root = _active_settings()
+    enabled, ext_enabled, style, root = _active_settings()
     mapped = 0
     if compute_count and enabled and root:
         try:
@@ -386,7 +434,7 @@ def status(*, compute_count: bool = True) -> dict:
     return {
         "installed": bool(_HOOK_STATE["installed"]),
         "addons_hooked": bool(_HOOK_STATE["addons_hooked"]),
-        "extensions_hooked": bool(_HOOK_STATE["extensions_hooked"]),
+        "extensions_hooked": bool(_HOOK_STATE["extensions_hooked"] and ext_enabled),
         "enabled": enabled,
         "style": style,
         "mapped_count": mapped,

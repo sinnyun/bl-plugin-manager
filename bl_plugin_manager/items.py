@@ -251,7 +251,7 @@ def rebuild_items(prefs) -> list[str]:
         else:
             prefs.manual_prompt_key = ""
             prefs.manual_prompt_name = ""
-    native_names.invalidate_cache()
+    native_names.warm_from_db(prefs.library_path, db)
     _LAST["sig"] = _signature(prefs)
     _LAST["ui_sig"] = _ui_signature(prefs)
     _LAST["t"] = time.time()

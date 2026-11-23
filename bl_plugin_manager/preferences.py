@@ -394,6 +394,12 @@ class PMAddonPreferences(AddonPreferences):
         default=True,
         update=_on_native_names_update,
     )
+    native_display_names_extensions: BoolProperty(
+        name="在「获取扩展」界面也显示中文别名",
+        description="仅对已安装扩展生效；若远程扩展列表极长可按需关闭以完全保持原生渲染",
+        default=True,
+        update=_on_native_names_update,
+    )
     native_name_style: EnumProperty(
         name="原生名称格式",
         items=native_names.STYLE_ITEMS,
@@ -514,6 +520,9 @@ class PMAddonPreferences(AddonPreferences):
         box = layout.box()
         box.label(text="2. 显示、内置插件与启动策略", icon="PREFERENCES")
         box.prop(self, "native_display_names")
+        row = box.row()
+        row.enabled = self.native_display_names
+        row.prop(self, "native_display_names_extensions")
         row = box.row()
         row.enabled = self.native_display_names
         row.prop(self, "native_name_style")

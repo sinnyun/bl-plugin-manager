@@ -2041,6 +2041,9 @@ class PM_OT_store_sync(_PMBase):
         return _report(self, True, f"商店目录已刷新，共 {n} 个扩展")
 
 
+_STORE_SEARCH_CACHE: dict = {}
+
+
 class PM_OT_store_open(_PMBase):
     bl_idname = "plugin_manager.store_open"
     bl_label = "打开在线商店"
@@ -2050,6 +2053,7 @@ class PM_OT_store_open(_PMBase):
         prefs = _prefs(context)
         if not prefs or not prefs.library_path:
             return _report(self, False, "请先设置插件库")
+        _STORE_SEARCH_CACHE.clear()
         return context.window_manager.invoke_props_dialog(self, width=720)
 
     def execute(self, context):
@@ -2058,7 +2062,6 @@ class PM_OT_store_open(_PMBase):
     def draw(self, context):
         layout = self.layout
         prefs = _prefs(context)
-        db = LibraryDB(prefs.library_path)
 
         catalog = _catalog_cache()
         if not catalog:
@@ -2072,9 +2075,18 @@ class PM_OT_store_open(_PMBase):
         row.prop(prefs, "store_only_compatible", text="仅兼容", toggle=True)
         row.operator("plugin_manager.store_sync", text="", icon="FILE_REFRESH")
 
-        results = store.search(catalog, db, prefs.store_search,
-                               only_compatible=prefs.store_only_compatible,
-                               only_new=prefs.store_only_new)
+        cache_key = (
+            id(catalog), len(catalog), prefs.library_path,
+            prefs.store_search, prefs.store_only_compatible, prefs.store_only_new,
+        )
+        results = _STORE_SEARCH_CACHE.get(cache_key)
+        if results is None:
+            db = LibraryDB(prefs.library_path)
+            results = store.search(catalog, db, prefs.store_search,
+                                   only_compatible=prefs.store_only_compatible,
+                                   only_new=prefs.store_only_new)
+            _STORE_SEARCH_CACHE.clear()
+            _STORE_SEARCH_CACHE[cache_key] = results
         page_size = 12
         pages = max(1, (len(results) + page_size - 1) // page_size)
         page = min(prefs.store_page, pages)

@@ -97,6 +97,27 @@ class NativeNamesTests(unittest.TestCase):
         mod.restore_legacy_bl_info(restores)
         self.assertEqual(fake_mod.bl_info["name"], "Node Wrangler")
 
+    def test_warm_from_db_populates_cache_and_memoizes_without_disk_io(self):
+        mod = _load_native()
+        mod.invalidate_cache()
+        fake_db = types.SimpleNamespace(
+            data={"library_id": "lib-1"},
+            plugins={
+                "ext:bool_tool": {
+                    "kind": "extension",
+                    "pkg_id": "bool_tool",
+                    "module": "bl_ext.blender_org.bool_tool",
+                    "display_name": "布尔工具",
+                },
+            },
+            _state_store=lambda lid: types.SimpleNamespace(path=""),
+        )
+        mod.warm_from_db("/fake/net/lib", fake_db)
+        by_m, by_p = mod._load_alias_maps("/fake/net/lib")
+        self.assertEqual(by_m["bl_ext.blender_org.bool_tool"], "布尔工具")
+        self.assertEqual(by_p["bool_tool"], "布尔工具")
+        mod.invalidate_cache()
+
 
 if __name__ == "__main__":
     unittest.main()
