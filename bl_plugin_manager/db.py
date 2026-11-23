@@ -270,7 +270,12 @@ class LibraryDB:
             "categories": [dict(item) for item in self.catalog.categories],
             "plugins": plugins,
         }
-        self._baseline = deepcopy(self._split())
+        _split_shared, split_bindings, split_runtime, split_groups = self._split()
+        raw_shared = {
+            "plugins": deepcopy(self.catalog.plugins),
+            "categories": {item["id"]: dict(item) for item in self.catalog.categories},
+        }
+        self._baseline = (raw_shared, deepcopy(split_bindings), deepcopy(split_runtime), deepcopy(split_groups))
 
     def _load_local(self, library_id: str) -> tuple[dict, dict, dict]:
         state = self._state_store(library_id).load()
@@ -390,6 +395,10 @@ class LibraryDB:
                 record["category"] = cur_groups[0] if cur_groups else C.DEFAULT_CATEGORY
 
             portable = {field: record[field] for field in PORTABLE_FIELDS if field in record}
+            # Avoid churning catalog.json with synthetic empty defaults that were absent on disk.
+            for field, default_val in _USER_DEFAULTS.items():
+                if field in portable and field not in old_rec and portable[field] == default_val:
+                    portable.pop(field, None)
             portable["plugin_id"] = plugin_id
             catalog_plugins[plugin_id] = portable
             rel = record.get("rel")

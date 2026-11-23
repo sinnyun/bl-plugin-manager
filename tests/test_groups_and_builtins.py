@@ -202,6 +202,48 @@ class GroupEngineTests(unittest.TestCase):
             self.assertEqual(reopened.get("builtin:node_wrangler")["display_name"], "节点管理")
             self.assertEqual(reopened.plugin_groups("builtin:node_wrangler"), ["材质"])
 
+    def test_editing_legacy_v23_catalog_without_groups_field_does_not_conflict(self):
+        """Regression: v2.3.x catalog records lack 'groups'; editing them must not false-conflict."""
+        db_mod = _load("bl_plugin_manager.db")
+        with tempfile.TemporaryDirectory() as root:
+            pm = Path(root) / ".pm"
+            pm.mkdir(parents=True)
+            # Write a v2.3.2-style catalog.json (no 'groups' key on plugin record)
+            (pm / "catalog.json").write_text(json.dumps({
+                "schema": 1,
+                "library_id": "lib-v23",
+                "revision": 4,
+                "categories": [{"id": "uncategorized", "name": "未分类", "order": 0}],
+                "plugins": {
+                    "addon:demo": {
+                        "plugin_id": "addon:demo",
+                        "kind": "addon",
+                        "name": "Demo Addon",
+                        "category": "未分类",
+                    },
+                },
+            }, ensure_ascii=False), encoding="utf-8")
+            # Seed local binding for addon:demo
+            state_dir = Path(self._state.name) / "lib-v23"
+            state_dir.mkdir(parents=True)
+            (state_dir / "test-groups.json").write_text(json.dumps({
+                "schema": 2,
+                "bindings": {"addon:demo": "addons/Demo"},
+                "plugins": {"addon:demo": {"module": "Demo"}},
+            }), encoding="utf-8")
+
+            db = db_mod.LibraryDB(root, use_cache=False)
+            self.assertEqual(db.status, "OK")
+            db.ensure_category("动画与运镜")
+            db.get("addon:demo")["display_name"] = "演示插件"
+            db.set_plugin_groups("addon:demo", ["动画与运镜"])
+            # Must save cleanly without raising CatalogConflictError!
+            db.save()
+
+            reopened = db_mod.LibraryDB(root, use_cache=False)
+            self.assertEqual(reopened.get("addon:demo")["display_name"], "演示插件")
+            self.assertEqual(reopened.plugin_groups("addon:demo"), ["动画与运镜"])
+
 
 if __name__ == "__main__":
     unittest.main()
