@@ -1010,22 +1010,49 @@ class PM_OT_disable_pack(_PMBase):
 # ---------------------------------------------------------------------------
 # 工作方案 / 预设（精选插件一键启停，与分类筛选完全解耦）
 # ---------------------------------------------------------------------------
+_ENUM_ITEMS_CACHE: dict[str, list[tuple[str, str, str]]] = {}
+_ENUM_STRING_HOLD: set[str] = set()
+
+
+def _cache_enum_items(slot: str, entries: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """Keep strong Python references to dynamic EnumProperty strings and lists.
+
+    Blender's C EnumProperty callback stores raw ``char*`` pointers to returned
+    Python strings without incrementing refcounts; returning temporary lists or
+    freshly formatted f-strings causes garbage-collected memory to show as
+    garbled text (乱码) in UI dropdowns.
+    """
+    prev = _ENUM_ITEMS_CACHE.get(slot)
+    if prev == entries:
+        return prev
+    held: list[tuple[str, str, str]] = []
+    for item in entries:
+        ident, label, desc = str(item[0]), str(item[1]), str(item[2])
+        _ENUM_STRING_HOLD.add(ident)
+        _ENUM_STRING_HOLD.add(label)
+        _ENUM_STRING_HOLD.add(desc)
+        held.append((ident, label, desc))
+    _ENUM_ITEMS_CACHE[slot] = held
+    return held
+
+
 def _preset_enum(self, context):
     from . import items as _items
 
     _items.refresh_cache(bridge.get_prefs())
     opts = _items.preset_options()
-    return [(p, p, "") for p in opts] or [("__NONE__", "（暂无预设，可在下方输入新名称）", "")]
+    entries = [(p, p, "") for p in opts] or [("__NONE__", "（暂无预设，可在下方输入新名称）", "")]
+    return _cache_enum_items("preset", entries)
 
 
 def _seed_category_enum(self, context):
     from . import items as _items
 
     _items.refresh_cache(bridge.get_prefs())
-    opts = [("", "不导入（创建空白预设）", "")]
+    opts = [("__NONE__", "不导入（创建空白预设）", "创建一个空白工作预设")]
     for name in _items.group_options():
-        opts.append((name, f"从分类「{name}」导入成员", ""))
-    return opts
+        opts.append((name, f"从分类「{name}」导入成员", f"导入分类「{name}」下的插件"))
+    return _cache_enum_items("seed_category", opts)
 
 
 class PM_OT_preset_add(_PMBase):
@@ -1053,7 +1080,7 @@ class PM_OT_preset_add(_PMBase):
         if not clean:
             return _report(self, False, "请输入预设名称")
         members: list[str] = []
-        if self.from_category:
+        if self.from_category and self.from_category != "__NONE__":
             members = [key for key in db.plugins if self.from_category in db.plugin_groups(key)]
         if self.add_plugin_key and self.add_plugin_key not in members and db.get(self.add_plugin_key):
             members.append(self.add_plugin_key)
@@ -1471,7 +1498,8 @@ def _group_enum(self, context):
 
     _items.refresh_cache(bridge.get_prefs())
     opts = _items.group_options()
-    return [(g, g, "") for g in opts] or [(C.DEFAULT_CATEGORY, "（暂无分组，请先新建）", "")]
+    entries = [(g, g, "") for g in opts] or [(C.DEFAULT_CATEGORY, "（暂无分类，请先新建）", "")]
+    return _cache_enum_items("group", entries)
 
 
 class PM_OT_batch_add_group(_PMBase):
@@ -1812,14 +1840,13 @@ class PM_OT_remove(_PMBase):
         return _report(self, True, f"已移除 {name}{tail}")
 
 
-_TRASH_CHOICES = []
-
-
 def _trash_choices(self, context):
     prefs = _prefs(context)
     entries = library.trash_entries(prefs.library_path) if prefs and prefs.library_path else {}
-    _TRASH_CHOICES[:] = [(key, item.get("name") or key, item["rel"]) for key, item in entries.items()]
-    return _TRASH_CHOICES
+    return _cache_enum_items(
+        "trash",
+        [(key, item.get("name") or key, item["rel"]) for key, item in entries.items()],
+    )
 
 
 class PM_OT_restore_plugin(_PMBase):
@@ -1844,17 +1871,16 @@ class PM_OT_restore_plugin(_PMBase):
         return _report(self, True, f"已恢复 {library.effective_name(restored)} 到原目录")
 
 
-_RELINK_CHOICES = []
-
-
 def _relink_choices(self, context):
     prefs, db = _prefs(context), _db(context)
     records = db.relink_options(self.key or prefs.selected_key) if db else {}
-    _RELINK_CHOICES[:] = [
-        (key, library.effective_name(record), f"{record.get('author', '')} · {key}")
-        for key, record in records.items()
-    ]
-    return _RELINK_CHOICES
+    return _cache_enum_items(
+        "relink",
+        [
+            (key, library.effective_name(record), f"{record.get('author', '')} · {key}")
+            for key, record in records.items()
+        ],
+    )
 
 
 class PM_OT_relink_addon(_PMBase):
@@ -2190,11 +2216,11 @@ class PM_OT_set_category(Operator):
 
 
 def _category_enum(self, context):
-    """分组下拉的候选项：从库文件刷新后取自模块缓存，不依赖 context。"""
+    """分类下拉的候选项：从库文件刷新后持久缓存字符串引用，防止 Blender 枚举显示乱码。"""
     from . import items as _items
 
     _items.refresh_cache(bridge.get_prefs())
-    return [(c, c, "") for c in _items.category_options()]
+    return _cache_enum_items("category", [(c, c, "") for c in _items.category_options()])
 
 
 class PM_OT_assign_category(Operator):
