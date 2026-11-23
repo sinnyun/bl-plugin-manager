@@ -49,6 +49,9 @@ def plugin_id_for(kind: str, pkg_id: str = "", name: str = "", folder: str = "")
     if kind == "extension":
         base = pkg_id or name or folder
         prefix = "ext"
+    elif kind == "builtin":
+        base = folder or name
+        prefix = "builtin"
     else:
         base = name or folder
         prefix = "addon"
@@ -279,7 +282,7 @@ def _allocate_id(base: str, plugins: dict) -> str:
 # 旧版 library.json 中可继承到总资料库的便携字段。旧文件以库内相对路径为键，
 # 这里把它转换成 plugin_id 键并记下 rel 作为本机绑定与匹配线索。
 _LEGACY_USER_FIELDS = (
-    "display_name", "category", "category_id", "tags", "note",
+    "display_name", "category", "category_id", "groups", "tags", "note",
     "favorite", "startup", "created_at", "updated_at",
 )
 _LEGACY_META_FIELDS = (

@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from unittest.mock import patch
 
 import addon_utils
 import bpy
@@ -59,6 +60,31 @@ def run():
     prefs = bpy.context.preferences.addons["bl_plugin_manager"].preferences
     prefs.library_path = lib
     bpy.ops.plugin_manager.setup_library()
+    from bl_plugin_manager import items, library_jobs
+    from bl_plugin_manager.preferences import PMAddonPreferences
+
+    class PrefShim:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    shim = PrefShim(prefs)
+    shim.layout = MockLayout("prefs_preparing")
+    pending = MockLayout("sidebar_preparing")
+    with patch.object(items, "maybe_rebuild", side_effect=AssertionError("read during connection")), \
+         patch.object(pm_ui.bridge, "library_state", side_effect=AssertionError("read during connection")):
+        PMAddonPreferences.draw(shim, bpy.context)
+        pm_ui.PM_PT_main.draw(type("S", (), {"layout": pending})(), bpy.context)
+    for layout in (shim.layout, pending):
+        if not any(name == "label" and kwargs.get("text") == prefs.library_job_status
+                   for name, _args, kwargs in layout.calls):
+            ERRORS.append(f"{layout.path}: 缺少后台连接状态")
+
+    library_jobs._job.worker.join(timeout=10)
+    assert library_jobs._tick() is None and not prefs.library_job_failed, prefs.library_job_status
+    bpy.app.timers.unregister(library_jobs._tick)
 
     # 造两个插件，让面板有内容
     for name, body in (
@@ -98,31 +124,41 @@ def run():
     pm_ui.PM_MT_library.draw(type("S", (), {"layout": mock})(), bpy.context)
     print(f"[UI] 库菜单 draw: {len(mock.calls)} 次布局调用")
 
-    # 3) 列表行 draw
+    # 3) 列表行 & 子面板 & 分组菜单 draw
     class RowMock(MockLayout):
         def __init__(self):
             super().__init__("row")
             self.layout_type = "DEFAULT"
 
+    # 创建一个测试分组，覆盖 PM_UL_groups 与 PM_MT_plugin_groups
+    bpy.ops.plugin_manager.add_category(name="烟雾测试组")
     if len(prefs.plugin_items):
-        row = RowMock()
-        item = prefs.plugin_items[0]
-        pm_ui.PM_UL_plugins.draw_item(row, bpy.context, row, prefs, item, None, prefs, "active_index", 0, 0)
+        bpy.ops.plugin_manager.plugin_toggle_group(key=prefs.plugin_items[0].key, group="烟雾测试组")
+    items.rebuild_items(prefs)
+
+    if len(prefs.group_items):
+        grow = RowMock()
+        pm_ui.PM_UL_groups.draw_item(grow, bpy.context, grow, prefs, prefs.group_items[0], None, prefs, "active_group_index", 0, 0)
+        print(f"[UI] 分组列表行 draw: {len(grow.calls)} 次布局调用")
+
+    if len(prefs.plugin_items):
+        for bmode in (False, True):
+            prefs.batch_mode = bmode
+            row = RowMock()
+            item = prefs.plugin_items[0]
+            pm_ui.PM_UL_plugins.draw_item(row, bpy.context, row, prefs, item, None, prefs, "active_index", 0, 0)
+        prefs.batch_mode = False
         print(f"[UI] 列表行 draw: {len(row.calls)} 次布局调用")
 
+    for panel_cls in (pm_ui.PM_PT_detail, pm_ui.PM_PT_batch, pm_ui.PM_PT_actions):
+        pmock = MockLayout(panel_cls.bl_idname)
+        panel_cls.draw(type("S", (), {"layout": pmock})(), bpy.context)
+    for menu_cls in (pm_ui.PM_MT_category, pm_ui.PM_MT_plugin_groups, pm_ui.PM_MT_plugin):
+        mmock = MockLayout(menu_cls.bl_idname)
+        menu_cls.draw(type("S", (), {"layout": mmock})(), bpy.context)
+
     # 4) 偏好设置 draw（AddonPreferences.draw 使用 self.layout）
-    class PrefShim:
-        """把未显式提供的属性转发到真实偏好，便于直接调用 draw。"""
-
-        def __init__(self, real):
-            object.__setattr__(self, "_real", real)
-
-        def __getattr__(self, name):
-            return getattr(object.__getattribute__(self, "_real"), name)
-
-    shim = PrefShim(prefs)
     shim.layout = MockLayout("prefs")
-    from bl_plugin_manager.preferences import PMAddonPreferences
 
     del OP_CALLS[:]
     PMAddonPreferences.draw(shim, bpy.context)

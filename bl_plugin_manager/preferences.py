@@ -7,20 +7,21 @@ import os
 import bpy
 from bpy.props import (
     BoolProperty,
-    FloatProperty,
     CollectionProperty,
+    EnumProperty,
+    FloatProperty,
     IntProperty,
     StringProperty,
 )
-from bpy.types import AddonPreferences, Operator, PropertyGroup
+from bpy.types import AddonPreferences, PropertyGroup
 
-from . import bridge, constants as C
+from . import bridge, constants as C, native_names
 
 _LOADING_MACHINE_PATH = False
 
 
 # ---------------------------------------------------------------------------
-# 列表项 / 分类项
+# 列表项 / 分组项 / 报告项
 # ---------------------------------------------------------------------------
 class PM_PluginItem(PropertyGroup):
     key: StringProperty(default="")
@@ -32,18 +33,19 @@ class PM_PluginItem(PropertyGroup):
     latest_version: StringProperty(default="")
     blender_min: StringProperty(default="")
     blender_max: StringProperty(default="")
-    compat: StringProperty(default="")        # ok / too_old / too_new / unknown
+    compat: StringProperty(default="")            # ok / too_old / too_new / unknown
     max_version_text: StringProperty(default="")  # 最高支持版本（实时计算）
-    supported: StringProperty(default="")     # yes / no / unknown（仅真实实测后才为 yes）
-    residue: IntProperty(default=0)           # 注册残留数量
-    compat_text: StringProperty(default="")   # 支持版本范围文案（实时计算）
-    compat_detail: StringProperty(default="") # 不兼容时的具体说明
-    load_state: StringProperty(default="")    # 实测结果: ok / failed / ""(未测)
+    supported: StringProperty(default="")         # yes / no / unknown（仅真实实测后才为 yes）
+    residue: IntProperty(default=0)               # 注册残留数量
+    compat_text: StringProperty(default="")       # 支持版本范围文案（实时计算）
+    compat_detail: StringProperty(default="")     # 不兼容时的具体说明
+    load_state: StringProperty(default="")        # 实测结果: ok / failed / ""(未测)
     load_error: StringProperty(default="")
     author: StringProperty(default="")
     module: StringProperty(default="")
     note: StringProperty(default="")
     category: StringProperty(default="")
+    groups_text: StringProperty(default="")       # 所属分组摘要
     enabled: BoolProperty(default=False)
     update_available: BoolProperty(default=False)
     missing: BoolProperty(default=False)
@@ -56,6 +58,17 @@ class PM_PluginItem(PropertyGroup):
 
 class PM_CategoryItem(PropertyGroup):
     name: StringProperty(default="")
+
+
+class PM_GroupItem(PropertyGroup):
+    """工作分组列表项（支持多组叠加开关、常驻、自启与计数）。"""
+
+    name: StringProperty(default="")
+    active: BoolProperty(default=False)
+    startup: BoolProperty(default=False)
+    pinned: BoolProperty(default=False)
+    total: IntProperty(default=0)
+    enabled: IntProperty(default=0)
 
 
 class PM_ReportItem(PropertyGroup):
@@ -84,6 +97,36 @@ def _on_filter_update(self, context):
     items.maybe_rebuild(self, force=True)
 
 
+def _on_native_names_update(self, context):
+    native_names.invalidate_cache()
+    try:
+        if self.native_display_names:
+            native_names.install()
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _on_builtin_toggle_update(self, context):
+    if _LOADING_MACHINE_PATH or not self.library_path or self.library_job_running:
+        return
+    try:
+        from .db import LibraryDB
+        from . import items, library
+
+        if os.path.isdir(self.library_path):
+            db = LibraryDB(self.library_path)
+            if db.status == "OK":
+                library.sync_builtins(self.library_path, db,
+                                      enabled=bool(self.manage_builtin_addons), persist=True)
+                items.rebuild_items(self)
+                native_names.invalidate_cache()
+    except Exception as exc:
+        print("[插件库] 切换内置插件链接状态失败:", exc)
+
+
 def _on_library_path_update(self, context):
     """Persist only the machine-local path; activation owns scanning/mounting."""
     if _LOADING_MACHINE_PATH:
@@ -101,6 +144,7 @@ def _on_library_path_update(self, context):
                              "management_enabled": False if changed else local.get("management_enabled", False)})
     except Exception as exc:
         print("[插件库] 保存本机插件库路径失败:", exc)
+    native_names.invalidate_cache()
     from . import items
     items.maybe_rebuild(self, force=True)
 
@@ -129,6 +173,14 @@ def _on_device_name_update(self, context):
 # ---------------------------------------------------------------------------
 # 插件偏好
 # ---------------------------------------------------------------------------
+_KIND_FILTER_ITEMS = (
+    ("all", "全部来源", "显示库内扩展、传统插件与已链接的 Blender 内置插件"),
+    (C.KIND_EXTENSION, "扩展插件", "仅显示库内扩展插件"),
+    (C.KIND_ADDON, "传统插件", "仅显示库内传统插件"),
+    (C.KIND_BUILTIN, "内置插件", "仅显示虚拟链接管理的 Blender 自带基础插件"),
+)
+
+
 class PMAddonPreferences(AddonPreferences):
     bl_idname = C.ADDON_ID
 
@@ -143,6 +195,9 @@ class PMAddonPreferences(AddonPreferences):
     pending_library_path: StringProperty(name="待连接插件库", subtype="DIR_PATH",
                                          options={"SKIP_SAVE"})
     library_preview: StringProperty(options={"SKIP_SAVE"})
+    library_job_running: BoolProperty(options={"SKIP_SAVE"})
+    library_job_failed: BoolProperty(options={"SKIP_SAVE"})
+    library_job_status: StringProperty(options={"SKIP_SAVE"})
     self_update_busy: BoolProperty(options={"SKIP_SAVE"})
     self_update_status: StringProperty(options={"SKIP_SAVE"})
     device_name: StringProperty(
@@ -152,10 +207,23 @@ class PMAddonPreferences(AddonPreferences):
         options={"SKIP_SAVE"},
         update=_on_device_name_update,
     )
-    # 界面状态
+
+    # 界面状态与筛选
     selected_key: StringProperty(default="")
     active_index: IntProperty(default=0, update=_on_index_update)
+    active_group_index: IntProperty(default=0)
     active_category: StringProperty(default="全部", update=_on_filter_update)
+    kind_filter: EnumProperty(
+        name="来源",
+        items=_KIND_FILTER_ITEMS,
+        default="all",
+        update=_on_filter_update,
+    )
+    batch_mode: BoolProperty(
+        name="批量选择",
+        description="在列表中显示批量勾选框",
+        default=False,
+    )
     only_favorites: BoolProperty(default=False, update=_on_filter_update)
     only_updates: BoolProperty(default=False, update=_on_filter_update)
     only_enabled: BoolProperty(default=False, update=_on_filter_update)
@@ -165,6 +233,26 @@ class PMAddonPreferences(AddonPreferences):
         default=False, update=_on_filter_update)
     search: StringProperty(default="", update=_on_filter_update)
     candidate_count: IntProperty(default=0)
+
+    # 原生界面名称覆写 & 内置插件链接
+    native_display_names: BoolProperty(
+        name="在 Blender 原生界面显示中文别名",
+        description="运行时在「偏好设置 → 插件」和「获取扩展」显示中文别名，不修改任何插件源码",
+        default=True,
+        update=_on_native_names_update,
+    )
+    native_name_style: EnumProperty(
+        name="原生名称格式",
+        items=native_names.STYLE_ITEMS,
+        default=native_names.STYLE_ORIG_CN,
+        update=_on_native_names_update,
+    )
+    manage_builtin_addons: BoolProperty(
+        name="虚拟链接管理 Blender 内置插件",
+        description="将 Blender 自带基础插件（如 Node Wrangler、Rigify）以只读链接方式纳入分组与中文名管理，不复制文件进库",
+        default=True,
+        update=_on_builtin_toggle_update,
+    )
 
     # 兼容性测试任务运行时状态（仅本会话，不写入偏好文件）
     compat_running: BoolProperty(default=False, options={"SKIP_SAVE"})
@@ -195,108 +283,138 @@ class PMAddonPreferences(AddonPreferences):
 
     # 启动控制
     sync_startup_on_launch: BoolProperty(
-        name="启动时按「自启」标记同步",
-        description=("Blender 启动时：启用在插件库中标记为「自启」的插件。"
-                     "默认只做启用，不会停用其它插件"),
+        name="启动时同步自启分组与插件",
+        description="Blender 启动时自动启用所有标记为「自启」的分组及插件",
         default=False,
     )
     startup_disable_unmarked: BoolProperty(
-        name="同时停用未标记自启的插件",
-        description=("启动同步时，把没有标记「自启」的插件也停用。"
-                     "能最大限度节省资源，但请先整理好自启标记再开启"),
+        name="同时停用未标记自启的库内插件",
+        description="启动同步时停用未标记自启的库内插件（不会停用 Blender 内置插件）",
         default=False,
     )
 
     plugin_items: CollectionProperty(type=PM_PluginItem)
     category_items: CollectionProperty(type=PM_CategoryItem)
+    group_items: CollectionProperty(type=PM_GroupItem)
 
     def draw(self, context):
         layout = self.layout
         from . import _update_boot_message, self_update
-
-        updates = layout.box()
-        updates.label(text=f"插件库管理器 {C.ADDON_VERSION_STR}", icon="PLUGIN")
-        row = updates.row()
-        row.enabled = not self.self_update_busy
-        row.operator("plugin_manager.github_update", icon="FILE_REFRESH")
-        op = updates.operator("wm.url_open", text="查看 GitHub 发布", icon="URL")
-        op.url = self_update.RELEASES_URL
-        if message := self.self_update_status or _update_boot_message:
-            updates.label(text=message, icon="INFO")
-
-        # --- 设备与库 ---
-        col = layout.column()
-        col.prop(self, "device_name")
         from .storage import machine_config
+
+        if self.library_job_status:
+            layout.label(
+                text=self.library_job_status,
+                icon="TIME" if self.library_job_running else "ERROR" if self.library_job_failed else "INFO",
+            )
+        if self.library_job_running:
+            return
+
+        # --- 1. 插件库与设备 ---
+        box = layout.box()
+        box.label(text="1. 插件库与设备", icon="FILE_FOLDER")
+        col = box.column(align=False)
+        row = col.row(align=True)
+        row.prop(self, "device_name")
         device_id = machine_config.load()["device_id"]
-        col.label(text=f"设备 ID: {device_id[:12]}" if device_id else "设备 ID 暂不可用")
+        sub = row.row()
+        sub.enabled = False
+        sub.label(text=f"ID: {device_id[:10]}" if device_id else "ID 暂不可用")
+
         if self.library_path:
             col.label(text=self.library_path, icon="FILE_FOLDER")
-        col.operator("plugin_manager.pick_library_path", text="选择插件库…", icon="FILEBROWSER")
+        else:
+            col.label(text="尚未选择插件库目录", icon="ERROR")
         if self.pending_library_path:
-            col.label(text=self.pending_library_path)
-            col.label(text=self.library_preview, icon="INFO")
+            col.label(text=f"待连接: {self.pending_library_path}", icon="INFO")
+            if self.library_preview:
+                col.label(text=self.library_preview)
 
-        # --- 挂载 ---
         row = col.row(align=True)
-        row.operator("plugin_manager.setup_library", text="启用管理 / 重连", icon="LINKED")
+        row.operator("plugin_manager.pick_library_path", text="选择插件库…", icon="FILEBROWSER")
+        row.operator("plugin_manager.setup_library", text="启用管理", icon="LINKED")
         row.operator("plugin_manager.unmount_library", text="停止管理", icon="UNLINKED")
 
         if self.library_path:
             state = bridge.library_state(self.library_path)
-            box = layout.box()
-            box.label(
+            status_row = box.row(align=True)
+            status_row.label(
                 text=f"脚本目录: {'已挂载' if state['script_dir'] else '未挂载'}",
                 icon="CHECKMARK" if state["script_dir"] else "ERROR",
             )
-            box.label(
+            status_row.label(
                 text=f"扩展仓库: {'已挂载' if state['repo'] else '未挂载'}",
                 icon="CHECKMARK" if state["repo"] else "ERROR",
             )
-            box.label(text="在 3D 视图侧边栏 '插件库' 标签中管理")
-        else:
-            layout.label(text="请先设置插件库路径", icon="ERROR")
 
-        # --- 诊断与维护 ---
+        # --- 2. 显示与集成 ---
         box = layout.box()
-        box.label(text="诊断与维护", icon="TOOL_SETTINGS")
-        row = box.row(align=True)
-        row.operator("plugin_manager.refresh", icon="FILE_REFRESH")
-        row.operator("plugin_manager.show_warnings", icon="INFO", text="诊断信息")
-        row = box.row(align=True)
-        row.operator("plugin_manager.cleanup_residue", icon="TRASH", text="清理失败插件残留")
-        row.operator("plugin_manager.clear_updates", icon="X", text="清除更新标记")
+        box.label(text="2. 显示、内置插件与启动策略", icon="PREFERENCES")
+        box.prop(self, "native_display_names")
+        row = box.row()
+        row.enabled = self.native_display_names
+        row.prop(self, "native_name_style")
+        nst = native_names.status()
+        if self.native_display_names:
+            if nst["installed"]:
+                scope = []
+                if nst["addons_hooked"]:
+                    scope.append("插件列表")
+                if nst["extensions_hooked"]:
+                    scope.append("获取扩展")
+                box.label(
+                    text=f"原生双语显示已生效（{' + '.join(scope)}，已映射 {nst['mapped_count']} 项，不改源码）",
+                    icon="CHECKMARK",
+                )
+            elif nst["error"]:
+                box.label(text=f"原生显示降级：{nst['error']}", icon="INFO")
 
-        # --- 启动同步策略 ---
-        box = layout.box()
-        box.label(text="启动同步策略", icon="PLAY")
+        box.separator()
+        box.prop(self, "manage_builtin_addons")
+
+        box.separator()
         box.prop(self, "sync_startup_on_launch")
         row = box.row()
         row.enabled = self.sync_startup_on_launch
         row.prop(self, "startup_disable_unmarked")
-        box.operator("plugin_manager.apply_startup", icon="PLAY", text="立即同步自启状态")
+        box.operator("plugin_manager.apply_startup", icon="PLAY", text="立即应用自启分组与插件")
 
-        # --- 迁移收编 ---
+        # --- 3. 外部收编与官方商店 ---
         box = layout.box()
-        box.label(text="迁移收编", icon="IMPORT")
+        box.label(text="3. 外部收编与官方商店", icon="IMPORT")
         row = box.row(align=True)
-        row.operator("plugin_manager.scan_candidates", icon="VIEWZOOM", text="扫描可收编插件")
+        row.operator("plugin_manager.scan_candidates", icon="VIEWZOOM", text="扫描外部插件")
+        row.operator("plugin_manager.import_candidates", icon="IMPORT", text="收编进库（自动避开内置冲突）")
         if self.candidate_count:
-            box.label(text=f"可收编 {self.candidate_count} 个")
-        box.operator("plugin_manager.import_candidates", icon="IMPORT", text="收编全部")
+            box.label(text=f"检测到外部插件 {self.candidate_count} 个", icon="INFO")
 
-        # --- 官方商店目录关联 ---
-        box = layout.box()
-        box.label(text="官方商店目录关联", icon="URL")
         try:
             official = bool(bridge.library_state(self.library_path).get("official")) if self.library_path else False
         except Exception:
             official = False
         if official:
-            box.label(text="官方商店面板已与本库共用目录", icon="CHECKMARK")
+            box.label(text="官方商店（extensions.blender.org）已与本库共用目录", icon="CHECKMARK")
         else:
             box.operator("plugin_manager.unify_store", icon="LINKED",
-                         text="让官方商店使用本插件库")
+                         text="让官方商店使用本插件库目录")
+
+        # --- 4. 维护与管理器更新 ---
+        box = layout.box()
+        box.label(text=f"4. 维护与更新（当前 v{C.ADDON_VERSION_STR}）", icon="TOOL_SETTINGS")
+        row = box.row(align=True)
+        row.operator("plugin_manager.refresh", icon="FILE_REFRESH", text="刷新列表")
+        row.operator("plugin_manager.show_warnings", icon="INFO", text="诊断信息")
+        row.operator("plugin_manager.cleanup_residue", icon="TRASH", text="清理残留")
+        row.operator("plugin_manager.clear_updates", icon="X", text="清除更新标记")
+
+        row = box.row(align=True)
+        sub = row.row(align=True)
+        sub.enabled = not self.self_update_busy
+        sub.operator("plugin_manager.github_update", icon="FILE_REFRESH", text="检查 GitHub 更新")
+        op = row.operator("wm.url_open", text="查看发布页", icon="URL")
+        op.url = self_update.RELEASES_URL
+        if message := self.self_update_status or _update_boot_message:
+            box.label(text=message, icon="INFO")
 
 
-classes = (PM_PluginItem, PM_CategoryItem, PM_ReportItem, PMAddonPreferences)
+classes = (PM_PluginItem, PM_CategoryItem, PM_GroupItem, PM_ReportItem, PMAddonPreferences)

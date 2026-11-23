@@ -7,8 +7,8 @@ import os
 # --- 身份标识 -------------------------------------------------------------
 ADDON_ID = "bl_plugin_manager"
 ADDON_NAME = "插件库管理器"
-ADDON_VERSION = (2, 3, 2)
-ADDON_VERSION_STR = "2.3.2"
+ADDON_VERSION = (2, 4, 0)
+ADDON_VERSION_STR = "2.4.0"
 
 # Blender 侧扩展仓库标识（必须是合法的 Python 标识符）
 REPO_MODULE = "pmlib"
@@ -34,7 +34,13 @@ DEFAULT_CATEGORY = "未分类"
 # --- 插件类型 -------------------------------------------------------------
 KIND_ADDON = "addon"          # 传统插件
 KIND_EXTENSION = "extension"  # 扩展插件
-KIND_LABELS = {KIND_ADDON: "传统插件", KIND_EXTENSION: "扩展插件"}
+KIND_BUILTIN = "builtin"      # Blender 内置插件（虚拟链接，不复制进库）
+KIND_LABELS = {
+    KIND_ADDON: "传统插件",
+    KIND_EXTENSION: "扩展插件",
+    KIND_BUILTIN: "内置插件",
+}
+BUILTIN_REL_PREFIX = "builtin/"
 
 MANIFEST_NAME = "blender_manifest.toml"
 LEGACY_INIT = "__init__.py"

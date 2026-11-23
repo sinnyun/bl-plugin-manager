@@ -36,6 +36,7 @@ def collect_candidates(root: str, db: LibraryDB) -> list[dict]:
     candidates: list[dict] = []
     seen_paths: set[str] = set()
     existing = _existing_ids(db)
+    builtin_names = {n.lower() for n in bridge.builtin_module_names()}
 
     def add(path: str, kind: str, source: str):
         norm = _norm(path)
@@ -45,6 +46,7 @@ def collect_candidates(root: str, db: LibraryDB) -> list[dict]:
         meta = scan.read_meta(path, kind) or {}
         name = os.path.basename(path)
         pkg_id = (meta.get("id") or "").lower()
+        conflict = (kind == C.KIND_ADDON and name.lower() in builtin_names)
         candidates.append(
             {
                 "path": path,
@@ -54,6 +56,7 @@ def collect_candidates(root: str, db: LibraryDB) -> list[dict]:
                 "version": meta.get("version", ""),
                 "source": source,
                 "already": (pkg_id and pkg_id in existing) or (name.lower() in existing),
+                "builtin_conflict": conflict,
             }
         )
 
@@ -89,10 +92,15 @@ def collect_candidates(root: str, db: LibraryDB) -> list[dict]:
 
 def import_candidates(root: str, db: LibraryDB, candidates: list[dict], move: bool = False,
                       enable: bool = False) -> dict:
-    stats = {"ok": 0, "skip": 0, "fail": 0, "errors": []}
+    stats = {"ok": 0, "skip": 0, "fail": 0, "conflicts": 0, "errors": []}
     for cand in candidates:
         if cand.get("already"):
             stats["skip"] += 1
+            continue
+        if cand.get("builtin_conflict"):
+            stats["skip"] += 1
+            stats["conflicts"] += 1
+            stats["errors"].append(f"{cand.get('folder')}: 与 Blender 内置插件同名，已跳过收编（请使用内置链接管理）")
             continue
         try:
             library.import_plugin_dir(

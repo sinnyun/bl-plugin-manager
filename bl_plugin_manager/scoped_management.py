@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 from . import constants as C
 from .db import LibraryDB
@@ -146,7 +147,7 @@ def transfer_activation(root: str, origin: str, target: str) -> None:
                    script_directories=profile["script_directories"])
 
 
-def _apply_activation(root: str, desired: set[str]) -> list[dict]:
+def _apply_activation(root: str, desired: set[str], *, skip_builtins: bool = False) -> list[dict]:
     api = _bridge()
     failures = []
     db = LibraryDB(root)
@@ -154,6 +155,8 @@ def _apply_activation(root: str, desired: set[str]) -> list[dict]:
     for record in db.all():
         key, module = record.get("key", ""), record.get("module", "")
         if not key or not module or record.get("missing") or module == C.ADDON_ID:
+            continue
+        if skip_builtins and record.get("kind") == C.KIND_BUILTIN:
             continue
         target = key in desired
         if api.is_module_enabled(module) == target:
@@ -206,12 +209,18 @@ def activate(root: str, after_mount=None) -> dict:
         return {"state": "ERROR", "failures": [{"error": str(exc)}]}
 
 
-def activate_library(root: str, *, resume: bool = False) -> dict:
-    """Validate the target before changing Blender and restore the old scope on failure."""
+@dataclass
+class PreparedLibrary:
+    root: str
+    previous: dict
+    database: LibraryDB
+    entries: list[dict] | None
+
+
+def prepare_library(root: str, previous: dict, load_environment: str, *, resume: bool) -> PreparedLibrary:
+    """Validate, migrate, and read plugin metadata without accessing Blender."""
     from . import library
 
-    root = os.path.abspath(root)
-    previous = machine_config.initialize()
     previous_root = previous.get("library_path")
     is_switch = bool(previous.get("management_enabled") and previous_root
                      and os.path.normcase(os.path.abspath(previous_root)) != os.path.normcase(root))
@@ -221,20 +230,39 @@ def activate_library(root: str, *, resume: bool = False) -> dict:
     info = library.inspect_target(root)
     if error := library.target_error(info):
         raise RuntimeError(error)
-    database = LibraryDB(root, use_cache=False)
+    database = LibraryDB(root, use_cache=False, load_environment=load_environment)
     if database.status in {"CORRUPT", "UNSUPPORTED"}:
         raise RuntimeError(f"插件库资料不可写（{database.status}），原文件已保留")
-    api = _bridge()
-    api.ensure_library_dirs(root)
+    library.bridge.ensure_library_dirs(root)
     status = database.prepare()
     if status != "OK":
         raise RuntimeError(f"插件库资料不可写（{status}），原文件已保留")
-    result = (library.connect_library(root, database, move_flat=False)
-              if not resume and not info["is_library"] and info["flat_plugins"] else {})
+    needs_import = not resume and not info["is_library"] and bool(info["flat_plugins"])
+    entries = None if needs_import else library.scan_library_entries(root)
+    if entries is not None:
+        database.merge_scan(entries, persist=False)
+    return PreparedLibrary(root, previous, database, entries)
+
+
+def activate_prepared_library(prepared: PreparedLibrary) -> dict:
+    """Apply Blender configuration on the main thread and roll back on failure."""
+    from . import library
+
+    root, previous, database = prepared.root, prepared.previous, prepared.database
+    if machine_config.load() != previous:
+        raise RuntimeError("本机插件库配置已变化，请重新连接")
+    previous_root = previous.get("library_path")
+    is_switch = bool(previous.get("management_enabled") and previous_root
+                     and os.path.normcase(os.path.abspath(previous_root)) != os.path.normcase(root))
+    result = library.connect_library(root, database, move_flat=False) if prepared.entries is None else {}
 
     def rescan():
-        library.sync_library(root, LibraryDB(root))
+        if prepared.entries is None:
+            library.sync_library(root, database)
+        else:
+            library.apply_scan_runtime(root, database, prepared.entries)
 
+    api = _bridge()
     original_config = api.capture_scoped_configuration()
     original_enabled = api.enabled_modules()
     target_modules = set()
@@ -269,7 +297,7 @@ def deactivate(root: str) -> dict:
     try:
         if os.path.isdir(root):
             sync_to_profile(root)
-            failures.extend(_apply_activation(root, set()))
+            failures.extend(_apply_activation(root, set(), skip_builtins=True))
         _bridge().reset_scoped_configuration()
         setter = getattr(_bridge(), "set_managed_library_root", None)
         if setter:

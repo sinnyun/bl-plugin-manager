@@ -15,7 +15,7 @@ from bpy.props import (
 )
 from bpy.types import Operator
 
-from . import (archive_jobs, bridge, compat_task, constants as C, library, migrate, scan,
+from . import (archive_jobs, bridge, compat_task, constants as C, library, library_jobs, migrate, scan,
                scoped_management, self_update, store, updates, watcher)
 from .db import LibraryDB, compatibility_environment, now_iso
 from .storage.catalog import CatalogConflictError
@@ -32,7 +32,7 @@ def _prefs(context):
 
 def _db(context) -> LibraryDB | None:
     prefs = _prefs(context)
-    if not prefs or not prefs.library_path or not os.path.isdir(prefs.library_path):
+    if not prefs or prefs.library_job_running or not prefs.library_path or not os.path.isdir(prefs.library_path):
         return None
     database = LibraryDB(prefs.library_path)
     return database if database.status not in {"CORRUPT", "UNSUPPORTED"} else None
@@ -68,7 +68,8 @@ class _PMBase(Operator):
 
     @classmethod
     def poll(cls, context):
-        return bridge.get_prefs() is not None
+        prefs = bridge.get_prefs()
+        return prefs is not None and not prefs.library_job_running
 
 
 _SELF_UPDATE_TASK = TaskController()
@@ -156,42 +157,11 @@ class PM_OT_setup_library(_PMBase):
         path = prefs.pending_library_path or prefs.library_path
         if not path:
             return _report(self, False, "请先选择插件库目录")
-        if prefs.compat_running or prefs.archive_running:
-            return _report(self, False, "请先结束当前任务，再切换或重连")
-        _status("插件库：正在连接并扫描…")
         try:
-            result = scoped_management.activate_library(path)
+            library_jobs.start(prefs, path)
         except (RuntimeError, OSError, ValueError) as exc:
             return _report(self, False, str(exc))
-        finally:
-            _clear_status()
-        from . import items, preferences
-
-        preferences._LOADING_MACHINE_PATH = True
-        try:
-            prefs.library_path = path
-            prefs.pending_library_path = ""
-            prefs.library_preview = ""
-        finally:
-            preferences._LOADING_MACHINE_PATH = False
-        items.clear_selection()
-        items.rebuild_items(prefs)
-        msg = "已启用插件库管理"
-        if migration := result.get("migration"):
-            msg += f"；已迁移 {migration['imported']} 条旧资料"
-        if result.get("imported"):
-            msg += f"；已复制 {len(result['imported'])} 个插件到库内"
-        failures = result.get("failed", []) + result.get("failures", [])
-        if failures:
-            prefs.report_summary = f"{msg}；{len(failures)} 项需要处理"
-            prefs.report_items.clear()
-            for failure in failures:
-                item = prefs.report_items.add()
-                item.name = failure.get("key", "插件加载") if isinstance(failure, dict) else "导入失败"
-                item.detail = failure.get("error", "") if isinstance(failure, dict) else failure
-                item.status = "failed"
-            return _report(self, True, prefs.report_summary, kind="WARNING")
-        return _report(self, True, msg)
+        return _report(self, True, prefs.library_job_status)
 
 
 class PM_OT_unify_store(_PMBase):
@@ -288,30 +258,16 @@ class PM_OT_pick_library_path(_PMBase):
         if self.cancel_preview:
             prefs.pending_library_path = ""
             prefs.library_preview = ""
+            prefs.library_job_status = ""
+            prefs.library_job_failed = False
             return {"FINISHED"}
         if not self.directory:
             return _report(self, False, "未选择目录")
-        path = os.path.abspath(self.directory)
         try:
-            info = library.inspect_target(path)
-            error = library.target_error(info)
-            database = LibraryDB(path)
-        except OSError as exc:
-            return _report(self, False, f"无法读取目录: {exc}")
-        if error:
-            return _report(self, False, error)
-        if database.status in {"CORRUPT", "UNSUPPORTED"}:
-            return _report(self, False, f"资料库不可写（{database.status}），原文件已保留")
-        prefs.pending_library_path = path
-        count = info["addon_count"] + info["extension_count"]
-        scattered = len(info["flat_plugins"])
-        if not info["exists"]:
-            prefs.library_preview = "新目录；启用管理时创建空库"
-        else:
-            prefs.library_preview = f"库内 {count} 个插件；另有 {scattered} 个待复制"
-        if database.catalog.legacy_path.exists():
-            prefs.library_preview += "；启用时迁移旧资料"
-        return _report(self, True, "已选目录。确认预览后点击「启用管理」")
+            library_jobs.start(prefs, self.directory, mode="preview")
+        except (RuntimeError, OSError, ValueError) as exc:
+            return _report(self, False, str(exc))
+        return _report(self, True, prefs.library_job_status)
 
 
 class PM_OT_unmount_library(_PMBase):
@@ -920,9 +876,8 @@ class PM_OT_batch_set_category(_PMBase):
         if cat != C.DEFAULT_CATEGORY:
             db.ensure_category(cat)
         for k in keys:
-            rec = db.get(k)
-            if rec:
-                rec["category"] = cat
+            if db.get(k):
+                db.set_plugin_groups(k, [cat] if cat != C.DEFAULT_CATEGORY else [])
         db.save()
         from . import items
 
@@ -958,35 +913,263 @@ class PM_OT_batch_set_startup(_PMBase):
         return _report(self, True, f"已批量{verb} {len(keys)} 个")
 
 
+def _apply_group_plan_op(op, prefs, db, plan: dict, label: str):
+    from . import items
+    from .services import groups as group_service
+
+    stats = group_service.apply_group_plan(
+        db, plan,
+        set_enabled_fn=bridge.set_enabled,
+        is_enabled_fn=bridge.is_module_enabled,
+    )
+    if prefs and prefs.library_path and bridge.managed_library_root() == prefs.library_path:
+        if stats["enabled_keys"]:
+            scoped_management.record_activations(prefs.library_path, stats["enabled_keys"], True)
+        if stats["disabled_keys"]:
+            scoped_management.record_activations(prefs.library_path, stats["disabled_keys"], False)
+    if prefs:
+        items.rebuild_items(prefs)
+    _redraw()
+    parts = [label]
+    if stats["enabled"]:
+        parts.append(f"启用 {stats['enabled']} 个")
+    if stats["disabled"]:
+        parts.append(f"停用 {stats['disabled']} 个")
+    if stats["kept_shared"]:
+        parts.append(f"共有保留 {stats['kept_shared']} 个")
+    if stats["failed"]:
+        parts.append(f"失败 {len(stats['failed'])} 个")
+    return _report(op, not stats["failed"], " · ".join(parts))
+
+
 class PM_OT_enable_pack(_PMBase):
     bl_idname = "plugin_manager.enable_pack"
     bl_label = "启用整组"
-    bl_description = "启用当前分类下的全部插件"
+    bl_description = "启用当前分组下的全部插件"
 
     def execute(self, context):
         prefs = _prefs(context)
         db = _db(context)
         if not db:
             return _report(self, False, "插件库未就绪")
-        records = [rec for rec in db.plugins.values()
-                   if (rec.get("category") or C.DEFAULT_CATEGORY) == prefs.active_category]
+        target = prefs.active_category
+        if target and target not in ("", "全部", C.DEFAULT_CATEGORY):
+            from .services import groups as group_service
+            plan = group_service.plan_group_toggle(db, target, True)
+            return _apply_group_plan_op(self, prefs, db, plan, f"已开启分组「{target}」")
+        records = [rec for key, rec in db.plugins.items() if not db.plugin_groups(key)]
         return _set_plugins_enabled(self, prefs, db, records, True)
-
 
 
 class PM_OT_disable_pack(_PMBase):
     bl_idname = "plugin_manager.disable_pack"
     bl_label = "停用整组"
-    bl_description = "停用当前分类下的全部插件"
+    bl_description = "停用当前分组下的全部插件（保留其他开启分组共有的插件）"
 
     def execute(self, context):
         prefs = _prefs(context)
         db = _db(context)
         if not db:
             return _report(self, False, "插件库未就绪")
-        records = [rec for rec in db.plugins.values()
-                   if (rec.get("category") or C.DEFAULT_CATEGORY) == prefs.active_category]
+        target = prefs.active_category
+        if target and target not in ("", "全部", C.DEFAULT_CATEGORY):
+            from .services import groups as group_service
+            plan = group_service.plan_group_toggle(db, target, False)
+            return _apply_group_plan_op(self, prefs, db, plan, f"已关闭分组「{target}」")
+        records = [rec for key, rec in db.plugins.items() if not db.plugin_groups(key)]
         return _set_plugins_enabled(self, prefs, db, records, False)
+
+
+class PM_OT_group_toggle(_PMBase):
+    bl_idname = "plugin_manager.group_toggle"
+    bl_label = "开关分组"
+    bl_description = "开启或关闭指定分组（支持多组叠加；关闭时自动保留与其他开启分组共有的插件）"
+
+    name: StringProperty(default="")
+    active: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        from .services import groups as group_service
+
+        plan = group_service.plan_group_toggle(db, self.name, self.active)
+        verb = "已开启" if self.active else "已关闭"
+        return _apply_group_plan_op(self, prefs, db, plan, f"{verb}分组「{self.name}」")
+
+
+class PM_OT_group_solo(_PMBase):
+    bl_idname = "plugin_manager.group_solo"
+    bl_label = "独占切换分组"
+    bl_description = "切换到此分组并关闭其他非常驻分组（常驻基础组保持开启）"
+
+    name: StringProperty(default="")
+    keep_pinned: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        from .services import groups as group_service
+
+        plan = group_service.plan_group_solo(db, self.name, keep_pinned=self.keep_pinned)
+        return _apply_group_plan_op(self, prefs, db, plan, f"已切换至分组「{self.name}」")
+
+
+class PM_OT_group_set_startup(_PMBase):
+    bl_idname = "plugin_manager.group_set_startup"
+    bl_label = "分组自启开关"
+    bl_description = "标记该分组在 Blender 启动同步时自动开启"
+
+    name: StringProperty(default="")
+    value: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        db.set_group_state(self.name, startup=bool(self.value))
+        db.save()
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        verb = "已设为自启" if self.value else "已取消自启"
+        return _report(self, True, f"分组「{self.name}」{verb}")
+
+
+class PM_OT_group_set_pinned(_PMBase):
+    bl_idname = "plugin_manager.group_set_pinned"
+    bl_label = "常驻分组开关"
+    bl_description = "常驻分组在独占切换其他工作分组或全部关闭时保持开启"
+
+    name: StringProperty(default="")
+    value: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        db.set_group_pinned(self.name, bool(self.value))
+        db.save()
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        verb = "已设为常驻组" if self.value else "已取消常驻"
+        return _report(self, True, f"分组「{self.name}」{verb}")
+
+
+class PM_OT_group_deactivate_all(_PMBase):
+    bl_idname = "plugin_manager.group_deactivate_all"
+    bl_label = "关闭全部工作分组"
+    bl_description = "关闭所有已开启的工作分组（默认保留常驻组）"
+
+    include_pinned: BoolProperty(default=False)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db:
+            return _report(self, False, "插件库未就绪")
+        from .services import groups as group_service
+
+        plan = group_service.plan_deactivate_all(db, include_pinned=self.include_pinned)
+        if not plan["deactivated"]:
+            return _report(self, True, "当前没有已开启的工作分组")
+        return _apply_group_plan_op(self, prefs, db, plan, "已关闭全部工作分组")
+
+
+class PM_OT_plugin_toggle_group(Operator):
+    bl_idname = "plugin_manager.plugin_toggle_group"
+    bl_label = "加入/移出分组"
+    bl_description = "把当前插件加入或移出指定分组（一个插件可同时属于多个分组）"
+
+    key: StringProperty(default="")
+    group: StringProperty(default="")
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        key = self.key or (prefs.selected_key if prefs else "")
+        if not db or not key or not self.group:
+            return _report(self, False, "未找到插件或分组")
+        groups = db.plugin_groups(key)
+        if self.group in groups:
+            db.remove_plugin_from_group(key, self.group)
+            msg = f"已移出分组「{self.group}」"
+        else:
+            db.add_plugin_to_group(key, self.group)
+            msg = f"已加入分组「{self.group}」"
+        db.save()
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, msg)
+
+
+def _group_enum(self, context):
+    from . import items as _items
+
+    _items.refresh_cache(bridge.get_prefs())
+    opts = _items.group_options()
+    return [(g, g, "") for g in opts] or [(C.DEFAULT_CATEGORY, "（暂无分组，请先新建）", "")]
+
+
+class PM_OT_batch_add_group(_PMBase):
+    bl_idname = "plugin_manager.batch_add_group"
+    bl_label = "批量加入/移出分组"
+    bl_description = "把勾选的插件批量加入或移出某个分组（不影响它们已有的其他分组）"
+
+    group: bpy.props.EnumProperty(name="分组", items=_group_enum)
+    remove: BoolProperty(name="移出该分组", default=False)
+
+    def invoke(self, context, event):
+        prefs = _prefs(context)
+        if not prefs:
+            return _report(self, False, "插件库未启用")
+        from . import items as _items
+
+        _items.refresh_cache(prefs)
+        if not _items.all_selected_keys():
+            return _report(self, False, "请先勾选要操作的插件")
+        if not _items.group_options():
+            return _report(self, False, "暂无可用分组，请先新建分组")
+        return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not prefs or not db:
+            return _report(self, False, "插件库未就绪")
+        keys = _target_keys(prefs, "", True)
+        if not keys:
+            return _report(self, False, "请先勾选要操作的插件")
+        if not self.group or self.group == C.DEFAULT_CATEGORY:
+            return _report(self, False, "请先新建工作分组")
+        for k in keys:
+            if not db.get(k):
+                continue
+            if self.remove:
+                db.remove_plugin_from_group(k, self.group)
+            else:
+                db.add_plugin_to_group(k, self.group)
+        db.save()
+        from . import items
+
+        items.rebuild_items(prefs)
+        _redraw()
+        verb = "移出" if self.remove else "加入"
+        return _report(self, True, f"已将 {len(keys)} 个插件{verb}分组「{self.group}」")
 
 
 
@@ -1634,7 +1817,7 @@ class PM_OT_clear_updates(_PMBase):
 # ---------------------------------------------------------------------------
 class PM_OT_set_category(Operator):
     bl_idname = "plugin_manager.set_category"
-    bl_label = "移入分类"
+    bl_label = "移入分组"
 
     key: StringProperty(default="")
     category: StringProperty(default="")
@@ -1644,21 +1827,21 @@ class PM_OT_set_category(Operator):
         rec = db.get(self.key) if db else None
         if not rec:
             return _report(self, False, "未找到插件")
-        rec["category"] = self.category or C.DEFAULT_CATEGORY
-        # 只有非「未分类」才登记为分类，保持分类列表干净
-        if rec["category"] != C.DEFAULT_CATEGORY:
-            db.ensure_category(rec["category"])
+        target = (self.category or C.DEFAULT_CATEGORY).strip() or C.DEFAULT_CATEGORY
+        if target != C.DEFAULT_CATEGORY:
+            db.ensure_category(target)
+        db.set_plugin_groups(self.key, [target] if target != C.DEFAULT_CATEGORY else [])
         db.save()
         from . import items
 
         prefs = _prefs(context)
         if prefs:
             items.rebuild_items(prefs)
-        return _report(self, True, f"已移入分类: {rec['category']}")
+        return _report(self, True, f"已移入分组: {target}")
 
 
 def _category_enum(self, context):
-    """分类下拉的候选项：从库文件刷新后取自模块缓存，不依赖 context。"""
+    """分组下拉的候选项：从库文件刷新后取自模块缓存，不依赖 context。"""
     from . import items as _items
 
     _items.refresh_cache(bridge.get_prefs())
@@ -1666,13 +1849,13 @@ def _category_enum(self, context):
 
 
 class PM_OT_assign_category(Operator):
-    """弹出下拉框，把当前选中的插件移入某个已有分类（或未分类）。"""
+    """弹出下拉框，把当前选中的插件移入某个已有分组（或未分类）。"""
 
     bl_idname = "plugin_manager.assign_category"
-    bl_label = "移入分类"
+    bl_label = "设置主分组"
 
     key: StringProperty(default="")
-    category: bpy.props.EnumProperty(name="分类", items=_category_enum)
+    category: bpy.props.EnumProperty(name="分组", items=_category_enum)
 
     def invoke(self, context, event):
         prefs = _prefs(context)
@@ -1694,23 +1877,24 @@ class PM_OT_assign_category(Operator):
         rec = db.get(self.key) if db else None
         if not rec:
             return _report(self, False, "未找到插件")
-        rec["category"] = self.category or C.DEFAULT_CATEGORY
-        if rec["category"] != C.DEFAULT_CATEGORY:
-            db.ensure_category(rec["category"])
+        target = (self.category or C.DEFAULT_CATEGORY).strip() or C.DEFAULT_CATEGORY
+        if target != C.DEFAULT_CATEGORY:
+            db.ensure_category(target)
+        db.set_plugin_groups(self.key, [target] if target != C.DEFAULT_CATEGORY else [])
         db.save()
         from . import items
 
         prefs = _prefs(context)
         if prefs:
             items.rebuild_items(prefs)
-        return _report(self, True, f"已移入分类: {rec['category']}")
+        return _report(self, True, f"已移入分组: {target}")
 
 
 class PM_OT_add_category(Operator):
     bl_idname = "plugin_manager.add_category"
-    bl_label = "新建分类"
+    bl_label = "新建分组"
 
-    name: StringProperty(name="分类名", default="")
+    name: StringProperty(name="分组名", default="")
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
@@ -1726,15 +1910,15 @@ class PM_OT_add_category(Operator):
             prefs = _prefs(context)
             if prefs:
                 items.rebuild_items(prefs)
-            return _report(self, True, f"已新建分类: {self.name}")
-        return _report(self, False, "分类为空或已存在")
+            return _report(self, True, f"已新建分组: {self.name}")
+        return _report(self, False, "分组名为空或已存在")
 
 
 class PM_OT_reset_auto_categories(_PMBase):
     bl_idname = "plugin_manager.reset_auto_categories"
     bl_label = "清理自动分类"
     bl_description = ("把插件自带元数据分类（你未手动改动过的）统一收回「未分类」，"
-                      "只保留你自己创建和指定的分类")
+                      "只保留你自己创建和指定的分组")
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
@@ -1753,12 +1937,12 @@ class PM_OT_reset_auto_categories(_PMBase):
             items.rebuild_items(prefs)
         return _report(self, True,
                        f"已收回 {res['moved']} 个插件到未分类，"
-                       f"剩余分类 {res['categories_left']} 个")
+                       f"剩余分组 {max(0, res['categories_left'] - 1)} 个")
 
 
 class PM_OT_rename_category(Operator):
     bl_idname = "plugin_manager.rename_category"
-    bl_label = "重命名分类"
+    bl_label = "重命名分组"
 
     old: StringProperty(default="")
     new: StringProperty(name="新名称", default="")
@@ -1769,16 +1953,23 @@ class PM_OT_rename_category(Operator):
 
     def execute(self, context):
         db = _db(context)
+        prefs = _prefs(context)
         if not db or not self.old:
             return _report(self, False, "插件库未就绪")
         db.rename_category(self.old, self.new)
         db.save()
-        return _report(self, True, f"分类已重命名为 {self.new}")
+        from . import items
+
+        if prefs:
+            if prefs.active_category == self.old:
+                prefs.active_category = self.new.strip() or "全部"
+            items.rebuild_items(prefs)
+        return _report(self, True, f"分组已重命名为 {self.new}")
 
 
 class PM_OT_delete_category(Operator):
     bl_idname = "plugin_manager.delete_category"
-    bl_label = "删除分类"
+    bl_label = "删除分组"
 
     name: StringProperty(default="")
 
@@ -1787,11 +1978,18 @@ class PM_OT_delete_category(Operator):
 
     def execute(self, context):
         db = _db(context)
+        prefs = _prefs(context)
         if not db or not self.name:
             return _report(self, False, "插件库未就绪")
         db.delete_category(self.name)
         db.save()
-        return _report(self, True, f"已删除分类: {self.name}")
+        from . import items
+
+        if prefs:
+            if prefs.active_category == self.name:
+                prefs.active_category = "全部"
+            items.rebuild_items(prefs)
+        return _report(self, True, f"已删除分组: {self.name}")
 
 
 class PM_OT_set_favorite(Operator):
@@ -1823,12 +2021,18 @@ class PM_OT_open_folder(Operator):
         rec = db.get(self.key or prefs.selected_key) if db else None
         if not rec:
             return _report(self, False, "未找到插件")
-        try:
-            path = str(resolve_record_path(prefs.library_path, rec["rel"], rec.get("kind", "addon")))
-        except UnsafeLibraryPathError:
-            return _report(self, False, "插件记录路径不安全，已阻止打开")
-        if not os.path.isdir(path):
-            return _report(self, False, "目录不存在")
+        if rec.get("kind") == C.KIND_BUILTIN:
+            src = rec.get("source_path") or ""
+            path = os.path.dirname(src) if src and os.path.isfile(src) else src
+            if not path or not os.path.isdir(path):
+                return _report(self, False, "未找到该内置插件目录")
+        else:
+            try:
+                path = str(resolve_record_path(prefs.library_path, rec["rel"], rec.get("kind", "addon")))
+            except UnsafeLibraryPathError:
+                return _report(self, False, "插件记录路径不安全，已阻止打开")
+            if not os.path.isdir(path):
+                return _report(self, False, "目录不存在")
         try:
             bpy.ops.wm.path_open(filepath=path)
         except Exception as exc:
@@ -1842,7 +2046,7 @@ class PM_OT_open_folder(Operator):
 class PM_OT_scan_candidates(_PMBase):
     bl_idname = "plugin_manager.scan_candidates"
     bl_label = "扫描现有插件"
-    bl_description = "扫描 Blender 现有脚本目录与本地扩展仓库，列出可收编的插件"
+    bl_description = "扫描 Blender 现有脚本目录与本地扩展仓库，列出可收编的插件（自动检测内置冲突）"
 
     def execute(self, context):
         prefs = _prefs(context)
@@ -1850,14 +2054,17 @@ class PM_OT_scan_candidates(_PMBase):
         if not prefs or not db:
             return _report(self, False, "插件库未就绪")
         cands = migrate.collect_candidates(prefs.library_path, db)
-        prefs.candidate_count = len(cands)
-        return _report(self, True, f"发现 {len(cands)} 个可收编插件，请查看'迁移'面板")
+        conflicts = sum(1 for c in cands if c.get("builtin_conflict"))
+        usable = len(cands) - conflicts
+        prefs.candidate_count = usable
+        tail = f"（另有 {conflicts} 个与 Blender 内置插件同名将自动跳过）" if conflicts else ""
+        return _report(self, True, f"发现 {usable} 个可收编插件{tail}")
 
 
 class PM_OT_import_candidates(_PMBase):
     bl_idname = "plugin_manager.import_candidates"
     bl_label = "收编全部"
-    bl_description = "把扫描到的插件全部导入插件库"
+    bl_description = "把扫描到的插件全部导入插件库（自动跳过与 Blender 内置同名的冲突插件）"
 
     move: BoolProperty(name="移动而非复制", default=False)
 
@@ -1871,15 +2078,16 @@ class PM_OT_import_candidates(_PMBase):
             return _report(self, False, "插件库未就绪")
         cands = migrate.collect_candidates(prefs.library_path, db)
         stats = migrate.import_candidates(prefs.library_path, db, cands, move=self.move)
-        self.report({"INFO"}, f"收编 {stats['ok']} 个，跳过 {stats['skip']}，失败 {stats['fail']}")
+        extra = f"，内置冲突跳过 {stats['conflicts']} 个" if stats.get("conflicts") else ""
+        self.report({"INFO"}, f"收编 {stats['ok']} 个，跳过 {stats['skip']}，失败 {stats['fail']}{extra}")
         for err in stats["errors"][:5]:
-            print("[插件库] 收编失败:", err)
+            print("[插件库] 收编跳过/失败:", err)
         return {"FINISHED"}
 
 
 class PM_OT_pick_category(Operator):
     bl_idname = "plugin_manager.pick_category"
-    bl_label = "选择分类"
+    bl_label = "按分组筛选"
 
     category: StringProperty(default="")
 
@@ -1891,21 +2099,21 @@ class PM_OT_pick_category(Operator):
         from . import items
 
         items.maybe_rebuild(prefs, force=True)
-        return _report(self, True, f"已切换到分类: {prefs.active_category}")
+        return _report(self, True, f"已筛选分组: {prefs.active_category}")
 
 
 class PM_OT_rename_display(Operator):
-    """设置/清除插件的「显示名称」（别名）。
+    """设置/清除插件的「中文显示名称」（别名）。
 
-    实际插件名来自插件元数据，保持只读；别名只影响界面显示，
-    方便把英文插件改成中文，或把冗长的名字缩短。
+    实际插件名来自插件元数据，保持只读；别名同时同步到 Blender 原生插件界面
+    （不修改任何插件代码）。
     """
 
     bl_idname = "plugin_manager.rename_display"
-    bl_label = "设置显示名称"
+    bl_label = "设置中文显示名"
 
     key: StringProperty(default="")
-    display_name: StringProperty(name="显示名称", default="")
+    display_name: StringProperty(name="中文显示名", default="")
     clear: BoolProperty(default=False)
 
     def invoke(self, context, event):
@@ -1925,21 +2133,23 @@ class PM_OT_rename_display(Operator):
         rec = db.get(self.key or (prefs.selected_key if prefs else "")) if db else None
         if not rec:
             return _report(self, False, "未找到插件")
+        from . import items, native_names
+
         if self.clear:
             rec["display_name"] = ""
             db.save()
-            from . import items
-
+            native_names.invalidate_cache()
             if prefs:
                 items.rebuild_items(prefs)
-            return _report(self, True, "已清除显示名称")
+            _redraw()
+            return _report(self, True, "已清除中文显示名")
         rec["display_name"] = self.display_name.strip()
         db.save()
-        from . import items
-
+        native_names.invalidate_cache()
         if prefs:
             items.rebuild_items(prefs)
-        return _report(self, True, f"显示名称已设为: {rec['display_name'] or '（空）'}")
+        _redraw()
+        return _report(self, True, f"中文显示名已设为: {rec['display_name'] or '（空）'}")
 
 
 class PM_OT_edit_meta(Operator):
@@ -1947,9 +2157,9 @@ class PM_OT_edit_meta(Operator):
     bl_label = "编辑插件信息"
 
     key: StringProperty(default="")
-    display_name: StringProperty(name="显示名称（别名）", default="")
+    display_name: StringProperty(name="中文显示名（别名）", default="")
     note: StringProperty(name="备注", default="")
-    category: StringProperty(name="分类", default="")
+    category: StringProperty(name="主分组", default="")
     tags: StringProperty(name="标签(逗号分隔)", default="")
 
     def _rec(self, context):
@@ -1981,19 +2191,26 @@ class PM_OT_edit_meta(Operator):
             return _report(self, False, "未找到插件")
         rec["display_name"] = self.display_name.strip()
         rec["note"] = self.note.strip()
-        rec["category"] = self.category.strip() or C.DEFAULT_CATEGORY
+        primary = self.category.strip() or C.DEFAULT_CATEGORY
         rec["tags"] = [t.strip() for t in self.tags.split(",") if t.strip()]
-        if rec["category"] != C.DEFAULT_CATEGORY:
-            db.ensure_category(rec["category"])
+        existing_groups = db.plugin_groups(self.key)
+        if primary == C.DEFAULT_CATEGORY:
+            db.set_plugin_groups(self.key, [])
+        else:
+            db.ensure_category(primary)
+            updated = [primary] + [g for g in existing_groups if g != primary]
+            db.set_plugin_groups(self.key, updated)
         try:
             db.save()
         except CatalogConflictError as error:
             return _report(self, False, str(error))
-        from . import items
+        from . import items, native_names
 
+        native_names.invalidate_cache()
         prefs = _prefs(context)
         if prefs:
             items.maybe_rebuild(prefs, force=True)
+        _redraw()
         return _report(self, True, "已保存插件信息")
 
 
@@ -2014,9 +2231,16 @@ classes = (
     PM_OT_select_all,
     PM_OT_batch_enable,
     PM_OT_batch_set_category,
+    PM_OT_batch_add_group,
     PM_OT_batch_set_startup,
     PM_OT_enable_pack,
     PM_OT_disable_pack,
+    PM_OT_group_toggle,
+    PM_OT_group_solo,
+    PM_OT_group_set_startup,
+    PM_OT_group_set_pinned,
+    PM_OT_group_deactivate_all,
+    PM_OT_plugin_toggle_group,
     PM_OT_import,
     PM_OT_import_zip,
     PM_OT_scan_inbox,

@@ -8,6 +8,9 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+from pathlib import Path
+from unittest.mock import patch
 
 import addon_utils
 import bpy
@@ -38,6 +41,22 @@ _assert_isolated_runtime()
 def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), detail))
     print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
+
+
+def finish_library_job():
+    jobs = PM.library_jobs
+    if jobs._job is None:
+        return
+    jobs._job.worker.join(timeout=10)
+    assert jobs._tick() is None, "library task did not finish"
+    if bpy.app.timers.is_registered(jobs._tick):
+        bpy.app.timers.unregister(jobs._tick)
+
+
+def setup_library():
+    result = bpy.ops.plugin_manager.setup_library()
+    finish_library_job()
+    return result
 
 
 # --- 准备目录 -------------------------------------------------------------
@@ -99,8 +118,43 @@ prefs.library_path = lib
 check("addon registered", PM.constants.ADDON_ID in bpy.context.preferences.addons)
 
 # 注册插件库
-r = bpy.ops.plugin_manager.setup_library()
+legacy = Path(lib, ".pm", "library.json")
+legacy.parent.mkdir(parents=True)
+legacy.write_text(json.dumps({"schema": 2, "library_id": "slow-library",
+                              "categories": [], "plugins": {}}), encoding="utf-8")
+read_legacy = PM.db.Catalog.read_legacy
+migration_started = threading.Event()
+allow_migration = threading.Event()
+was_background = []
+
+
+def slow_read_legacy(catalog):
+    background = threading.current_thread() is not threading.main_thread()
+    was_background.append(background)
+    migration_started.set()
+    if background and not allow_migration.wait(5):
+        raise RuntimeError("migration test timed out")
+    return read_legacy(catalog)
+
+
+with patch.object(PM.db.Catalog, "read_legacy", slow_read_legacy):
+    r = bpy.ops.plugin_manager.setup_library()
+    try:
+        check("network migration leaves Blender free before the library is mounted",
+              migration_started.wait(2) and was_background == [True]
+              and legacy.exists() and not PM.bridge.is_registered(lib)
+              and PM.library_jobs._tick() == 0.1
+              and not bpy.ops.plugin_manager.setup_library.poll())
+        with patch.object(PM.scoped_management, "sync_to_profile",
+                          side_effect=AssertionError("sync during migration")):
+            check("device sync waits for library preparation", PM._sync_manager_state() == 2.0)
+    finally:
+        allow_migration.set()
+    finish_library_job()
 check("setup_library", r == {"FINISHED"})
+check("background migration archives the legacy database before mounting",
+      not legacy.exists() and bool(list(legacy.parent.glob("archive/library.pre-catalog.*.json")))
+      and "已迁移" in prefs.library_job_status)
 check("lib dirs created", os.path.isdir(os.path.join(lib, "addons")) and os.path.isdir(os.path.join(lib, "extensions")))
 state = PM.bridge.library_state(lib)
 check("script dir registered", state["script_dir"])
@@ -351,7 +405,7 @@ prefs.library_path = lib  # 前面报告测试用过其它路径，这里恢复
 r = bpy.ops.plugin_manager.unmount_library()
 check("unmount restores defaults", r == {"FINISHED"} and not PM.bridge.is_registered(lib), str(r))
 # 重新挂载，供后续测试使用
-r = bpy.ops.plugin_manager.setup_library()
+r = setup_library()
 check("explicit re-enable restores device configuration",
       r == {"FINISHED"} and PM.bridge.is_registered(lib))
 
@@ -363,7 +417,7 @@ PM.register()
 prefs = bpy.context.preferences.addons[PM.constants.ADDON_ID].preferences
 check("addon reload remains inactive until explicit enable", not PM.bridge.is_registered(lib),
       str(PM.bridge.library_state(lib)))
-r = bpy.ops.plugin_manager.setup_library()
+r = setup_library()
 check("setup after addon reload restores device configuration",
       r == {"FINISHED"} and PM.bridge.is_registered(lib))
 
@@ -372,7 +426,7 @@ prefs.library_path = ""
 check("clearing library path unmounts managed library", not PM.bridge.is_registered(lib),
       str(PM.bridge.library_state(lib)))
 prefs.library_path = lib
-r = bpy.ops.plugin_manager.setup_library()
+r = setup_library()
 check("setup remounts after clearing library path", r == {"FINISHED"} and PM.bridge.is_registered(lib))
 
 # 未启用管理时，启动流程不得按名称猜测并删除任何原生配置。
@@ -387,8 +441,9 @@ check("inactive bootstrap preserves unmanaged native entries",
       any(item == unmanaged_script for item in bpy.context.preferences.filepaths.script_directories)
       and any(item == unmanaged_repo for item in bpy.context.preferences.extensions.repos))
 prefs.library_path = lib
-r = bpy.ops.plugin_manager.setup_library()
-check("setup resumes takeover", r == {"FINISHED"} and PM.bridge.is_registered(lib))
+r = setup_library()
+check("setup resumes takeover", r == {"FINISHED"} and PM.bridge.is_registered(lib),
+      f"r={r}, status={prefs.library_job_status!r}, state={PM.bridge.library_state(lib)}")
 
 # --- 扩展插件：id 含空格必须净化为合法模块名 ---------------------------
 space_src = os.path.join(base, "SpaceExt")
@@ -466,23 +521,24 @@ check("connect: rejects plugin-as-library", bool(r_bad["error"]),
 # pick_library_path 先预览，显式启用才切换
 old_path = prefs.library_path
 r_op = bpy.ops.plugin_manager.pick_library_path(directory=flat_lib)
+finish_library_job()
 check("pick_library_path previews without switching",
       r_op == {"FINISHED"} and prefs.pending_library_path == flat_lib and prefs.library_path == old_path,
       str(prefs.pending_library_path))
-r_op = bpy.ops.plugin_manager.setup_library()
+r_op = setup_library()
 check("explicit activation switches library",
       r_op == {"FINISHED"} and os.path.normcase(prefs.library_path) == os.path.normcase(flat_lib),
       str(prefs.library_path))
 pinfo = PM.library.inspect_target(flat_lib)
 check("picked path is library", pinfo["is_library"])
 
-# pick_library_path：选中插件本身应被拒绝（Blender 报 ERROR 时会抛 RuntimeError）
+# pick_library_path：后台检查完成后拒绝插件目录，并保留当前库。
 prefs.library_path = lib  # 恢复
-try:
-    r_badop = bpy.ops.plugin_manager.pick_library_path(directory=legacy_src)
-except RuntimeError:
-    r_badop = {"CANCELLED"}
-check("pick_library_path rejects plugin dir", r_badop == {"CANCELLED"}, str(r_badop))
+bpy.ops.plugin_manager.pick_library_path(directory=legacy_src)
+finish_library_job()
+check("pick_library_path rejects plugin dir",
+      prefs.library_job_failed and "目录本身就是一个插件" in prefs.library_job_status
+      and not prefs.pending_library_path and prefs.library_path == lib)
 check("library_path unchanged after reject",
       os.path.normcase(prefs.library_path) == os.path.normcase(lib))
 
@@ -611,7 +667,7 @@ if os.path.isfile(log_path):
 
 # 恢复库路径，供随后的挂载往返测试使用
 prefs.library_path = lib
-bpy.ops.plugin_manager.setup_library()
+setup_library()
 
 # --- 双名称机制：实际名只读，显示名（别名）可改，不影响实际名 -------------
 alias_rec = PM.db.LibraryDB(lib).get(recs["LegacyDemo"]["key"])
@@ -1082,7 +1138,6 @@ check("filter yields only compatibility problems", all_inc)
 prefs.only_incompatible = False
 PM.items.rebuild_items(prefs)
 
-from pathlib import Path
 from threading import Event, get_ident
 from bl_plugin_manager import archive_jobs
 from bl_plugin_manager.storage import machine_config
@@ -1190,6 +1245,8 @@ try:
     machine_config.save({"library_path": str(offline), "management_enabled": True})
     PM._bootstrap_prefs()
     prefs.sync_startup_on_launch = True
+    check("launch sync waits for library preparation", PM._apply_launch_sync() == 0.2)
+    finish_library_job()
     PM._apply_launch_sync()
     check("offline startup preserves existing Blender paths",
           PM.bridge.find_script_dir(str(script_sentinel))[0] >= 0)
@@ -1199,9 +1256,11 @@ finally:
     prefs.sync_startup_on_launch = False
     machine_config.save(active_config)
     PM._bootstrap_prefs()
+    finish_library_job()
 
 broken_switch = Path(base, "mount-failure")
 assert bpy.ops.plugin_manager.pick_library_path(directory=str(broken_switch)) == {"FINISHED"}
+finish_library_job()
 original_apply_scope = PM.bridge.apply_scoped_configuration
 
 def fail_new_mount(config):
@@ -1211,18 +1270,219 @@ def fail_new_mount(config):
 
 try:
     PM.bridge.apply_scoped_configuration = fail_new_mount
-    try:
-        bpy.ops.plugin_manager.setup_library()
-    except RuntimeError:
-        check("failed switch restores old scope and path",
-              prefs.library_path == active_config["library_path"]
-              and machine_config.load()["library_path"] == active_config["library_path"]
-              and PM.bridge.is_registered(active_config["library_path"]))
-    else:
-        check("failed switch is reported", False)
+    setup_library()
+    check("failed switch restores old scope and path",
+          prefs.library_job_failed and "simulated mount failure" in prefs.library_job_status
+          and prefs.library_path == active_config["library_path"]
+          and machine_config.load()["library_path"] == active_config["library_path"]
+          and PM.bridge.is_registered(active_config["library_path"]))
 finally:
     PM.bridge.apply_scoped_configuration = original_apply_scope
     bpy.ops.plugin_manager.pick_library_path(cancel_preview=True)
+
+retry_library = Path(base, "migration-retry")
+retry_legacy = retry_library / ".pm" / "library.json"
+retry_legacy.parent.mkdir(parents=True)
+original_legacy = json.dumps({"schema": 2, "plugins": {}, "categories": []})
+retry_legacy.write_text(original_legacy, encoding="utf-8")
+bpy.ops.plugin_manager.pick_library_path(directory=str(retry_library))
+finish_library_job()
+with patch.object(PM.db.Catalog, "read_legacy", side_effect=OSError("simulated network read failure")):
+    setup_library()
+check("failed migration preserves the original database and mounted library",
+      prefs.library_job_failed and "simulated network read failure" in prefs.library_job_status
+      and retry_legacy.read_text(encoding="utf-8") == original_legacy
+      and PM.bridge.is_registered(active_config["library_path"]))
+setup_library()
+check("migration retries successfully after a network error",
+      not prefs.library_job_failed and not retry_legacy.exists()
+      and PM.bridge.is_registered(str(retry_library)))
+
+# ==========================================================================
+# Section 15: Composable Groups, Built-in Virtual Links & Native Display Names
+# ==========================================================================
+print("\n=== 15. 分组引擎、内置链接与原生中英双语显示名 ===")
+g_lib = Path(base, "groups-and-native")
+g_lib.mkdir(parents=True)
+bpy.ops.plugin_manager.pick_library_path(directory=str(g_lib))
+finish_library_job()
+setup_library()
+
+# Create 4 real legacy addons for multi-group stacking & solo switch tests
+def _make_toggleable_addon(folder_name: str, display: str) -> str:
+    src = Path(base, "grp_src", folder_name)
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "__init__.py").write_text(
+        f'bl_info = {{"name": "{display}", "version": (1, 0, 0), "blender": (4, 2, 0)}}\n'
+        'def register(): pass\n'
+        'def unregister(): pass\n',
+        encoding="utf-8",
+    )
+    return str(src)
+
+db_g = PM.db.LibraryDB(str(g_lib))
+rec_m = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_mod", "Mod Tool"), str(g_lib), db_g, move=True)
+rec_sh = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_shared", "Shared Helper"), str(g_lib), db_g, move=True)
+rec_sc = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_sculpt", "Sculpt Tool"), str(g_lib), db_g, move=True)
+rec_base = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_base", "Base Core"), str(g_lib), db_g, move=True)
+
+bpy.ops.plugin_manager.add_category(name="基础常驻")
+bpy.ops.plugin_manager.add_category(name="建模工作组")
+bpy.ops.plugin_manager.add_category(name="雕刻工作组")
+bpy.ops.plugin_manager.group_set_pinned(name="基础常驻", value=True)
+
+bpy.ops.plugin_manager.plugin_toggle_group(key=rec_base["key"], group="基础常驻")
+bpy.ops.plugin_manager.plugin_toggle_group(key=rec_m["key"], group="建模工作组")
+bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sh["key"], group="建模工作组")
+bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sh["key"], group="雕刻工作组")
+bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sc["key"], group="雕刻工作组")
+
+# Stack Modeling + Sculpting
+bpy.ops.plugin_manager.group_toggle(name="建模工作组", active=True)
+bpy.ops.plugin_manager.group_toggle(name="雕刻工作组", active=True)
+check("multi-group stacking enables all members",
+      PM.bridge.is_module_enabled("pm_grp_mod")
+      and PM.bridge.is_module_enabled("pm_grp_shared")
+      and PM.bridge.is_module_enabled("pm_grp_sculpt"))
+
+# Close Modeling while Sculpting remains open -> Shared Helper stays enabled
+bpy.ops.plugin_manager.group_toggle(name="建模工作组", active=False)
+check("closing one group keeps shared plugin enabled",
+      (not PM.bridge.is_module_enabled("pm_grp_mod"))
+      and PM.bridge.is_module_enabled("pm_grp_shared")
+      and PM.bridge.is_module_enabled("pm_grp_sculpt"))
+
+# Solo switch to Modeling keeps pinned Base Core open and closes Sculpting
+bpy.ops.plugin_manager.group_toggle(name="基础常驻", active=True)
+bpy.ops.plugin_manager.group_solo(name="建模工作组", keep_pinned=True)
+check("solo switch preserves pinned base group and swaps workflow groups",
+      PM.bridge.is_module_enabled("pm_grp_base")
+      and PM.bridge.is_module_enabled("pm_grp_mod")
+      and PM.bridge.is_module_enabled("pm_grp_shared")
+      and (not PM.bridge.is_module_enabled("pm_grp_sculpt")))
+
+# Group auto-start sync
+bpy.ops.plugin_manager.group_deactivate_all(include_pinned=True)
+bpy.ops.plugin_manager.group_set_startup(name="雕刻工作组", value=True)
+PM.library.apply_startup(str(g_lib), PM.db.LibraryDB(str(g_lib)), enable_marked=True, disable_unmarked=False)
+check("group startup enables all members of startup group",
+      PM.bridge.is_module_enabled("pm_grp_sculpt")
+      and PM.bridge.is_module_enabled("pm_grp_shared"))
+
+# Built-in virtual linking & conflict guard
+db_b = PM.db.LibraryDB(str(g_lib))
+builtins = [r for r in db_b.plugins.values() if r.get("kind") == PM.constants.KIND_BUILTIN]
+check("built-in core add-ons are virtually linked", len(builtins) >= 1, f"count={len(builtins)}")
+target_builtin = next((r for r in builtins if r.get("module") == "node_wrangler"), builtins[0] if builtins else None)
+if target_builtin:
+    b_mod = target_builtin["module"]
+    check("built-in files are not copied into library addons dir",
+          not (g_lib / "addons" / b_mod).exists())
+    # Importing a colliding addon folder with the same module name must be blocked
+    colliding = Path(base, b_mod)
+    colliding.mkdir(parents=True, exist_ok=True)
+    (colliding / "__init__.py").write_text(
+        'bl_info = {"name": "Fake Builtin", "version": (1, 0, 0), "blender": (4, 2, 0)}\n',
+        encoding="utf-8",
+    )
+    conflict_blocked = False
+    try:
+        PM.library.import_plugin_dir(str(colliding), str(g_lib), PM.db.LibraryDB(str(g_lib)), move=False)
+    except ValueError as exc:
+        conflict_blocked = "内置" in str(exc)
+    check("importing addon colliding with Blender built-in is blocked", conflict_blocked)
+
+    # Removing built-in to trash must be refused
+    trash_blocked = False
+    try:
+        PM.library.remove_plugin(str(g_lib), PM.db.LibraryDB(str(g_lib)), target_builtin["key"], to_trash=True)
+    except ValueError:
+        trash_blocked = True
+    check("removing built-in virtual link to trash is blocked", trash_blocked)
+
+    # Native bilingual display names (Original English + Chinese alias) in Add-ons & Get Extensions
+    bpy.ops.plugin_manager.rename_display(key=target_builtin["key"], display_name="节点管理测试")
+    bpy.ops.plugin_manager.rename_display(key=rec_m["key"], display_name="建模助手")
+    nst = PM.native_names.status()
+    check("native display name hooks installed for Add-ons and Get Extensions",
+          nst["installed"] and nst["addons_hooked"] and nst["extensions_hooked"], str(nst))
+
+    # Exercise real bl_extension_ui.addons_panel_draw_items with a label-capturing mock
+    import bl_pkg.bl_extension_ui as bl_ext_ui
+    captured_labels = []
+    class _CapLayout:
+        def __getattr__(self, name):
+            def _fn(*a, **kw):
+                if name == "label" and "text" in kw:
+                    captured_labels.append(kw["text"])
+                return _CapLayout()
+            return _fn
+        def __setattr__(self, k, v):
+            object.__setattr__(self, k, v)
+
+    b_fake = next((m for m in addon_utils.modules(refresh=False) if m.__name__ == b_mod), None)
+    orig_b_name = addon_utils.module_bl_info(b_fake)["name"] if b_fake else ""
+    if b_fake is not None:
+        bl_ext_ui.addons_panel_draw_items(
+            _CapLayout(), bpy.context,
+            addon_modules=[b_fake],
+            used_addon_module_name_map={},
+            search_casefold="",
+            addon_tags_exclude=set(),
+            enabled_only=False,
+            addon_extension_manifest_map={},
+            addon_extension_block_map={},
+            show_development=False,
+            show_developer_ui=False,
+        )
+        expected_label = f"{orig_b_name} (节点管理测试)"
+        check("native Add-ons panel renders English first then Chinese alias",
+              any(expected_label in t for t in captured_labels),
+              f"expected={expected_label!r}, got={captured_labels[:5]}")
+        check("native Add-ons draw restores bl_info name afterwards",
+              addon_utils.module_bl_info(b_fake)["name"] == orig_b_name,
+              addon_utils.module_bl_info(b_fake)["name"])
+
+    # Exercise real ExtensionUI_FilterParams.extension_ui_visible for Get Extensions
+    from collections import namedtuple
+    _Pkg = namedtuple("_Pkg", ("id", "name", "tagline", "type", "tags", "version", "maintainer", "website", "block"))
+    ext_pkg = _Pkg("demo_ext_cn", "Demo Extension", "Desc", "add-on", (), "1.0.0", "Auth", "", None)
+    db_n = PM.db.LibraryDB(str(g_lib))
+    db_n.merge_scan([{
+        "rel": "extensions/demo_ext_cn", "kind": "extension", "pkg_id": "demo_ext_cn", "id": "demo_ext_cn",
+        "name": "Demo Extension", "folder_name": "demo_ext_cn", "version": "1.0.0",
+    }], complete=False, persist=False)
+    eid = next(k for k, v in db_n.plugins.items() if v.get("pkg_id") == "demo_ext_cn")
+    db_n.get(eid)["module"] = "bl_ext.blender_org.demo_ext_cn"
+    db_n.get(eid)["display_name"] = "演示扩展"
+    db_n.save()
+    PM.native_names.invalidate_cache()
+    params = bl_ext_ui.ExtensionUI_FilterParams(
+        search_casefold="演示扩展",
+        tags_exclude=set(),
+        filter_by_type="add-on",
+        addons_enabled=set(),
+        active_theme_info=("", ""),
+        repos_all=[type("R", (), {"module": "blender_org"})()],
+        repo_filter="_ALL_",
+        show_installed_enabled=True,
+        show_installed_disabled=True,
+        show_available=True,
+    )
+    local_manifest = {"demo_ext_cn": ext_pkg}
+    visible = list(params.extension_ui_visible(0, local_manifest, None))
+    check("Get Extensions matches Chinese search and formats English (Chinese)",
+          len(visible) == 1 and visible[0].item_local.name == "Demo Extension (演示扩展)",
+          str([v.item_local.name for v in visible]))
+    check("Get Extensions patch does not mutate original manifest cache",
+          local_manifest["demo_ext_cn"].name == "Demo Extension")
+
+    # Deactivating management must NOT disable an enabled Blender built-in add-on
+    PM.bridge.set_enabled(b_mod, True)
+    PM.scoped_management.deactivate(str(g_lib))
+    check("stopping management preserves enabled Blender built-in add-on",
+          PM.bridge.is_module_enabled(b_mod))
+    PM.bridge.set_enabled(b_mod, False)
 
 print("\n===SUMMARY===")
 fails = [r for r in RESULTS if not r[1]]

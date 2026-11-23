@@ -535,6 +535,97 @@ def is_module_enabled(module: str) -> bool:
         return False
 
 
+def _is_builtin_core_module(mod) -> bool:
+    """Return True when ``mod`` lives under Blender's bundled ``addons_core``."""
+    filepath = getattr(mod, "__file__", "") or ""
+    if not filepath:
+        return False
+    parts = os.path.normpath(filepath).split(os.sep)
+    if parts and parts[-1] == "__init__.py" and len(parts) >= 3:
+        return parts[-3] == "addons_core"
+    if len(parts) >= 2:
+        return parts[-2] == "addons_core"
+    return False
+
+
+def builtin_module_names() -> set[str]:
+    """Module names bundled with the running Blender (``scripts/addons_core``).
+
+    Used to block importing third-party copies that would collide with Blender's
+    built-in core add-ons and trigger duplicate-addon errors on Blender upgrade.
+    """
+    names: set[str] = set()
+    try:
+        for mod in addon_utils.modules(refresh=False):
+            if _is_builtin_core_module(mod):
+                names.add(mod.__name__)
+    except Exception:
+        pass
+    try:
+        hidden = getattr(addon_utils, "_addons_hidden_core", ())
+        for name in hidden:
+            if isinstance(name, str) and name:
+                names.add(name)
+    except Exception:
+        pass
+    return names
+
+
+def discover_builtin_addons() -> list[dict]:
+    """Discover Blender's bundled core add-ons for virtual link management.
+
+    Built-in add-ons stay inside Blender's own installation directory and are
+    never copied into the user's plugin library.
+    """
+    entries: list[dict] = []
+    try:
+        hidden = set(getattr(addon_utils, "_addons_hidden_core", ()))
+    except Exception:
+        hidden = set()
+    try:
+        mods = list(addon_utils.modules(refresh=False))
+    except Exception:
+        return entries
+
+    for mod in mods:
+        mod_name = getattr(mod, "__name__", "") or ""
+        if not mod_name or mod_name in hidden or mod_name == C.ADDON_ID:
+            continue
+        if not _is_builtin_core_module(mod):
+            continue
+        try:
+            info = addon_utils.module_bl_info(mod)
+        except Exception:
+            info = {}
+        ver = info.get("version") or ()
+        ver_str = ".".join(str(x) for x in ver) if isinstance(ver, (list, tuple)) else str(ver or "")
+        bmin = info.get("blender") or ()
+        bmin_str = ".".join(str(x) for x in bmin) if isinstance(bmin, (list, tuple)) else str(bmin or "")
+        entries.append({
+            "rel": f"{C.BUILTIN_REL_PREFIX}{mod_name}",
+            "kind": C.KIND_BUILTIN,
+            "pkg_id": "",
+            "id": "",
+            "name": str(info.get("name") or mod_name),
+            "folder_name": mod_name,
+            "version": ver_str,
+            "blender_min": bmin_str,
+            "blender_max": "",
+            "pkg_type": "add-on",
+            "author": str(info.get("author") or "Blender Foundation"),
+            "description": str(info.get("description") or "").rstrip("."),
+            "auto_category": str(info.get("category") or C.DEFAULT_CATEGORY),
+            "auto_tags": [],
+            "doc_url": str(info.get("doc_url") or ""),
+            "location": str(info.get("location") or ""),
+            "metadata_fingerprint": [],
+            "issues": [],
+            "module": mod_name,
+            "source_path": str(getattr(mod, "__file__", "") or ""),
+        })
+    return entries
+
+
 def _residue_modules(module: str) -> tuple[str, ...]:
     """该插件的"归属模块名"集合。
 

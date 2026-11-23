@@ -67,6 +67,9 @@ def select_targets(records, enabled_modules, include_enabled: bool = False,
         if rec.get("missing"):
             sel.skipped_missing += 1
             continue
+        if rec.get("kind") == "builtin":
+            sel.skipped_unbound += 1
+            continue
         # 主题(theme)不是插件，无法用 addon_enable 启用，跳过
         if (rec.get("pkg_type") or rec.get("type") or "").strip() == "theme":
             sel.skipped_theme += 1

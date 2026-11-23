@@ -243,6 +243,24 @@ def _apply_user_defaults(db: LibraryDB, plugin_id: str, entry: dict,
 # ---------------------------------------------------------------------------
 # 导入
 # ---------------------------------------------------------------------------
+def builtin_conflict_reason(plugin_dir: str, kind: str, meta: dict | None = None, *,
+                            folder: str = "") -> str:
+    """Return a user-facing conflict reason if importing would shadow a Blender built-in."""
+    if kind != C.KIND_ADDON:
+        return ""
+    candidate = (folder or sanitize_name(os.path.basename(os.path.normpath(plugin_dir)))).lower()
+    if not candidate:
+        return ""
+    builtins = {name.lower() for name in bridge.builtin_module_names()}
+    if candidate in builtins:
+        label = (meta or {}).get("name") or candidate
+        return (
+            f"「{label}」({candidate}) 与 Blender 内置插件模块名冲突，不能复制入库；"
+            "请直接在管理器中使用「内置插件」虚拟链接进行分组与命名管理"
+        )
+    return ""
+
+
 def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = False,
                       enable: bool = False, origin: str = "manual",
                       origin_path: str = "") -> dict:
@@ -257,6 +275,8 @@ def import_plugin_dir(plugin_dir: str, root: str, db: LibraryDB, move: bool = Fa
         folder = sanitize_module_name(meta.get("id") or os.path.basename(plugin_dir))
     else:
         folder = sanitize_name(os.path.basename(plugin_dir))
+    if conflict := builtin_conflict_reason(plugin_dir, kind, meta, folder=folder):
+        raise ValueError(conflict)
     base = _base_for(root, kind)
     os.makedirs(base, exist_ok=True)
 
@@ -470,20 +490,9 @@ def connect_library(root: str, db: LibraryDB, move_flat: bool = True) -> dict:
     return result
 
 
-def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
-    """扫描库内容，把本机安装的插件连接到总资料库。
-
-    记录以稳定 plugin_id 为键；本机实际安装位置保存在 ``db.bindings`` 中。
-    已存在且元数据未变的插件只刷新本机派生字段（模块名、启用状态），跳过
-    manifest 重解析与写盘。
-
-    性能要点：模块索引只解析一次并复用（原先每个插件都全量遍历一次，
-    152 个约 8 秒）。
-    """
+def scan_library_entries(root: str) -> list[dict]:
+    """Read plugin metadata from disk without consulting Blender."""
     entries = []
-    runtime_modules: dict[str, str] = {}
-    module_index = bridge._module_index()
-    active_repo = bridge._active_repo_module()
 
     for kind, base in ((C.KIND_ADDON, os.path.join(root, C.DIR_ADDONS)),
                        (C.KIND_EXTENSION, os.path.join(root, C.DIR_EXTENSIONS))):
@@ -493,11 +502,6 @@ def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
             meta = entry["meta"] or {}
             folder = os.path.basename(os.path.normpath(entry["abs"]))
             key = rel_key(root, entry["abs"])
-            module = module_index.get(bridge._norm(entry["abs"]))
-            if not module:
-                module = (f"bl_ext.{active_repo}.{folder}"
-                          if kind == C.KIND_EXTENSION else folder)
-            runtime_modules[key] = module
             entries.append({
                 "rel": key,
                 "kind": kind,
@@ -520,17 +524,86 @@ def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
                 "issues": (scan.manifest_issues(entry["abs"])
                            if kind == C.KIND_EXTENSION else []),
             })
+    return entries
 
+
+def sync_library(root: str, db: LibraryDB, skip_unchanged: bool = True) -> dict:
+    """Scan installed plugins and link them to the catalog."""
+    entries = scan_library_entries(root)
     db.merge_scan(entries)
+    return apply_scan_runtime(root, db, entries)
+
+
+def sync_builtins(root: str, db: LibraryDB, *, enabled: bool | None = None,
+                  persist: bool = False) -> dict:
+    """Link or unlink Blender's built-in core add-ons without copying files into the library."""
+    if enabled is None:
+        prefs = bridge.get_prefs()
+        enabled = bool(getattr(prefs, "manage_builtin_addons", True)) if prefs is not None else True
+
+    if not enabled:
+        removed = 0
+        for key in [k for k, r in list(db.plugins.items()) if r.get("kind") == C.KIND_BUILTIN]:
+            db.remove(key)
+            removed += 1
+        if persist and removed:
+            db.save()
+        return {"linked": 0, "removed": removed}
+
+    entries = bridge.discover_builtin_addons()
+    present_rels = {entry["rel"] for entry in entries}
+    if entries:
+        db.merge_scan(entries, complete=False, persist=False)
+    by_rel = {entry["rel"]: entry for entry in entries}
+    linked = 0
+    for record in db.plugins.values():
+        if record.get("kind") != C.KIND_BUILTIN:
+            continue
+        rel = record.get("rel", "")
+        entry = by_rel.get(rel)
+        if entry:
+            module = entry["module"]
+            record["module"] = module
+            record["source_path"] = entry.get("source_path", "")
+            record["enabled"] = bridge.is_module_enabled(module)
+            record["missing"] = False
+            record["compat"], record["compat_detail"] = scan.blender_compat(
+                record.get("blender_min", ""), record.get("blender_max", ""))
+            linked += 1
+        elif rel not in present_rels:
+            record["missing"] = True
+    if persist:
+        db.save()
+    return {"linked": linked, "removed": 0}
+
+
+def apply_scan_runtime(root: str, db: LibraryDB, entries: list[dict]) -> dict:
+    """Resolve modules after mounting, then save the merged scan and runtime state."""
+    module_index = bridge._module_index()
+    active_repo = bridge._active_repo_module()
+    runtime_modules = {}
+    for entry in entries:
+        key = entry["rel"]
+        folder = entry["folder_name"]
+        module = module_index.get(bridge._norm(os.path.join(root, key)))
+        if not module:
+            module = f"bl_ext.{active_repo}.{folder}" if entry["kind"] == C.KIND_EXTENSION else folder
+        runtime_modules[key] = module
+
     stats = dict(db.scan_stats or {})
     stats.setdefault("added", 0)
     stats.setdefault("updated", 0)
     stats.setdefault("unchanged", 0)
     stats.setdefault("missing", 0)
+
+    builtin_stats = sync_builtins(root, db, persist=False)
+    stats["builtins"] = builtin_stats.get("linked", 0)
     stats["bindings"] = len(db.bindings)
 
     # 本机派生字段：模块名、启用状态、缺失标记。写入本机运行状态，不进总资料库。
     for record in db.plugins.values():
+        if record.get("kind") == C.KIND_BUILTIN:
+            continue
         record["compat"], record["compat_detail"] = scan.blender_compat(
             record.get("blender_min", ""), record.get("blender_max", ""))
         module = runtime_modules.get(record.get("rel", ""))
@@ -552,6 +625,8 @@ def remove_plugin(root: str, db: LibraryDB, key: str, to_trash: bool = True) -> 
     rec = db.get(key)
     if not rec:
         return None
+    if rec.get("kind") == C.KIND_BUILTIN:
+        raise ValueError("Blender 内置插件为虚拟链接管理，不能移入回收站（可在偏好设置中关闭内置链接）")
     try:
         plugin_dir = str(resolve_record_path(root, rec["rel"], rec.get("kind", "addon")))
     except UnsafeLibraryPathError:
@@ -664,30 +739,31 @@ def restore_plugin(root: str, db: LibraryDB, trash_id: str) -> dict:
 # ---------------------------------------------------------------------------
 def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
                   disable_unmarked: bool = False) -> dict:
-    """按库中的自启标记同步 Blender 的插件启用状态。
+    """按库中的「自启分组」与单插件「自启标记」同步 Blender 的插件启用状态。
 
-    * enable_marked   ：把标记为「自启」的插件启用（默认开启）
-    * disable_unmarked：把未标记自启的插件停用（默认关闭，需显式开启）
-
-    默认只做「确保自启的插件是启用的」，不会主动停用任何插件——这样即使你
-    还没整理好自启标记，也不会有插件被意外关掉。
+    * enable_marked   ：启用标记为自启的插件及所有自启分组内的成员（默认开启）
+    * disable_unmarked：停用未在自启集合内的库内插件（默认关闭，需显式开启；
+                        绝不会强制停用 Blender 内置插件）
     """
-    stats = {"enabled": 0, "disabled": 0, "failed": [], "skipped": 0}
+    from .services import groups as group_service
+
+    stats = {"enabled": 0, "disabled": 0, "failed": [], "skipped": 0, "groups": 0}
+    startup_keys, startup_groups = group_service.effective_startup_targets(db)
     # 一次性取得当前已启用集合，避免逐个插件遍历 preferences.addons
     enabled_set = bridge.enabled_modules()
     for key, rec in list(db.plugins.items()):
         module = rec.get("module")
-        if not module or rec.get("missing"):
+        if not module or rec.get("missing") or module == C.ADDON_ID:
             stats["skipped"] += 1
             continue
-        want = bool(rec.get("startup"))
+        want = key in startup_keys
         if want and enable_marked:
             if module in enabled_set:
+                rec["enabled"] = True
                 continue
             ok, err = bridge.set_enabled(module, True)
             if ok:
                 enabled_set.add(module)
-            if ok:
                 rec["enabled"] = True
                 rec["startup_override"] = True
                 rec["last_error"] = ""
@@ -696,7 +772,10 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
                 rec["last_error"] = err
                 stats["failed"].append({"module": module, "name": rec.get("name"), "error": err})
         elif (not want) and disable_unmarked:
+            if rec.get("kind") == C.KIND_BUILTIN:
+                continue
             if module not in enabled_set:
+                rec["enabled"] = False
                 continue
             ok, err = bridge.set_enabled(module, False)
             if ok:
@@ -707,6 +786,10 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
             else:
                 rec["last_error"] = err
                 stats["failed"].append({"module": module, "name": rec.get("name"), "error": err})
+    if enable_marked and startup_groups:
+        for group_name in startup_groups:
+            db.set_group_state(group_name, active=True)
+        stats["groups"] = len(startup_groups)
     db.save()
     return stats
 

@@ -50,8 +50,8 @@ _V2_RUNTIME_FIELDS = frozenset({
     "last_error", "restore_error", "residue", "compat", "compat_detail",
     "metadata_fingerprint", "last_checked", "update_available", "latest_version",
     "latest_url", "latest_hash", "latest_size", "latest_website",
-    # 来源与合规检查结果：origin_path 是本机绝对路径，只存本机。
-    "origin", "origin_path", "imported_at", "issues",
+    # 来源与合规检查结果：origin_path / source_path 是本机绝对路径，只存本机。
+    "origin", "origin_path", "source_path", "imported_at", "issues",
     "version", "blender_min", "blender_max", "archive_source", "load_environment",
     "latest_repo", "update_source_required",
     "startup_override",
@@ -122,6 +122,7 @@ def clear_load_result(record: dict) -> None:
 _USER_DEFAULTS = {
     "display_name": "",
     "category": C.DEFAULT_CATEGORY,
+    "groups": [],
     "tags": [],
     "note": "",
     "favorite": False,
@@ -129,10 +130,35 @@ _USER_DEFAULTS = {
 }
 
 
+def _normalize_group_list(raw, fallback_category: str = "") -> list[str]:
+    """Normalize a plugin's group membership list (excluding the uncategorized sentinel)."""
+    groups: list[str] = []
+    seen: set[str] = set()
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            name = str(item or "").strip()
+            if name and name != C.DEFAULT_CATEGORY and name not in seen:
+                seen.add(name)
+                groups.append(name)
+    if not groups:
+        cat = str(fallback_category or "").strip()
+        if cat and cat != C.DEFAULT_CATEGORY:
+            groups.append(cat)
+    return groups
+
+
 def _with_user_defaults(record: dict) -> dict:
+    has_groups = isinstance(record.get("groups"), list)
     for field, value in _USER_DEFAULTS.items():
         if record.get(field) is None:
             record[field] = list(value) if isinstance(value, list) else value
+    cat = str(record.get("category") or "").strip()
+    if has_groups:
+        record["groups"] = _normalize_group_list(record.get("groups"))
+        record["category"] = record["groups"][0] if record["groups"] else C.DEFAULT_CATEGORY
+    else:
+        record["groups"] = _normalize_group_list([], fallback_category=cat)
+        record["category"] = record["groups"][0] if record["groups"] else C.DEFAULT_CATEGORY
     return record
 
 
@@ -164,11 +190,12 @@ def _merge_changes(base: dict, edited: dict, latest: dict, conflicts=None, path=
 class LibraryDB:
     """总资料库 + 本机绑定 + 本机运行状态的读写视图。"""
 
-    def __init__(self, root: str, use_cache: bool = True):
+    def __init__(self, root: str, use_cache: bool = True, *, load_environment: str | None = None):
         self.root = root
         self.catalog = Catalog(root)
         self.path = str(self.catalog.path)
         self._use_cache = use_cache
+        self._load_environment = load_environment if load_environment is not None else compatibility_environment()
         # 解析缓存由 json_cache 统一按文件签名处理；use_cache=False 用于必须
         # 直接读盘的受控流程（首次激活、切库）。
         if not use_cache:
@@ -178,6 +205,7 @@ class LibraryDB:
         self.loaded_signature = None
         self._bindings: dict[str, str] = {}
         self._runtime: dict[str, dict] = {}
+        self._group_state: dict[str, dict] = {}
         # 最近一次 merge_scan 的统计（added/updated/missing/renamed…）与
         # 本次扫描的 rel -> plugin_id 映射。
         self.scan_stats: dict = {}
@@ -190,7 +218,7 @@ class LibraryDB:
         status = self.catalog.load()
         self._catalog_baseline = deepcopy(self.catalog.plugins) if status == "OK" else {}
         legacy_status = self.catalog.legacy_status() if status != "OK" else "MISSING"
-        self._bindings, self._runtime = {}, {}
+        self._bindings, self._runtime, self._group_state = {}, {}, {}
         if status == "OK":
             self.status = "OK"
         elif status in {"CORRUPT", "UNSUPPORTED"} or legacy_status in {"CORRUPT", "UNSUPPORTED"}:
@@ -210,7 +238,7 @@ class LibraryDB:
             return
 
         library_id = str(self.catalog.data.get("library_id") or "")
-        self._bindings, self._runtime = self._load_local(library_id)
+        self._bindings, self._runtime, self._group_state = self._load_local(library_id)
 
         plugins: dict[str, dict] = {}
         for plugin_id, portable in self.catalog.plugins.items():
@@ -228,7 +256,7 @@ class LibraryDB:
             runtime = self._runtime.get(plugin_id)
             if isinstance(runtime, dict):
                 record.update(runtime)
-            if record.get("load_environment") and record["load_environment"] != compatibility_environment():
+            if record.get("load_environment") and record["load_environment"] != self._load_environment:
                 clear_load_result(record)
             record.setdefault("missing", False)
             if not record.get("name"):
@@ -244,7 +272,7 @@ class LibraryDB:
         }
         self._baseline = deepcopy(self._split())
 
-    def _load_local(self, library_id: str) -> tuple[dict, dict]:
+    def _load_local(self, library_id: str) -> tuple[dict, dict, dict]:
         state = self._state_store(library_id).load()
         raw_bindings = state.get("bindings")
         bindings = ({str(k): str(v) for k, v in raw_bindings.items()
@@ -253,7 +281,16 @@ class LibraryDB:
         raw_runtime = state.get("plugins")
         runtime = ({str(k): dict(v) for k, v in raw_runtime.items() if isinstance(v, dict)}
                    if isinstance(raw_runtime, dict) else {})
-        return bindings, runtime
+        raw_groups = state.get("groups")
+        groups = {}
+        if isinstance(raw_groups, dict):
+            for name, cfg in raw_groups.items():
+                if isinstance(name, str) and name and isinstance(cfg, dict):
+                    groups[name] = {
+                        "active": bool(cfg.get("active", False)),
+                        "startup": bool(cfg.get("startup", False)),
+                    }
+        return bindings, runtime, groups
 
     def _state_store(self, library_id: str) -> StateStore:
         return StateStore(library_id or "unknown", _environment())
@@ -283,8 +320,8 @@ class LibraryDB:
         if previous_id and previous_id != library_id:
             raise catalog_store.CatalogConflictError("库标识已变更，请重新打开插件库后再保存")
         current = self._split()
-        old_shared, old_bindings, old_runtime = self._baseline
-        shared, bindings, runtime = current
+        old_shared, old_bindings, old_runtime, old_groups = self._baseline
+        shared, bindings, runtime, groups = current
         existing = {"plugins": self.catalog.plugins,
                     "categories": {item["id"]: item for item in self.catalog.categories}}
         conflicts = []
@@ -309,12 +346,17 @@ class LibraryDB:
                 self.catalog.load()
                 raise
 
-        if bindings != old_bindings or runtime != old_runtime:
-            latest_bindings, latest_runtime = self._load_local(library_id)
+        if bindings != old_bindings or runtime != old_runtime or groups != old_groups:
+            latest_bindings, latest_runtime, latest_groups = self._load_local(library_id)
             self._bindings = _merge_changes(old_bindings, bindings, latest_bindings)
             self._runtime = _merge_changes(old_runtime, runtime, latest_runtime)
-            self._state_store(library_id).save(
-                {"schema": 2, "bindings": self._bindings, "plugins": self._runtime})
+            self._group_state = _merge_changes(old_groups, groups, latest_groups)
+            self._state_store(library_id).save({
+                "schema": 2,
+                "bindings": self._bindings,
+                "plugins": self._runtime,
+                "groups": self._group_state,
+            })
         self._baseline = deepcopy(current)
         self._catalog_baseline = deepcopy(shared["plugins"])
         self.status = "OK"
@@ -322,15 +364,31 @@ class LibraryDB:
         self.data["library_id"] = library_id
         self.data["revision"] = int(self.catalog.data.get("revision", 0))
 
-    def _split(self) -> tuple[dict, dict, dict]:
-        """把视图记录按归属拆成 总资料库 / 绑定 / 运行状态。
+    def _split(self) -> tuple[dict, dict, dict, dict]:
+        """把视图记录按归属拆成 总资料库 / 绑定 / 运行状态 / 分组状态。
 
         以资料库既有条目为底，保证本机未安装的条目不会被这次写入抹掉。
         """
         catalog_plugins = dict(self._catalog_baseline)
         bindings: dict[str, str] = {}
         runtime: dict[str, dict] = {}
+        old_plugins = (self._baseline[0].get("plugins", {})
+                       if getattr(self, "_baseline", None) else {})
         for plugin_id, record in self.data["plugins"].items():
+            # Keep legacy `category` and multi-group `groups` synchronized
+            # regardless of which one the caller mutated.
+            old_rec = old_plugins.get(plugin_id) or {}
+            old_cat = str(old_rec.get("category") or C.DEFAULT_CATEGORY)
+            old_groups = _normalize_group_list(old_rec.get("groups"), fallback_category=old_cat)
+            cur_cat = str(record.get("category") or C.DEFAULT_CATEGORY).strip() or C.DEFAULT_CATEGORY
+            cur_groups = _normalize_group_list(record.get("groups"))
+            if cur_cat != old_cat and cur_groups == old_groups:
+                cur_groups = [cur_cat] if cur_cat != C.DEFAULT_CATEGORY else []
+                record["groups"] = cur_groups
+            else:
+                record["groups"] = cur_groups
+                record["category"] = cur_groups[0] if cur_groups else C.DEFAULT_CATEGORY
+
             portable = {field: record[field] for field in PORTABLE_FIELDS if field in record}
             portable["plugin_id"] = plugin_id
             catalog_plugins[plugin_id] = portable
@@ -341,7 +399,11 @@ class LibraryDB:
             if fields:
                 runtime[plugin_id] = fields
         categories = {item["id"]: dict(item) for item in self._category_records()}
-        return {"plugins": catalog_plugins, "categories": categories}, bindings, runtime
+        groups = {name: {"active": bool(cfg.get("active", False)),
+                         "startup": bool(cfg.get("startup", False))}
+                  for name, cfg in self._group_state.items()
+                  if isinstance(name, str) and name and isinstance(cfg, dict)}
+        return {"plugins": catalog_plugins, "categories": categories}, bindings, runtime, groups
 
     # -- 初始化与迁移 ------------------------------------------------------
     def prepare(self) -> str:
@@ -402,7 +464,8 @@ class LibraryDB:
         occupied = {
             slug(os.path.basename(os.path.normpath(rel)))
             for rel in self._bindings.values()
-            if rel and os.path.isdir(os.path.join(self.root, rel.replace("/", os.sep)))
+            if rel and not rel.startswith(C.BUILTIN_REL_PREFIX)
+            and os.path.isdir(os.path.join(self.root, rel.replace("/", os.sep)))
         }
         result = link_scan(self.catalog.plugins, self._bindings, entries,
                            occupied_folders=occupied)
@@ -419,7 +482,7 @@ class LibraryDB:
             entry = scanned[record["rel"]]
             if any(field in entry and entry[field] != record.get(field) for field in _INSTALL_FIELDS):
                 clear_load_result(record)
-            if record.get("load_environment") and record["load_environment"] != compatibility_environment():
+            if record.get("load_environment") and record["load_environment"] != self._load_environment:
                 clear_load_result(record)
             for field in _INSTALL_FIELDS:
                 if field in entry:
@@ -428,10 +491,17 @@ class LibraryDB:
             if not record.get("name"):
                 record["name"] = record["folder_name"]
             _with_user_defaults(record)
+        previous_plugins = dict(self.data.get("plugins") or {})
         self.data["plugins"] = {pid: result.plugins[pid] for pid in result.present}
         # 未在本机扫描到的既有绑定需要保留其记录（启用意图与别名不丢）。
         for plugin_id, rel in result.bindings.items():
             if plugin_id in self.data["plugins"] or plugin_id not in self.catalog.plugins:
+                continue
+            prev = previous_plugins.get(plugin_id)
+            if isinstance(prev, dict) and not complete:
+                record = dict(prev)
+                record["rel"] = rel
+                self.data["plugins"][plugin_id] = _with_user_defaults(record)
                 continue
             record = dict(self.catalog.plugins[plugin_id])
             record["key"] = plugin_id
@@ -441,7 +511,7 @@ class LibraryDB:
             runtime = self._runtime.get(plugin_id)
             if isinstance(runtime, dict):
                 record.update(runtime)
-            if complete:
+            if complete and record.get("kind") != C.KIND_BUILTIN:
                 record["missing"] = True
             if not record.get("name"):
                 record["name"] = record["folder_name"]
@@ -543,54 +613,167 @@ class LibraryDB:
 
     def rename_category(self, old: str, new: str) -> None:
         new = (new or "").strip()
-        if not new:
+        if not new or old == C.DEFAULT_CATEGORY:
             return
         for item in self._category_records():
             if item.get("name") == old:
                 item["name"] = new
                 item["id"] = new
         for rec in self.plugins.values():
-            if rec.get("category") == old:
+            groups = _normalize_group_list(rec.get("groups"), fallback_category=rec.get("category", ""))
+            if old in groups:
+                updated = []
+                for g in groups:
+                    target = new if g == old else g
+                    if target not in updated:
+                        updated.append(target)
+                rec["groups"] = updated
+                rec["category"] = updated[0] if updated else C.DEFAULT_CATEGORY
+            elif rec.get("category") == old:
                 rec["category"] = new
+                rec["groups"] = [new]
+        if old in self._group_state:
+            state = self._group_state.pop(old)
+            self._group_state.setdefault(new, state)
 
     def delete_category(self, name: str) -> None:
-        """删除分类，其下插件回到「未分类」（不会删除插件）。"""
+        """删除分组/分类，其下插件移出该组（不会删除插件）。"""
         if name == C.DEFAULT_CATEGORY:
             return
         self.data["categories"] = [
             item for item in self._category_records() if item.get("name") != name
         ]
         for rec in self.plugins.values():
-            if rec.get("category") == name:
+            groups = _normalize_group_list(rec.get("groups"), fallback_category=rec.get("category", ""))
+            if name in groups:
+                groups = [g for g in groups if g != name]
+                rec["groups"] = groups
+                rec["category"] = groups[0] if groups else C.DEFAULT_CATEGORY
+            elif rec.get("category") == name:
                 rec["category"] = C.DEFAULT_CATEGORY
+                rec["groups"] = []
+        self._group_state.pop(name, None)
 
     def reset_auto_categories(self) -> dict:
         """把「仍是插件自带分类、你未改动过」的归类收回为未分类。"""
         moved = 0
         for rec in self.plugins.values():
             auto = (rec.get("auto_category") or "").strip()
-            cur = (rec.get("category") or "").strip()
-            if cur and cur != C.DEFAULT_CATEGORY and cur == auto:
+            groups = _normalize_group_list(rec.get("groups"), fallback_category=rec.get("category", ""))
+            if len(groups) == 1 and groups[0] == auto and auto != C.DEFAULT_CATEGORY:
+                rec["groups"] = []
                 rec["category"] = C.DEFAULT_CATEGORY
                 moved += 1
-        remaining = {
-            (rec.get("category") or "").strip()
-            for rec in self.plugins.values()
-            if (rec.get("category") or "").strip()
-            and (rec.get("category") or "").strip() != C.DEFAULT_CATEGORY
-        }
-        self.data["categories"] = [dict(catalog_store.DEFAULT_CATEGORY)] + [
-            {"id": name, "name": name, "order": i + 1}
-            for i, name in enumerate(sorted(remaining))
-        ]
+        remaining = set()
+        for rec in self.plugins.values():
+            for g in _normalize_group_list(rec.get("groups"), fallback_category=rec.get("category", "")):
+                if g and g != C.DEFAULT_CATEGORY:
+                    remaining.add(g)
+        existing_meta = {item.get("name"): item for item in self._category_records()}
+        rebuilt = [dict(catalog_store.DEFAULT_CATEGORY)]
+        for i, name in enumerate(sorted(remaining)):
+            item = dict(existing_meta.get(name) or {"id": name, "name": name})
+            item["id"] = name
+            item["name"] = name
+            item["order"] = i + 1
+            rebuilt.append(item)
+        self.data["categories"] = rebuilt
+        self._group_state = {k: v for k, v in self._group_state.items() if k in remaining}
         return {"moved": moved, "categories_left": len(self.data["categories"])}
 
     def category_counts(self) -> dict:
         counts = {name: 0 for name in self.categories}
-        for rec in self.plugins.values():
-            cat = rec.get("category") or C.DEFAULT_CATEGORY
-            counts[cat] = counts.get(cat, 0) + 1
+        for key in self.plugins:
+            groups = self.plugin_groups(key)
+            if not groups:
+                counts[C.DEFAULT_CATEGORY] = counts.get(C.DEFAULT_CATEGORY, 0) + 1
+            else:
+                for g in groups:
+                    counts[g] = counts.get(g, 0) + 1
         return counts
+
+    # -- 分组（多对多归属 + 本机启停/自启状态） ----------------------------
+    def group_records(self) -> list[dict]:
+        """Return user groups (excluding uncategorized) merged with local state."""
+        out: list[dict] = []
+        for idx, item in enumerate(self._category_records()):
+            name = str(item.get("name") or "").strip()
+            if not name or name == C.DEFAULT_CATEGORY or item.get("id") == "uncategorized":
+                continue
+            state = self._group_state.get(name) or {}
+            out.append({
+                "id": str(item.get("id") or name),
+                "name": name,
+                "order": int(item.get("order", idx)),
+                "pinned": bool(item.get("pinned", False)),
+                "description": str(item.get("description") or ""),
+                "active": bool(state.get("active", False)),
+                "startup": bool(state.get("startup", False)),
+            })
+        return out
+
+    def group_names(self) -> list[str]:
+        return [g["name"] for g in self.group_records()]
+
+    def get_group_state(self, name: str) -> dict:
+        state = self._group_state.get(name) or {}
+        return {
+            "active": bool(state.get("active", False)),
+            "startup": bool(state.get("startup", False)),
+        }
+
+    def set_group_state(self, name: str, *, active: bool | None = None,
+                        startup: bool | None = None) -> dict:
+        name = (name or "").strip()
+        if not name or name == C.DEFAULT_CATEGORY:
+            return {"active": False, "startup": False}
+        self.ensure_category(name)
+        cur = self.get_group_state(name)
+        if active is not None:
+            cur["active"] = bool(active)
+        if startup is not None:
+            cur["startup"] = bool(startup)
+        self._group_state[name] = cur
+        return dict(cur)
+
+    def set_group_pinned(self, name: str, pinned: bool) -> None:
+        name = (name or "").strip()
+        if not name or name == C.DEFAULT_CATEGORY:
+            return
+        self.ensure_category(name)
+        for item in self._category_records():
+            if item.get("name") == name:
+                item["pinned"] = bool(pinned)
+                break
+
+    def plugin_groups(self, key: str) -> list[str]:
+        rec = self.get(key)
+        if not rec:
+            return []
+        return _normalize_group_list(rec.get("groups"), fallback_category=rec.get("category", ""))
+
+    def set_plugin_groups(self, key: str, group_names: list[str]) -> list[str]:
+        rec = self.get(key)
+        if not rec:
+            return []
+        cleaned = _normalize_group_list(group_names)
+        for name in cleaned:
+            self.ensure_category(name)
+        rec["groups"] = cleaned
+        rec["category"] = cleaned[0] if cleaned else C.DEFAULT_CATEGORY
+        return list(cleaned)
+
+    def add_plugin_to_group(self, key: str, group_name: str) -> list[str]:
+        name = (group_name or "").strip()
+        groups = self.plugin_groups(key)
+        if name and name != C.DEFAULT_CATEGORY and name not in groups:
+            groups.append(name)
+        return self.set_plugin_groups(key, groups)
+
+    def remove_plugin_from_group(self, key: str, group_name: str) -> list[str]:
+        name = (group_name or "").strip()
+        groups = [g for g in self.plugin_groups(key) if g != name]
+        return self.set_plugin_groups(key, groups)
 
     # -- 统计 --------------------------------------------------------------
     def startup_stats(self) -> dict:

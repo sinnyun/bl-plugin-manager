@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 3, 2),
+    "version": (2, 4, 0),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -51,7 +51,9 @@ else:
         db,
         items,
         library,
+        library_jobs,
         migrate,
+        native_names,
         operators,
         preferences,
         scoped_management,
@@ -65,7 +67,7 @@ else:
     # 支持在 Blender 文本编辑器中热重载
     if _PM_WAS_IMPORTED:  # pragma: no cover
         for _mod in (C, scan, db, bridge, scoped_management, library, store, updates, migrate, watcher,
-                     items, compat_task, preferences, operators, ui):
+                     native_names, items, compat_task, preferences, library_jobs, operators, ui):
             importlib.reload(_mod)
 
     _modules = (preferences, operators, ui)
@@ -74,11 +76,14 @@ else:
 
     def _sync_manager_state():
         """Mirror native-panel changes into the active device profile."""
+        if library_jobs.running():
+            return 2.0
         try:
             from .storage import machine_config
             local = machine_config.load()
             root = local.get("library_path")
-            if local.get("management_enabled") and root and os.path.isdir(root):
+            if (local.get("management_enabled") and root and bridge.managed_library_root() == root
+                    and os.path.isdir(root)):
                 scoped_management.sync_to_profile(root)
         except Exception as exc:
             print("[插件库] 同步原生配置失败:", exc)
@@ -105,13 +110,8 @@ else:
                 print("[插件库] 初始化本机配置失败:", exc)
         if not prefs or not local or not local.get("management_enabled"):
             return
-        if not os.path.isdir(prefs.library_path):
-            print("[插件库] 插件库离线，已保留本机配置")
-            return
         try:
-            result = scoped_management.activate_library(prefs.library_path, resume=True)
-            if result["state"] == "ERROR":
-                print("[插件库] 恢复设备配置时存在失败:", result["failures"])
+            library_jobs.start(prefs, prefs.library_path, mode="resume")
         except Exception as exc:
             print("[插件库] 初始化库失败:", exc)
 
@@ -121,9 +121,12 @@ else:
         prefs = bridge.get_prefs()
         if not prefs or not prefs.sync_startup_on_launch or not prefs.library_path:
             return
+        if library_jobs.running():
+            return 0.2
         from .storage import machine_config
         if (not machine_config.load().get("management_enabled")
-                or not os.path.isdir(prefs.library_path) or not bridge.is_registered(prefs.library_path)):
+                or bridge.managed_library_root() != prefs.library_path
+                or not bridge.is_registered(prefs.library_path)):
             return
         try:
             from .db import LibraryDB
@@ -143,6 +146,10 @@ else:
                     bpy.utils.register_class(cls)
                     _registered.append(cls)
             _bootstrap_prefs()
+            try:
+                native_names.install()
+            except Exception as exc:
+                print("[插件库] 挂载原生中文显示名失败:", exc)
         except Exception:
             try:
                 operators.shutdown_compat_task()
@@ -186,12 +193,17 @@ else:
         except Exception:
             pass
         try:
+            native_names.uninstall()
+        except Exception as exc:
+            print("[插件库] 卸载原生中文显示名失败:", exc)
+        try:
             operators.shutdown_compat_task()
             operators.shutdown_self_update()
         except Exception as exc:
             print("[插件库] 关闭兼容性测试任务失败:", exc)
         try:
             archive_jobs.shutdown()
+            library_jobs.shutdown()
         except Exception as exc:
             print("[插件库] 关闭安装任务失败:", exc)
         try:

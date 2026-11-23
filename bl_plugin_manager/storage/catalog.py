@@ -42,7 +42,7 @@ PORTABLE_FIELDS = frozenset({
     "plugin_id", "kind", "pkg_id", "id", "name", "pkg_type", "author",
     "description", "auto_category", "auto_tags", "doc_url", "location",
     # 用户数据（跨电脑共享）
-    "display_name", "category", "category_id", "tags", "note",
+    "display_name", "category", "category_id", "groups", "tags", "note",
     "favorite",
     # 来源信息（插件官网/文档地址，不指向本机路径）
     "source_url",
@@ -139,7 +139,7 @@ class Catalog:
             return False
         categories = value.get("categories")
         return isinstance(categories, list) and all(
-            isinstance(item, dict) and set(item) <= {"id", "name", "order"}
+            isinstance(item, dict) and set(item) <= {"id", "name", "order", "pinned", "description"}
             and isinstance(item.get("id"), str) and isinstance(item.get("name"), str)
             for item in categories
         )
