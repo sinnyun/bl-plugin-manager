@@ -137,13 +137,16 @@ def run():
     items.rebuild_items(prefs)
 
     if len(prefs.group_items):
-        grow = RowMock()
-        pm_ui.PM_UL_groups.draw_item(grow, bpy.context, grow, prefs, prefs.group_items[0], None, prefs, "active_group_index", 0, 0)
-        print(f"[UI] 分组列表行 draw: {len(grow.calls)} 次布局调用")
+        for gi in range(len(prefs.group_items)):
+            grow = RowMock()
+            pm_ui.PM_UL_groups.draw_item(grow, bpy.context, grow, prefs, prefs.group_items[gi], None, prefs, "active_group_index", gi, 0)
+        print(f"[UI] 分组列表行 draw: {len(prefs.group_items)} 行（含默认全部插件行）")
 
     if len(prefs.plugin_items):
         for bmode in (False, True):
             prefs.batch_mode = bmode
+            mock_b = MockLayout(f"main[batch={bmode}]")
+            pm_ui.PM_PT_main.draw(type("S", (), {"layout": mock_b})(), bpy.context)
             row = RowMock()
             item = prefs.plugin_items[0]
             pm_ui.PM_UL_plugins.draw_item(row, bpy.context, row, prefs, item, None, prefs, "active_index", 0, 0)

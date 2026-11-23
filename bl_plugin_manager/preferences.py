@@ -18,6 +18,7 @@ from bpy.types import AddonPreferences, PropertyGroup
 from . import bridge, constants as C, native_names
 
 _LOADING_MACHINE_PATH = False
+_SYNCING_GROUP_INDEX = False
 
 
 # ---------------------------------------------------------------------------
@@ -61,9 +62,10 @@ class PM_CategoryItem(PropertyGroup):
 
 
 class PM_GroupItem(PropertyGroup):
-    """工作分组列表项（支持多组叠加开关、常驻、自启与计数）。"""
+    """工作分组列表项（含默认「全部插件」行，以及用户工作分组的开关、自启、常驻与计数）。"""
 
     name: StringProperty(default="")
+    is_all: BoolProperty(default=False)
     active: BoolProperty(default=False)
     startup: BoolProperty(default=False)
     pinned: BoolProperty(default=False)
@@ -95,6 +97,27 @@ def _on_filter_update(self, context):
     from . import items
 
     items.maybe_rebuild(self, force=True)
+
+
+def _on_group_index_update(self, context):
+    if _SYNCING_GROUP_INDEX:
+        return
+    if 0 <= self.active_group_index < len(self.group_items):
+        item = self.group_items[self.active_group_index]
+        target = "全部" if item.is_all else item.name
+        if self.active_category != target:
+            self.active_category = target
+
+
+def _on_batch_mode_update(self, context):
+    from . import items
+
+    if not self.batch_mode:
+        items.clear_selection()
+        for it in self.plugin_items:
+            it.selected = False
+    else:
+        items.prune_selection_to_visible(self)
 
 
 def _on_native_names_update(self, context):
@@ -211,7 +234,7 @@ class PMAddonPreferences(AddonPreferences):
     # 界面状态与筛选
     selected_key: StringProperty(default="")
     active_index: IntProperty(default=0, update=_on_index_update)
-    active_group_index: IntProperty(default=0)
+    active_group_index: IntProperty(default=0, update=_on_group_index_update)
     active_category: StringProperty(default="全部", update=_on_filter_update)
     kind_filter: EnumProperty(
         name="来源",
@@ -221,8 +244,9 @@ class PMAddonPreferences(AddonPreferences):
     )
     batch_mode: BoolProperty(
         name="批量选择",
-        description="在列表中显示批量勾选框",
+        description="对当前筛选结果开启批量勾选与操作栏（关闭时清空勾选）",
         default=False,
+        update=_on_batch_mode_update,
     )
     only_favorites: BoolProperty(default=False, update=_on_filter_update)
     only_updates: BoolProperty(default=False, update=_on_filter_update)

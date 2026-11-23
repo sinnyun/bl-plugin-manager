@@ -179,6 +179,11 @@ powershell -ExecutionPolicy Bypass -File _test/run_regressions.ps1 -Suite ui
 
 详细设计与审计见 `docs/PLUGIN_MANAGER_ARCHITECTURE_AUDIT.md`、`docs/superpowers/specs/2026-09-13-machine-local-library-path-design.md`、`docs/superpowers/specs/2026-09-18-master-catalog-design.md` 和 `docs/superpowers/specs/2026-09-15-compatibility-task-and-settings-design.md`。
 
+## 2.4.2 改进
+
+- 工作分组列表顶部新增固定默认行「全部插件」，点击整行即可在「全部插件」与任意工作分组间顺畅切换筛选且高亮同步。
+- 筛选与批量操作彻底统一：批量目标严格限定在当前筛选可见的勾选项，切换筛选实时同步缩小批量目标；「全选当前」替换旧隐藏勾选；退出「批量」模式自动清空勾选，开启后主面板直接展示内联批量操作栏。
+
 ## 2.4.1 修复
 
 - 修复从 2.3.x 升级到 2.4 后，首次通过「编辑插件信息 / 分配分组」给旧资料库条目添加分组时，因旧记录缺失 `groups` 字段导致的误报“共享资料已被修改，请刷新”冲突问题。

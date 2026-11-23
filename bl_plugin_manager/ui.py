@@ -47,14 +47,21 @@ def _progress_bar(layout, factor, text):
 # 列表行：工作分组 & 插件列表 & 扫描报告
 # ---------------------------------------------------------------------------
 class PM_UL_groups(UIList):
-    """工作分组列表：一行完成多组叠加开关、自启、独占切换与筛选。"""
+    """工作分组列表：含默认「全部插件」行，点击整行切换筛选，图标控制多组开关/自启/常驻/独占。"""
 
     bl_idname = "PM_UL_groups"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname,
                   index=0, flt_flag=0):
-        prefs = data
         row = layout.row(align=True)
+
+        # 默认第 0 行：全部插件（只做切换查看全部，不混入分组开关图标）
+        if getattr(item, "is_all", False):
+            row.label(
+                text=f"{item.name} ({item.enabled}/{item.total})",
+                icon="OUTLINER_COLLECTION",
+            )
+            return
 
         # 1) 分组开关（支持多组同时开启 / 关闭）
         op = row.operator(
@@ -66,17 +73,11 @@ class PM_UL_groups(UIList):
         op.name = item.name
         op.active = not item.active
 
-        # 2) 分组名 + (已启用/总数)，点击即可按该分组筛选下方列表
-        is_filtering = getattr(prefs, "active_category", "") == item.name
-        name_row = row.row(align=True)
-        op = name_row.operator(
-            "plugin_manager.pick_category",
+        # 2) 分组名 + (已启用/总数)：点击行即通过 active_group_index 切换筛选
+        row.label(
             text=f"{item.name} ({item.enabled}/{item.total})",
-            icon="PINNED" if item.pinned else ("RESTRICT_SELECT_OFF" if is_filtering else "NONE"),
-            depress=is_filtering,
-            emboss=is_filtering,
+            icon="PINNED" if item.pinned else "NONE",
         )
-        op.category = "全部" if is_filtering else item.name
 
         # 3) 右侧紧凑动作：自启 / 常驻 / 独占切换
         right = row.row(align=True)
@@ -354,21 +355,23 @@ class PM_PT_main(Panel):
         if not PM_PT_main.draw_library_status(layout, prefs):
             return
 
-        # --- 1. 工作分组区（高频：多组叠加 / 自启 / 独占切换） ---
+        # --- 1. 工作分组区（含默认「全部插件」行；多组叠加 / 自启 / 独占切换） ---
         group_box = layout.box()
         hdr = group_box.row(align=True)
-        active_groups = sum(1 for g in prefs.group_items if g.active)
+        active_groups = sum(1 for g in prefs.group_items if not getattr(g, "is_all", False) and g.active)
         hdr.label(text=f"工作分组（已开 {active_groups}）", icon="OUTLINER_COLLECTION")
         hdr.operator("plugin_manager.add_category", text="", icon="ADD")
         hdr.operator("plugin_manager.group_deactivate_all", text="", icon="X")
         hdr.menu("PM_MT_category", text="", icon="DOWNARROW_HLT")
 
         if len(prefs.group_items):
-            rows = min(max(2, len(prefs.group_items)), 5)
+            rows = min(max(3, len(prefs.group_items)), 6)
             group_box.template_list(
                 "PM_UL_groups", "", prefs, "group_items", prefs, "active_group_index",
                 rows=rows, sort_lock=True,
             )
+            if len(prefs.group_items) <= 1:
+                group_box.label(text="点右上角「+」新建分组即可一键启停工作流", icon="INFO")
         else:
             row = group_box.row(align=True)
             row.label(text="暂无分组，新建后可一键启停工作流", icon="INFO")
@@ -385,11 +388,26 @@ class PM_PT_main(Panel):
         filters.prop(prefs, "only_incompatible", text="问题", toggle=True)
         filters.prop(prefs, "batch_mode", text="批量", toggle=True)
 
-        if prefs.active_category not in ("", "全部"):
+        if prefs.active_category == C.DEFAULT_CATEGORY:
             chip = layout.row(align=True)
-            chip.label(text=f"当前筛选分组：{prefs.active_category}", icon="FILTER")
-            op = chip.operator("plugin_manager.pick_category", text="显示全部", icon="X")
+            chip.label(text=f"当前筛选：{C.DEFAULT_CATEGORY}", icon="FILTER")
+            op = chip.operator("plugin_manager.pick_category", text="回到全部", icon="X")
             op.category = "全部"
+
+        # 批量模式开启时，直接内联展示针对「当前筛选结果」的批量操作栏
+        if prefs.batch_mode:
+            vis_n = len(items.selected_keys(prefs))
+            batch_box = layout.box()
+            brow = batch_box.row(align=True)
+            brow.label(text=f"当前筛选已选 {vis_n}/{len(prefs.plugin_items)}", icon="CHECKBOX_HLT")
+            brow.operator("plugin_manager.select_all", text="全选当前").value = True
+            brow.operator("plugin_manager.select_all", text="清空").value = False
+            act = batch_box.row(align=True)
+            act.enabled = bool(vis_n)
+            act.operator("plugin_manager.batch_enable", text="启用", icon="CHECKBOX_HLT").value = True
+            act.operator("plugin_manager.batch_enable", text="停用", icon="CHECKBOX_DEHLT").value = False
+            act.operator("plugin_manager.batch_add_group", text="分组…", icon="OUTLINER_COLLECTION")
+            act.operator("plugin_manager.batch_set_startup", text="自启", icon="RADIOBUT_ON").value = True
 
         if len(prefs.plugin_items):
             layout.template_list(
@@ -628,18 +646,17 @@ class PM_PT_batch(Panel):
         prefs = bridge.get_prefs()
         if not prefs or prefs.library_job_running:
             return
-        n = len(items.all_selected_keys())
-        hidden = n - len(items.selected_keys(prefs))
+        vis_n = len(items.selected_keys(prefs))
         top = layout.row(align=True)
-        top.prop(prefs, "batch_mode", text="显示勾选框", toggle=True)
-        top.label(text=f"已选 {n}" + (f"（隐藏 {hidden}）" if hidden else ""))
+        top.prop(prefs, "batch_mode", text="开启批量勾选", toggle=True)
+        top.label(text=f"当前筛选已选 {vis_n}/{len(prefs.plugin_items)}")
 
         row = layout.row(align=True)
         row.operator("plugin_manager.select_all", text="全选当前结果").value = True
-        row.operator("plugin_manager.select_all", text="清空全部").value = False
+        row.operator("plugin_manager.select_all", text="清空勾选").value = False
 
         actions = layout.column(align=True)
-        actions.enabled = bool(n)
+        actions.enabled = bool(vis_n)
         row = actions.row(align=True)
         row.operator("plugin_manager.batch_enable", text="批量启用", icon="CHECKBOX_HLT").value = True
         row.operator("plugin_manager.batch_enable", text="批量停用", icon="CHECKBOX_DEHLT").value = False

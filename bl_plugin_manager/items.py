@@ -212,6 +212,15 @@ def clear_selection() -> None:
     SELECTED_KEYS.clear()
 
 
+def prune_selection_to_visible(prefs) -> list[str]:
+    """Keep only selections that are present in the currently filtered visible list."""
+    visible = {it.key for it in prefs.plugin_items if it.key}
+    SELECTED_KEYS.intersection_update(visible)
+    for it in prefs.plugin_items:
+        it.selected = it.key in SELECTED_KEYS
+    return [it.key for it in prefs.plugin_items if it.selected]
+
+
 # 供操作符枚举使用：不依赖 context 的分组/分类缓存
 CATEGORY_CACHE: list[str] = [C.DEFAULT_CATEGORY]
 
@@ -230,15 +239,44 @@ def _rebuild_categories(prefs, db: LibraryDB) -> None:
 def _rebuild_groups(prefs, db: LibraryDB) -> None:
     if not hasattr(prefs, "group_items"):
         return
+    from . import preferences as _prefs_mod
+
     prefs.group_items.clear()
+    # Row 0: built-in default "全部插件" group for effortless switching back to all plugins.
+    all_row = prefs.group_items.add()
+    all_row.name = "全部插件"
+    if hasattr(all_row, "is_all"):
+        all_row.is_all = True
+    all_row.total = len(db.plugins)
+    all_row.enabled = sum(
+        1 for rec in db.plugins.values()
+        if rec.get("enabled") and not rec.get("missing")
+    )
+
+    active_cat = prefs.active_category or "全部"
+    target_index = 0 if active_cat in ("", "全部") else -1
+
     for info in group_service.list_groups(db):
+        idx = len(prefs.group_items)
         g = prefs.group_items.add()
         g.name = info["name"]
+        if hasattr(g, "is_all"):
+            g.is_all = False
         g.active = bool(info["active"])
         g.startup = bool(info["startup"])
         g.pinned = bool(info["pinned"])
         g.total = int(info["total"])
         g.enabled = int(info["enabled"])
+        if active_cat == info["name"]:
+            target_index = idx
+
+    if hasattr(prefs, "active_group_index"):
+        prev_sync = getattr(_prefs_mod, "_SYNCING_GROUP_INDEX", False)
+        _prefs_mod._SYNCING_GROUP_INDEX = True
+        try:
+            prefs.active_group_index = target_index
+        finally:
+            _prefs_mod._SYNCING_GROUP_INDEX = prev_sync
 
 
 def category_options() -> list[str]:

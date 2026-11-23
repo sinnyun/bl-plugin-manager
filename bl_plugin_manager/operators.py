@@ -708,14 +708,15 @@ class PM_OT_apply_startup(_PMBase):
 # 批量操作（多选）
 # ---------------------------------------------------------------------------
 def _target_keys(prefs, single_key: str, use_selection: bool) -> list[str]:
-    """确定批量操作的目标：勾选的多选项，或单个 key。
+    """确定批量操作的目标：当前筛选可见列表中的勾选项，或单个 key。
 
-    批量时作用于**所有勾选项**（含因过滤暂时不可见的），符合"勾了就操作"的直觉。
+    批量操作严格作用于当前筛选结果里勾选的插件（所见即所选），
+    不会误操作此前在其它筛选条件下遗留的隐藏勾选项。
     """
     from . import items
 
     if use_selection:
-        return items.all_selected_keys()
+        return items.selected_keys(prefs)
     if single_key:
         return [single_key]
     if prefs.selected_key:
@@ -787,6 +788,8 @@ class PM_OT_select_all(_PMBase):
         from . import items
 
         if self.value:
+            # 仅选中当前筛选结果，清空此前其它筛选下遗留的隐藏勾选项
+            items.clear_selection()
             for it in prefs.plugin_items:
                 items.set_selected(it.key, True)
         else:
@@ -795,7 +798,7 @@ class PM_OT_select_all(_PMBase):
             it.selected = bool(self.value)
         _redraw()
         n = sum(1 for it in prefs.plugin_items if it.selected)
-        return _report(self, True, f"已勾选 {n} 个" if self.value else "已取消全选")
+        return _report(self, True, f"已勾选当前筛选结果 {n} 个" if self.value else "已清空勾选")
 
 
 def _set_plugins_enabled(operator, prefs, db, records, enabled):
@@ -860,8 +863,8 @@ class PM_OT_batch_set_category(_PMBase):
         from . import items as _items
 
         _items.refresh_cache(prefs)
-        if not [it for it in prefs.plugin_items if it.selected]:
-            return _report(self, False, "请先勾选要归类的插件")
+        if not _items.selected_keys(prefs):
+            return _report(self, False, "请先在当前筛选结果中勾选要归类的插件")
         return context.window_manager.invoke_props_dialog(self, width=340)
 
     def execute(self, context):
@@ -1140,8 +1143,8 @@ class PM_OT_batch_add_group(_PMBase):
         from . import items as _items
 
         _items.refresh_cache(prefs)
-        if not _items.all_selected_keys():
-            return _report(self, False, "请先勾选要操作的插件")
+        if not _items.selected_keys(prefs):
+            return _report(self, False, "请先在当前筛选结果中勾选要操作的插件")
         if not _items.group_options():
             return _report(self, False, "暂无可用分组，请先新建分组")
         return context.window_manager.invoke_props_dialog(self, width=340)

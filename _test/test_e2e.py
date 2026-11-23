@@ -1337,6 +1337,42 @@ bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sh["key"], group="建模工�
 bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sh["key"], group="雕刻工作组")
 bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sc["key"], group="雕刻工作组")
 
+# Default "全部插件" row at index 0 & seamless active_group_index switching
+PM.items.rebuild_items(prefs)
+check("default all-plugins group is row 0",
+      len(prefs.group_items) >= 4 and prefs.group_items[0].is_all and prefs.group_items[0].name == "全部插件",
+      str([(g.name, g.is_all) for g in prefs.group_items]))
+mod_grp_idx = next(i for i, g in enumerate(prefs.group_items) if g.name == "建模工作组")
+prefs.active_group_index = mod_grp_idx
+check("selecting group row switches active_category and filters list",
+      prefs.active_category == "建模工作组"
+      and {it.key for it in prefs.plugin_items} == {rec_m["key"], rec_sh["key"]},
+      f"cat={prefs.active_category}, keys={[it.key for it in prefs.plugin_items]}")
+prefs.active_group_index = 0
+check("selecting row 0 switches back to all plugins",
+      prefs.active_category == "全部" and len(prefs.plugin_items) >= 4)
+
+# Filter-scoped batch selection: batch actions only affect currently filtered checked items!
+prefs.batch_mode = True
+bpy.ops.plugin_manager.select_all(value=True)
+check("select_all selects current filtered results",
+      len(PM.items.selected_keys(prefs)) == len(prefs.plugin_items))
+# Narrow filter to "雕刻工作组" -> batch targets must narrow strictly to visible checked items!
+sculpt_grp_idx = next(i for i, g in enumerate(prefs.group_items) if g.name == "雕刻工作组")
+prefs.active_group_index = sculpt_grp_idx
+filtered_targets = PM.operators._target_keys(prefs, "", True)
+check("filtering narrows batch targets to visible checked items only",
+      set(filtered_targets) == {rec_sh["key"], rec_sc["key"]},
+      str(filtered_targets))
+# select_all inside filtered view replaces old hidden selections completely
+bpy.ops.plugin_manager.select_all(value=True)
+check("select_all inside filter replaces old hidden selections",
+      set(PM.items.all_selected_keys()) == {rec_sh["key"], rec_sc["key"]})
+# Turning off batch_mode clears selections cleanly
+prefs.batch_mode = False
+check("disabling batch_mode clears selections", len(PM.items.all_selected_keys()) == 0)
+prefs.active_group_index = 0
+
 # Stack Modeling + Sculpting
 bpy.ops.plugin_manager.group_toggle(name="建模工作组", active=True)
 bpy.ops.plugin_manager.group_toggle(name="雕刻工作组", active=True)
