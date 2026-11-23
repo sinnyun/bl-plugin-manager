@@ -130,17 +130,25 @@ def run():
             super().__init__("row")
             self.layout_type = "DEFAULT"
 
-    # 创建一个测试分组，覆盖 PM_UL_groups 与 PM_MT_plugin_groups
-    bpy.ops.plugin_manager.add_category(name="烟雾测试组")
+    # 创建一个测试分类与一个测试预设，覆盖 PM_UL_groups / PM_UL_presets 与相关菜单
+    bpy.ops.plugin_manager.add_category(name="烟雾测试分类")
+    bpy.ops.plugin_manager.preset_add(name="烟雾测试预设")
     if len(prefs.plugin_items):
-        bpy.ops.plugin_manager.plugin_toggle_group(key=prefs.plugin_items[0].key, group="烟雾测试组")
+        bpy.ops.plugin_manager.plugin_toggle_group(key=prefs.plugin_items[0].key, group="烟雾测试分类")
+        bpy.ops.plugin_manager.plugin_toggle_preset(key=prefs.plugin_items[0].key, preset="烟雾测试预设")
     items.rebuild_items(prefs)
+
+    if len(prefs.preset_items):
+        for pi in range(len(prefs.preset_items)):
+            prow = RowMock()
+            pm_ui.PM_UL_presets.draw_item(prow, bpy.context, prow, prefs, prefs.preset_items[pi], None, prefs, "active_preset_index", pi, 0)
+        print(f"[UI] 预设列表行 draw: {len(prefs.preset_items)} 行")
 
     if len(prefs.group_items):
         for gi in range(len(prefs.group_items)):
             grow = RowMock()
             pm_ui.PM_UL_groups.draw_item(grow, bpy.context, grow, prefs, prefs.group_items[gi], None, prefs, "active_group_index", gi, 0)
-        print(f"[UI] 分组列表行 draw: {len(prefs.group_items)} 行（含默认全部插件行）")
+        print(f"[UI] 分类列表行 draw: {len(prefs.group_items)} 行（含默认全部插件行）")
 
     if len(prefs.plugin_items):
         for bmode in (False, True):
@@ -156,7 +164,8 @@ def run():
     for panel_cls in (pm_ui.PM_PT_detail, pm_ui.PM_PT_batch, pm_ui.PM_PT_actions):
         pmock = MockLayout(panel_cls.bl_idname)
         panel_cls.draw(type("S", (), {"layout": pmock})(), bpy.context)
-    for menu_cls in (pm_ui.PM_MT_category, pm_ui.PM_MT_plugin_groups, pm_ui.PM_MT_plugin):
+    for menu_cls in (pm_ui.PM_MT_preset, pm_ui.PM_MT_category, pm_ui.PM_MT_plugin_groups,
+                     pm_ui.PM_MT_plugin_presets, pm_ui.PM_MT_prompt_presets, pm_ui.PM_MT_plugin):
         mmock = MockLayout(menu_cls.bl_idname)
         menu_cls.draw(type("S", (), {"layout": mmock})(), bpy.context)
 

@@ -1,10 +1,12 @@
 """界面：3D 视图侧边栏 (N 面板) 的插件库工作台。
 
-信息架构分层：
-* 主面板：库状态条 → 工作分组（多组叠加开关/自启/常驻/独占切换）→ 插件搜索与列表
-* 插件详情（默认展开）：中文别名一键编辑、来源徽章、所属分组多选、启停/自启/收藏
-* 批量操作（折叠，与主面板「批量」开关联动）
-* 导入、商店与测试（折叠，消除主面板重复入口与低频干扰）
+信息架构分层（v2.5 职责彻底拆分）：
+* 工作预设（Preset）：精选插件的一键启停 / 切换 / 常驻 / 干净启动自启（状态实时推导）
+* 分类筛选（Category）：纯整理与筛选（含「全部插件」行，不带开关，绝不误触发启停）
+* 手动启用提示条：手动单开插件后温和提示「加入预设 / 归入分类 / 仅临时使用」
+* 插件详情（默认展开）：中文别名一键编辑、来源徽章、所属分类与预设、启停/自启/收藏
+* 批量操作（折叠，与主面板「批量」开关联动，严格作用于当前筛选勾选项）
+* 导入、商店与维护（折叠）
 """
 
 from __future__ import annotations
@@ -44,56 +46,66 @@ def _progress_bar(layout, factor, text):
 
 
 # ---------------------------------------------------------------------------
-# 列表行：工作分组 & 插件列表 & 扫描报告
+# 列表行：工作预设 & 分类筛选 & 插件列表 & 扫描报告
 # ---------------------------------------------------------------------------
-class PM_UL_groups(UIList):
-    """工作分组列表：含默认「全部插件」行，点击整行切换筛选，图标控制多组开关/自启/常驻/独占。"""
+class PM_UL_presets(UIList):
+    """工作预设列表：状态由成员真实启用情况推导（全开/部分开/未开），无过期假开关。"""
 
-    bl_idname = "PM_UL_groups"
+    bl_idname = "PM_UL_presets"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname,
                   index=0, flt_flag=0):
         row = layout.row(align=True)
 
-        # 默认第 0 行：全部插件（只做切换查看全部，不混入分组开关图标）
-        if getattr(item, "is_all", False):
-            row.label(
-                text=f"{item.name} ({item.enabled}/{item.total})",
-                icon="OUTLINER_COLLECTION",
-            )
-            return
+        # 1) 真实状态复选框：全开 → 点了关；部分开/未开 → 点了全开
+        if item.state == "all":
+            chk_icon, want_enable = "CHECKBOX_HLT", False
+        elif item.state == "partial":
+            chk_icon, want_enable = "REMOVE", True
+        else:
+            chk_icon, want_enable = "CHECKBOX_DEHLT", True
 
-        # 1) 分组开关（支持多组同时开启 / 关闭）
         op = row.operator(
-            "plugin_manager.group_toggle",
+            "plugin_manager.preset_toggle",
             text="",
-            icon="CHECKBOX_HLT" if item.active else "CHECKBOX_DEHLT",
+            icon=chk_icon,
             emboss=False,
         )
         op.name = item.name
-        op.active = not item.active
+        op.enable = want_enable
 
-        # 2) 分组名 + (已启用/总数)：点击行即通过 active_group_index 切换筛选
+        # 2) 预设名 + (已启/总数)
         row.label(
             text=f"{item.name} ({item.enabled}/{item.total})",
             icon="PINNED" if item.pinned else "NONE",
         )
 
-        # 3) 右侧紧凑动作：自启 / 常驻 / 独占切换
+        # 3) 右侧紧凑动作：筛选查看 / 自启（干净启动模式）/ 常驻 / 独占切换
         right = row.row(align=True)
         right.alignment = "RIGHT"
 
+        is_filtered = getattr(data, "active_preset_filter", "") == item.name
         op = right.operator(
-            "plugin_manager.group_set_startup",
+            "plugin_manager.preset_filter",
             text="",
-            icon="RADIOBUT_ON" if item.startup else "RADIOBUT_OFF",
-            emboss=False,
+            icon="FILTER",
+            depress=is_filtered,
+            emboss=is_filtered,
         )
         op.name = item.name
-        op.value = not item.startup
+
+        if getattr(data, "startup_mode", "remember") == "clean":
+            op = right.operator(
+                "plugin_manager.preset_set_startup",
+                text="",
+                icon="RADIOBUT_ON" if item.startup else "RADIOBUT_OFF",
+                emboss=False,
+            )
+            op.name = item.name
+            op.value = not item.startup
 
         op = right.operator(
-            "plugin_manager.group_set_pinned",
+            "plugin_manager.preset_set_pinned",
             text="",
             icon="PINNED" if item.pinned else "UNPINNED",
             emboss=False,
@@ -102,13 +114,30 @@ class PM_UL_groups(UIList):
         op.value = not item.pinned
 
         op = right.operator(
-            "plugin_manager.group_solo",
+            "plugin_manager.preset_switch",
             text="",
-            icon="PLAY",
+            icon="FORWARD",
             emboss=False,
         )
         op.name = item.name
         op.keep_pinned = True
+        op.keep_manual = True
+
+
+class PM_UL_groups(UIList):
+    """分类筛选列表：含默认「全部插件」行，点击整行纯筛选列表，绝不误触发启停。"""
+
+    bl_idname = "PM_UL_groups"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname,
+                  index=0, flt_flag=0):
+        row = layout.row(align=True)
+        row_icon = "OUTLINER_COLLECTION" if getattr(item, "is_all", False) else "FILE_FOLDER"
+        row.label(text=item.name, icon=row_icon)
+        right = row.row(align=True)
+        right.alignment = "RIGHT"
+        right.enabled = False
+        right.label(text=f"{item.enabled}/{item.total}")
 
 
 class PM_UL_plugins(UIList):
@@ -147,6 +176,8 @@ class PM_UL_plugins(UIList):
             label, st_icon, warning = "文件缺失", "ERROR", True
         elif item.last_error:
             label, st_icon, warning = "启用失败", "ERROR", True
+        elif getattr(item, "is_temporary", False) and not warning:
+            label, st_icon = "临时", "TIME"
         elif item.kind == C.KIND_BUILTIN and not warning:
             label, st_icon = "内置", "NONE"
         elif item.update_available and not warning:
@@ -206,11 +237,55 @@ class PM_MT_library(Menu):
         layout.operator("plugin_manager.pick_library_path", icon="FILEBROWSER", text="切换插件库…")
 
 
+class PM_MT_preset(Menu):
+    """工作预设管理菜单。"""
+
+    bl_idname = "PM_MT_preset"
+    bl_label = "预设管理"
+
+    def draw(self, context):
+        layout = self.layout
+        prefs = bridge.get_prefs()
+        if not prefs:
+            return
+        layout.operator("plugin_manager.preset_add", icon="ADD", text="新建预设 / 从分类导入…")
+        layout.operator("plugin_manager.preset_capture", icon="BOOKMARKS", text="从当前已启保存为预设…")
+        active_name = ""
+        if 0 <= prefs.active_preset_index < len(prefs.preset_items):
+            active_name = prefs.preset_items[prefs.active_preset_index].name
+        if active_name:
+            layout.separator()
+            op = layout.operator("plugin_manager.preset_capture", icon="FILE_REFRESH",
+                                 text=f"用当前已启更新「{active_name}」…")
+            op.name = active_name
+            op.overwrite = True
+            op = layout.operator("plugin_manager.preset_rename", icon="SORTALPHA",
+                                 text=f"重命名「{active_name}」…")
+            op.old = active_name
+            op = layout.operator("plugin_manager.preset_delete", icon="TRASH",
+                                 text=f"删除「{active_name}」")
+            op.name = active_name
+            if prefs.startup_mode != "clean":
+                cur_item = prefs.preset_items[prefs.active_preset_index]
+                op = layout.operator(
+                    "plugin_manager.preset_set_startup",
+                    icon="RADIOBUT_ON" if cur_item.startup else "RADIOBUT_OFF",
+                    text=f"取消「{active_name}」自启" if cur_item.startup else f"设「{active_name}」为干净启动自启",
+                )
+                op.name = active_name
+                op.value = not cur_item.startup
+        layout.separator()
+        layout.operator("plugin_manager.preset_deactivate_all", icon="CANCEL",
+                        text="关闭全部非常驻预设")
+        op = layout.operator("plugin_manager.apply_startup", icon="PLAY", text="按自启清单同步…")
+        op.disable_unmarked = prefs.startup_mode == "clean"
+
+
 class PM_MT_category(Menu):
-    """分组筛选与管理菜单。"""
+    """分类筛选与整理菜单（分类仅用于整理，批量启停收纳于此）。"""
 
     bl_idname = "PM_MT_category"
-    bl_label = "分组管理"
+    bl_label = "分类管理"
 
     def draw(self, context):
         layout = self.layout
@@ -228,7 +303,7 @@ class PM_MT_category(Menu):
             )
             op.category = name
         layout.separator()
-        layout.operator("plugin_manager.add_category", icon="ADD", text="新建分组…")
+        layout.operator("plugin_manager.add_category", icon="ADD", text="新建分类…")
         if prefs.active_category not in ("", "全部", C.DEFAULT_CATEGORY):
             op = layout.operator("plugin_manager.rename_category", icon="SORTALPHA",
                                  text=f"重命名「{prefs.active_category}」…")
@@ -238,21 +313,19 @@ class PM_MT_category(Menu):
             op.name = prefs.active_category
             layout.separator()
             layout.operator("plugin_manager.enable_pack", icon="CHECKBOX_HLT",
-                            text="开启当前分组全部")
+                            text="批量启用本分类全部")
             layout.operator("plugin_manager.disable_pack", icon="CHECKBOX_DEHLT",
-                            text="关闭当前分组全部")
+                            text="批量停用本分类全部")
         layout.separator()
-        layout.operator("plugin_manager.group_deactivate_all", icon="CANCEL",
-                        text="关闭全部工作分组")
         layout.operator("plugin_manager.reset_auto_categories", icon="LOOP_BACK",
                         text="清理自动分类")
 
 
 class PM_MT_plugin_groups(Menu):
-    """为选中插件多选勾选所属分组。"""
+    """为选中插件多选勾选所属分类。"""
 
     bl_idname = "PM_MT_plugin_groups"
-    bl_label = "所属分组"
+    bl_label = "所属分类"
 
     def draw(self, context):
         layout = self.layout
@@ -267,7 +340,7 @@ class PM_MT_plugin_groups(Menu):
         current = set(db.plugin_groups(prefs.selected_key))
         group_names = db.group_names()
         if not group_names:
-            layout.label(text="还没有工作分组", icon="INFO")
+            layout.label(text="还没有分类", icon="INFO")
         else:
             for name in group_names:
                 op = layout.operator(
@@ -278,7 +351,55 @@ class PM_MT_plugin_groups(Menu):
                 op.key = prefs.selected_key
                 op.group = name
         layout.separator()
-        layout.operator("plugin_manager.add_category", icon="ADD", text="新建分组…")
+        layout.operator("plugin_manager.add_category", icon="ADD", text="新建分类…")
+
+
+def _draw_plugin_presets_menu(layout, prefs, key: str) -> None:
+    from .db import LibraryDB
+
+    db = LibraryDB(prefs.library_path) if (prefs and prefs.library_path) else None
+    if not db or not key:
+        return
+    current = set(db.plugin_presets(key))
+    preset_names = db.preset_names()
+    if not preset_names:
+        layout.label(text="还没有工作预设", icon="INFO")
+    else:
+        for name in preset_names:
+            op = layout.operator(
+                "plugin_manager.plugin_toggle_preset",
+                text=name,
+                icon="CHECKBOX_HLT" if name in current else "CHECKBOX_DEHLT",
+            )
+            op.key = key
+            op.preset = name
+    layout.separator()
+    op = layout.operator("plugin_manager.preset_add", icon="ADD", text="新建预设并加入…")
+    op.add_plugin_key = key
+
+
+class PM_MT_plugin_presets(Menu):
+    """为详情面板当前选中的插件勾选所属预设。"""
+
+    bl_idname = "PM_MT_plugin_presets"
+    bl_label = "所属预设"
+
+    def draw(self, context):
+        prefs = bridge.get_prefs()
+        if prefs and prefs.selected_key:
+            _draw_plugin_presets_menu(self.layout, prefs, prefs.selected_key)
+
+
+class PM_MT_prompt_presets(Menu):
+    """为刚刚手动启用的插件一键加入指定预设。"""
+
+    bl_idname = "PM_MT_prompt_presets"
+    bl_label = "加入工作预设"
+
+    def draw(self, context):
+        prefs = bridge.get_prefs()
+        if prefs and prefs.manual_prompt_key:
+            _draw_plugin_presets_menu(self.layout, prefs, prefs.manual_prompt_key)
 
 
 class PM_MT_plugin(Menu):
@@ -355,28 +476,60 @@ class PM_PT_main(Panel):
         if not PM_PT_main.draw_library_status(layout, prefs):
             return
 
-        # --- 1. 工作分组区（含默认「全部插件」行；多组叠加 / 自启 / 独占切换） ---
-        group_box = layout.box()
-        hdr = group_box.row(align=True)
-        active_groups = sum(1 for g in prefs.group_items if not getattr(g, "is_all", False) and g.active)
-        hdr.label(text=f"工作分组（已开 {active_groups}）", icon="OUTLINER_COLLECTION")
+        # --- 1. 工作预设区（精选插件一键启停/切换；状态实时推导，不与分类混用） ---
+        preset_box = layout.box()
+        phdr = preset_box.row(align=True)
+        mode_tag = " · 干净启动" if prefs.startup_mode == "clean" else ""
+        phdr.label(text=f"工作预设{mode_tag}", icon="BOOKMARKS")
+        phdr.operator("plugin_manager.preset_add", text="", icon="ADD")
+        phdr.operator("plugin_manager.preset_capture", text="", icon="FILE_TICK")
+        phdr.operator("plugin_manager.preset_deactivate_all", text="", icon="X")
+        phdr.menu("PM_MT_preset", text="", icon="DOWNARROW_HLT")
+
+        if len(prefs.preset_items):
+            prows = min(max(2, len(prefs.preset_items)), 5)
+            preset_box.template_list(
+                "PM_UL_presets", "", prefs, "preset_items", prefs, "active_preset_index",
+                rows=prows, sort_lock=True,
+            )
+        else:
+            empty_row = preset_box.row(align=True)
+            empty_row.operator("plugin_manager.preset_capture", text="保存当前已启为预设", icon="BOOKMARKS")
+            empty_row.operator("plugin_manager.preset_add", text="新建预设", icon="ADD")
+
+        # --- 2. 分类筛选区（纯整理与筛选，含默认「全部插件」行，绝不误触发启停） ---
+        cat_box = layout.box()
+        hdr = cat_box.row(align=True)
+        hdr.label(text="分类筛选", icon="OUTLINER_COLLECTION")
         hdr.operator("plugin_manager.add_category", text="", icon="ADD")
-        hdr.operator("plugin_manager.group_deactivate_all", text="", icon="X")
         hdr.menu("PM_MT_category", text="", icon="DOWNARROW_HLT")
 
         if len(prefs.group_items):
-            rows = min(max(3, len(prefs.group_items)), 6)
-            group_box.template_list(
+            rows = min(max(3, len(prefs.group_items)), 5)
+            cat_box.template_list(
                 "PM_UL_groups", "", prefs, "group_items", prefs, "active_group_index",
                 rows=rows, sort_lock=True,
             )
-            if len(prefs.group_items) <= 1:
-                group_box.label(text="点右上角「+」新建分组即可一键启停工作流", icon="INFO")
         else:
-            row = group_box.row(align=True)
-            row.label(text="暂无分组，新建后可一键启停工作流", icon="INFO")
+            cat_box.label(text="暂无分类，点右上角「+」新建", icon="INFO")
 
-        # --- 2. 插件搜索与列表区 ---
+        # --- 3. 手动启用提示条（温和提示：加入预设 / 归入分类 / 仅临时使用） ---
+        if prefs.manual_prompt_key:
+            pbox = layout.box()
+            prow = pbox.row(align=True)
+            prow.label(text=f"已手动启用「{prefs.manual_prompt_name}」", icon="INFO")
+            op = prow.operator("plugin_manager.manual_prompt_action", text="", icon="X", emboss=False)
+            op.key = prefs.manual_prompt_key
+            op.action = "dismiss"
+            pact = pbox.row(align=True)
+            pact.menu("PM_MT_prompt_presets", text="加入预设…", icon="BOOKMARKS")
+            op = pact.operator("plugin_manager.assign_category", text="归入分类…", icon="FILE_FOLDER")
+            op.key = prefs.manual_prompt_key
+            op = pact.operator("plugin_manager.manual_prompt_action", text="仅临时使用", icon="TIME")
+            op.key = prefs.manual_prompt_key
+            op.action = "temp"
+
+        # --- 4. 插件搜索与列表区 ---
         search_row = layout.row(align=True)
         search_row.prop(prefs, "search", text="", icon="VIEWZOOM")
         search_row.prop(prefs, "kind_filter", text="")
@@ -387,6 +540,12 @@ class PM_PT_main(Panel):
         filters.prop(prefs, "only_updates", text="更新", toggle=True)
         filters.prop(prefs, "only_incompatible", text="问题", toggle=True)
         filters.prop(prefs, "batch_mode", text="批量", toggle=True)
+
+        if prefs.active_preset_filter:
+            chip = layout.row(align=True)
+            chip.label(text=f"预设筛选：{prefs.active_preset_filter}", icon="BOOKMARKS")
+            op = chip.operator("plugin_manager.preset_filter", text="清除", icon="X")
+            op.name = ""
 
         if prefs.active_category == C.DEFAULT_CATEGORY:
             chip = layout.row(align=True)
@@ -406,8 +565,8 @@ class PM_PT_main(Panel):
             act.enabled = bool(vis_n)
             act.operator("plugin_manager.batch_enable", text="启用", icon="CHECKBOX_HLT").value = True
             act.operator("plugin_manager.batch_enable", text="停用", icon="CHECKBOX_DEHLT").value = False
-            act.operator("plugin_manager.batch_add_group", text="分组…", icon="OUTLINER_COLLECTION")
-            act.operator("plugin_manager.batch_set_startup", text="自启", icon="RADIOBUT_ON").value = True
+            act.operator("plugin_manager.batch_add_preset", text="预设…", icon="BOOKMARKS")
+            act.operator("plugin_manager.batch_add_group", text="分类…", icon="OUTLINER_COLLECTION")
 
         if len(prefs.plugin_items):
             layout.template_list(
@@ -432,6 +591,7 @@ class PM_PT_main(Panel):
         else:
             filtered = (
                 prefs.search or prefs.active_category not in ("", "全部")
+                or bool(prefs.active_preset_filter)
                 or prefs.kind_filter != "all"
                 or any((prefs.only_enabled, prefs.only_updates, prefs.only_favorites,
                         prefs.only_incompatible))
@@ -548,11 +708,29 @@ class PM_PT_detail(Panel):
             bits.append(f"v{sel['version']}")
         col.label(text=" · ".join(b for b in bits if b))
 
-        # 所属分组（多对多）
+        # 所属分类（纯整理筛选，多对多）
         groups = sel.get("groups") or []
         group_row = col.row(align=True)
-        group_row.label(text="分组：" + (" / ".join(groups) if groups else "未分组"), icon="OUTLINER_COLLECTION")
+        group_row.label(text="分类：" + (" / ".join(groups) if groups else "未分类"), icon="OUTLINER_COLLECTION")
         group_row.menu("PM_MT_plugin_groups", text="分配…", icon="DOWNARROW_HLT")
+
+        # 所属工作预设（精选一键启停）
+        from .db import LibraryDB
+        from .services import presets as preset_service
+
+        sel_key = sel.get("key", "")
+        _db = LibraryDB(prefs.library_path) if prefs.library_path else None
+        presets = _db.plugin_presets(sel_key) if (_db and sel_key) else []
+        preset_row = col.row(align=True)
+        preset_row.label(text="预设：" + (" / ".join(presets) if presets else "未加入预设"), icon="BOOKMARKS")
+        preset_row.menu("PM_MT_plugin_presets", text="分配…", icon="DOWNARROW_HLT")
+
+        if sel.get("enabled") and preset_service.is_temporary(sel_key):
+            trow = col.row(align=True)
+            trow.label(text="本次临时启用（切预设时保留）", icon="TIME")
+            op = trow.operator("plugin_manager.manual_prompt_action", text="取消临时", icon="X")
+            op.key = sel_key
+            op.action = "untemp"
 
         # 兼容与异常提示（紧凑显示）
         from . import scan as _scan
@@ -665,8 +843,10 @@ class PM_PT_batch(Panel):
         row.operator("plugin_manager.batch_enable", text="批量启用", icon="CHECKBOX_HLT").value = True
         row.operator("plugin_manager.batch_enable", text="批量停用", icon="CHECKBOX_DEHLT").value = False
         row = actions.row(align=True)
-        row.operator("plugin_manager.batch_add_group", text="加入/移出分组…", icon="OUTLINER_COLLECTION")
-        row.operator("plugin_manager.batch_set_category", text="设为单一分组…", icon="FILE_FOLDER")
+        row.operator("plugin_manager.batch_add_preset", text="加入/移出预设…", icon="BOOKMARKS")
+        row.operator("plugin_manager.batch_add_group", text="加入/移出分类…", icon="OUTLINER_COLLECTION")
+        row = actions.row(align=True)
+        row.operator("plugin_manager.batch_set_category", text="设为单一分类…", icon="FILE_FOLDER")
         row = actions.row(align=True)
         row.operator("plugin_manager.batch_set_startup", text="设为自启",
                      icon="RADIOBUT_ON").value = True
@@ -756,12 +936,16 @@ def _selected(prefs):
 
 
 classes = (
+    PM_UL_presets,
     PM_UL_groups,
     PM_UL_plugins,
     PM_UL_report,
     PM_MT_library,
+    PM_MT_preset,
     PM_MT_category,
     PM_MT_plugin_groups,
+    PM_MT_plugin_presets,
+    PM_MT_prompt_presets,
     PM_MT_plugin,
     PM_PT_main,
     PM_PT_detail,

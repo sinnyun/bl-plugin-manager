@@ -800,18 +800,20 @@ def restore_plugin(root: str, db: LibraryDB, trash_id: str) -> dict:
 # 自启同步：把「自启标记」应用为 Blender 实际启用状态
 # ---------------------------------------------------------------------------
 def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
-                  disable_unmarked: bool = False) -> dict:
-    """按库中的「自启分组」与单插件「自启标记」同步 Blender 的插件启用状态。
+                  disable_unmarked: bool = False, *,
+                  skip_incompatible: bool = True) -> dict:
+    """按库中的「自启预设」与单插件「自启标记」同步 Blender 的插件启用状态。
 
-    * enable_marked   ：启用标记为自启的插件及所有自启分组内的成员（默认开启）
-    * disable_unmarked：停用未在自启集合内的库内插件（默认关闭，需显式开启；
-                        绝不会强制停用 Blender 内置插件）
+    * enable_marked   ：启用标记为自启的预设成员及单插件（自动跳过已知不兼容/失败项）
+    * disable_unmarked：停用未在自启集合内的库内插件（绝不会强制停用 Blender 内置插件）
     """
-    from .services import groups as group_service
+    from .services import presets as preset_service
 
-    stats = {"enabled": 0, "disabled": 0, "failed": [], "skipped": 0, "groups": 0}
-    startup_keys, startup_groups = group_service.effective_startup_targets(db)
-    # 一次性取得当前已启用集合，避免逐个插件遍历 preferences.addons
+    stats = {
+        "enabled": 0, "disabled": 0, "failed": [],
+        "skipped": 0, "skipped_broken": 0, "presets": 0,
+    }
+    startup_keys, startup_presets = preset_service.effective_startup_targets(db)
     enabled_set = bridge.enabled_modules()
     for key, rec in list(db.plugins.items()):
         module = rec.get("module")
@@ -820,6 +822,9 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
             continue
         want = key in startup_keys
         if want and enable_marked:
+            if skip_incompatible and preset_service.is_known_broken(rec):
+                stats["skipped_broken"] += 1
+                continue
             if module in enabled_set:
                 rec["enabled"] = True
                 continue
@@ -827,7 +832,6 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
             if ok:
                 enabled_set.add(module)
                 rec["enabled"] = True
-                rec["startup_override"] = True
                 rec["last_error"] = ""
                 stats["enabled"] += 1
             else:
@@ -843,15 +847,12 @@ def apply_startup(root: str, db: LibraryDB, enable_marked: bool = True,
             if ok:
                 enabled_set.discard(module)
                 rec["enabled"] = False
-                rec["startup_override"] = False
+                preset_service.note_manual_disable(key)
                 stats["disabled"] += 1
             else:
                 rec["last_error"] = err
                 stats["failed"].append({"module": module, "name": rec.get("name"), "error": err})
-    if enable_marked and startup_groups:
-        for group_name in startup_groups:
-            db.set_group_state(group_name, active=True)
-        stats["groups"] = len(startup_groups)
+    stats["presets"] = len(startup_presets)
     db.save()
     return stats
 

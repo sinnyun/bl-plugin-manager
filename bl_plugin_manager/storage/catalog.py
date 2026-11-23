@@ -115,6 +115,7 @@ class Catalog:
             "library_id": str(uuid.uuid4()),
             "revision": 0,
             "categories": [dict(DEFAULT_CATEGORY)],
+            "presets": [],
             "plugins": {},
         }
 
@@ -138,11 +139,23 @@ class Catalog:
         ):
             return False
         categories = value.get("categories")
-        return isinstance(categories, list) and all(
+        if not (isinstance(categories, list) and all(
             isinstance(item, dict) and set(item) <= {"id", "name", "order", "pinned", "description"}
             and isinstance(item.get("id"), str) and isinstance(item.get("name"), str)
             for item in categories
-        )
+        )):
+            return False
+        presets = value.get("presets")
+        if presets is not None:
+            if not isinstance(presets, list):
+                return False
+            for item in presets:
+                if not (isinstance(item, dict)
+                        and set(item) <= {"id", "name", "order", "plugins", "pinned", "description"}
+                        and isinstance(item.get("id"), str) and isinstance(item.get("name"), str)
+                        and isinstance(item.get("plugins", []), list)):
+                    return False
+        return True
 
     @staticmethod
     def _sanitize(value: dict) -> dict:
@@ -186,6 +199,7 @@ class Catalog:
         self.data = self._sanitize(value)
         self.data.setdefault("plugins", {})
         self.data.setdefault("categories", [dict(DEFAULT_CATEGORY)])
+        self.data.setdefault("presets", [])
         self.status = "OK"
         self.loaded_signature = sig
         return self.status
@@ -317,6 +331,10 @@ class Catalog:
     @property
     def categories(self) -> list:
         return self.data.setdefault("categories", [dict(DEFAULT_CATEGORY)])
+
+    @property
+    def presets(self) -> list:
+        return self.data.setdefault("presets", [])
 
     def get(self, plugin_id: str) -> dict | None:
         return self.plugins.get(plugin_id)

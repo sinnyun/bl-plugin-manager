@@ -1299,25 +1299,26 @@ check("migration retries successfully after a network error",
       and PM.bridge.is_registered(str(retry_library)))
 
 # ==========================================================================
-# Section 15: Composable Groups, Built-in Virtual Links & Native Display Names
+# Section 15: Decoupled Categories & Presets, Startup Modes, Manual Prompt, Built-ins & Native Names
 # ==========================================================================
-print("\n=== 15. 分组引擎、内置链接与原生中英双语显示名 ===")
+print("\n=== 15. 分类/预设拆分、启动模式、手动提示、内置链接与原生双语名 ===")
 g_lib = Path(base, "groups-and-native")
 g_lib.mkdir(parents=True)
 bpy.ops.plugin_manager.pick_library_path(directory=str(g_lib))
 finish_library_job()
 setup_library()
 
-# Create 4 real legacy addons for multi-group stacking & solo switch tests
-def _make_toggleable_addon(folder_name: str, display: str) -> str:
+# Create 5 real legacy addons (4 healthy + 1 broken) for preset / category / manual prompt tests
+def _make_toggleable_addon(folder_name: str, display: str, *, broken: bool = False) -> str:
     src = Path(base, "grp_src", folder_name)
     src.mkdir(parents=True, exist_ok=True)
-    (src / "__init__.py").write_text(
+    body = (
         f'bl_info = {{"name": "{display}", "version": (1, 0, 0), "blender": (4, 2, 0)}}\n'
-        'def register(): pass\n'
-        'def unregister(): pass\n',
-        encoding="utf-8",
+        'def register():\n'
+        + ('    raise RuntimeError("broken addon")\n' if broken else '    pass\n')
+        + 'def unregister(): pass\n'
     )
+    (src / "__init__.py").write_text(body, encoding="utf-8")
     return str(src)
 
 db_g = PM.db.LibraryDB(str(g_lib))
@@ -1325,11 +1326,12 @@ rec_m = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_mod", "Mod T
 rec_sh = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_shared", "Shared Helper"), str(g_lib), db_g, move=True)
 rec_sc = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_sculpt", "Sculpt Tool"), str(g_lib), db_g, move=True)
 rec_base = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_base", "Base Core"), str(g_lib), db_g, move=True)
+rec_manual = PM.library.import_plugin_dir(_make_toggleable_addon("pm_grp_manual", "Manual Extra"), str(g_lib), db_g, move=True)
 
+# 1) Categories: pure organization & filtering (no toggles!)
 bpy.ops.plugin_manager.add_category(name="基础常驻")
 bpy.ops.plugin_manager.add_category(name="建模工作组")
 bpy.ops.plugin_manager.add_category(name="雕刻工作组")
-bpy.ops.plugin_manager.group_set_pinned(name="基础常驻", value=True)
 
 bpy.ops.plugin_manager.plugin_toggle_group(key=rec_base["key"], group="基础常驻")
 bpy.ops.plugin_manager.plugin_toggle_group(key=rec_m["key"], group="建模工作组")
@@ -1339,71 +1341,96 @@ bpy.ops.plugin_manager.plugin_toggle_group(key=rec_sc["key"], group="雕刻工�
 
 # Default "全部插件" row at index 0 & seamless active_group_index switching
 PM.items.rebuild_items(prefs)
-check("default all-plugins group is row 0",
+check("default all-plugins category is row 0",
       len(prefs.group_items) >= 4 and prefs.group_items[0].is_all and prefs.group_items[0].name == "全部插件",
       str([(g.name, g.is_all) for g in prefs.group_items]))
 mod_grp_idx = next(i for i, g in enumerate(prefs.group_items) if g.name == "建模工作组")
 prefs.active_group_index = mod_grp_idx
-check("selecting group row switches active_category and filters list",
+check("selecting category row switches active_category and filters list",
       prefs.active_category == "建模工作组"
       and {it.key for it in prefs.plugin_items} == {rec_m["key"], rec_sh["key"]},
       f"cat={prefs.active_category}, keys={[it.key for it in prefs.plugin_items]}")
 prefs.active_group_index = 0
 check("selecting row 0 switches back to all plugins",
-      prefs.active_category == "全部" and len(prefs.plugin_items) >= 4)
+      prefs.active_category == "全部" and len(prefs.plugin_items) >= 5)
 
 # Filter-scoped batch selection: batch actions only affect currently filtered checked items!
 prefs.batch_mode = True
 bpy.ops.plugin_manager.select_all(value=True)
 check("select_all selects current filtered results",
       len(PM.items.selected_keys(prefs)) == len(prefs.plugin_items))
-# Narrow filter to "雕刻工作组" -> batch targets must narrow strictly to visible checked items!
 sculpt_grp_idx = next(i for i, g in enumerate(prefs.group_items) if g.name == "雕刻工作组")
 prefs.active_group_index = sculpt_grp_idx
 filtered_targets = PM.operators._target_keys(prefs, "", True)
 check("filtering narrows batch targets to visible checked items only",
       set(filtered_targets) == {rec_sh["key"], rec_sc["key"]},
       str(filtered_targets))
-# select_all inside filtered view replaces old hidden selections completely
 bpy.ops.plugin_manager.select_all(value=True)
 check("select_all inside filter replaces old hidden selections",
       set(PM.items.all_selected_keys()) == {rec_sh["key"], rec_sc["key"]})
-# Turning off batch_mode clears selections cleanly
 prefs.batch_mode = False
 check("disabling batch_mode clears selections", len(PM.items.all_selected_keys()) == 0)
 prefs.active_group_index = 0
 
-# Stack Modeling + Sculpting
-bpy.ops.plugin_manager.group_toggle(name="建模工作组", active=True)
-bpy.ops.plugin_manager.group_toggle(name="雕刻工作组", active=True)
-check("multi-group stacking enables all members",
+# 2) Curated Presets: decoupled from categories, real-time derived state, union & manual protection
+bpy.ops.plugin_manager.preset_add(name="日常基础", from_category="基础常驻", pinned=True)
+bpy.ops.plugin_manager.preset_add(name="建模方案", from_category="建模工作组", pinned=False)
+bpy.ops.plugin_manager.preset_add(name="雕刻方案", from_category="雕刻工作组", pinned=False)
+PM.items.rebuild_items(prefs)
+check("presets created cleanly with off state",
+      len(prefs.preset_items) == 3 and all(p.state == "off" for p in prefs.preset_items))
+
+# Stack Modeling + Sculpting presets
+bpy.ops.plugin_manager.preset_toggle(name="建模方案", enable=True)
+bpy.ops.plugin_manager.preset_toggle(name="雕刻方案", enable=True)
+check("multi-preset stacking enables all members",
       PM.bridge.is_module_enabled("pm_grp_mod")
       and PM.bridge.is_module_enabled("pm_grp_shared")
       and PM.bridge.is_module_enabled("pm_grp_sculpt"))
 
 # Close Modeling while Sculpting remains open -> Shared Helper stays enabled
-bpy.ops.plugin_manager.group_toggle(name="建模工作组", active=False)
-check("closing one group keeps shared plugin enabled",
+bpy.ops.plugin_manager.preset_toggle(name="建模方案", enable=False)
+check("closing one preset keeps shared plugin enabled",
       (not PM.bridge.is_module_enabled("pm_grp_mod"))
       and PM.bridge.is_module_enabled("pm_grp_shared")
       and PM.bridge.is_module_enabled("pm_grp_sculpt"))
 
-# Solo switch to Modeling keeps pinned Base Core open and closes Sculpting
-bpy.ops.plugin_manager.group_toggle(name="基础常驻", active=True)
-bpy.ops.plugin_manager.group_solo(name="建模工作组", keep_pinned=True)
-check("solo switch preserves pinned base group and swaps workflow groups",
+# 3) Manual enable prompt + temporary protection across preset switches
+bpy.ops.plugin_manager.toggle(key=rec_manual["key"], enable=True)
+check("manual enable triggers non-blocking prompt bar",
+      prefs.manual_prompt_key == rec_manual["key"], f"prompt={prefs.manual_prompt_key}")
+bpy.ops.plugin_manager.manual_prompt_action(key=rec_manual["key"], action="temp")
+check("marking manual plugin temporary dismisses prompt",
+      prefs.manual_prompt_key == "" and PM.services.presets.is_temporary(rec_manual["key"]))
+
+# Switch to Modeling preset -> preserves pinned Base Core AND temporary Manual Extra, closes Sculpt Tool!
+bpy.ops.plugin_manager.preset_switch(name="建模方案", keep_pinned=True, keep_manual=True)
+check("preset switch preserves pinned preset and manual temporary plugin",
       PM.bridge.is_module_enabled("pm_grp_base")
       and PM.bridge.is_module_enabled("pm_grp_mod")
       and PM.bridge.is_module_enabled("pm_grp_shared")
+      and PM.bridge.is_module_enabled("pm_grp_manual")
       and (not PM.bridge.is_module_enabled("pm_grp_sculpt")))
 
-# Group auto-start sync
-bpy.ops.plugin_manager.group_deactivate_all(include_pinned=True)
-bpy.ops.plugin_manager.group_set_startup(name="雕刻工作组", value=True)
-PM.library.apply_startup(str(g_lib), PM.db.LibraryDB(str(g_lib)), enable_marked=True, disable_unmarked=False)
-check("group startup enables all members of startup group",
+# Filter list by preset
+bpy.ops.plugin_manager.preset_filter(name="建模方案")
+check("preset_filter restricts visible list to preset members",
+      {it.key for it in prefs.plugin_items} == {rec_m["key"], rec_sh["key"]})
+bpy.ops.plugin_manager.preset_filter(name="")
+
+# 4) Startup mode toggle (remember vs clean) + preset startup sync
+bpy.ops.plugin_manager.preset_deactivate_all(include_pinned=True, keep_manual=False)
+bpy.ops.plugin_manager.preset_set_startup(name="雕刻方案", value=True)
+prefs.startup_mode = "clean"
+check("startup_mode persists to machine_config",
+      machine_config.load().get("startup_mode") == "clean")
+PM.library.apply_startup(str(g_lib), PM.db.LibraryDB(str(g_lib)), enable_marked=True, disable_unmarked=True)
+check("clean startup enables startup preset and disables temporary/unmarked plugins",
       PM.bridge.is_module_enabled("pm_grp_sculpt")
-      and PM.bridge.is_module_enabled("pm_grp_shared"))
+      and PM.bridge.is_module_enabled("pm_grp_shared")
+      and (not PM.bridge.is_module_enabled("pm_grp_mod"))
+      and (not PM.bridge.is_module_enabled("pm_grp_manual")))
+prefs.startup_mode = "remember"
 
 # Built-in virtual linking & conflict guard
 db_b = PM.db.LibraryDB(str(g_lib))

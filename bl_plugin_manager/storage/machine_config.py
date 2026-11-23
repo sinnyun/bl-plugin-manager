@@ -11,7 +11,8 @@ from pathlib import Path
 
 
 SCHEMA = 1
-_SETTINGS = ("device_name", "library_path", "management_enabled")
+STARTUP_MODES = ("remember", "clean")
+_SETTINGS = ("device_name", "library_path", "management_enabled", "startup_mode")
 _ALLOWED = ("schema", "device_id", *_SETTINGS)
 
 
@@ -28,7 +29,7 @@ def config_path() -> Path:
 def _defaults() -> dict:
     return {"schema": SCHEMA, "device_id": "",
             "device_name": socket.gethostname(), "library_path": None,
-            "management_enabled": False}
+            "management_enabled": False, "startup_mode": "remember"}
 
 
 def _validate(data: dict) -> None:
@@ -40,6 +41,8 @@ def _validate(data: dict) -> None:
         raise ValueError("library_path must be a string or null")
     if not isinstance(data["management_enabled"], bool):
         raise ValueError("management_enabled must be boolean")
+    if data.get("startup_mode", "remember") not in STARTUP_MODES:
+        raise ValueError("startup_mode must be 'remember' or 'clean'")
 
 
 def _read(path: Path) -> dict:

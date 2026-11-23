@@ -7,7 +7,7 @@ import time
 
 from . import constants as C, native_names, scan
 from .db import LibraryDB
-from .services import groups as group_service
+from .services import groups as group_service, presets as preset_service
 
 # 轻量节流：避免 N 面板高频重绘时反复读取库文件
 _LAST = {"t": 0.0, "sig": None}
@@ -32,12 +32,15 @@ def _signature(prefs):
     return (
         prefs.library_path,
         prefs.active_category,
+        getattr(prefs, "active_preset_filter", ""),
         getattr(prefs, "kind_filter", "all"),
         prefs.only_favorites,
         prefs.only_updates,
         prefs.only_enabled,
         prefs.only_incompatible,
         prefs.search,
+        preset_service._PENDING_PROMPT_KEY,
+        tuple(sorted(preset_service.TEMP_KEYS)),
         tuple(db_sigs),
     )
 
@@ -98,9 +101,14 @@ def rebuild_items(prefs) -> list[str]:
     prefs.plugin_items.clear()
     if hasattr(prefs, "group_items"):
         prefs.group_items.clear()
+    if hasattr(prefs, "preset_items"):
+        prefs.preset_items.clear()
     if not prefs.library_path:
         prefs.active_index = 0
         prefs.selected_key = ""
+        if hasattr(prefs, "manual_prompt_key"):
+            prefs.manual_prompt_key = ""
+            prefs.manual_prompt_name = ""
         return []
 
     db = LibraryDB(prefs.library_path)
@@ -108,9 +116,20 @@ def rebuild_items(prefs) -> list[str]:
     library_id = db.data.get("library_id")
     _local_state = (prefs.library_path, str(db._state_store(library_id).path) if library_id else "")
     active_cat = prefs.active_category or "全部"
+    active_preset = getattr(prefs, "active_preset_filter", "") or ""
+    preset_member_set = None
+    if active_preset:
+        prec = db.get_preset(active_preset)
+        if prec is not None:
+            preset_member_set = set(prec.get("plugins") or [])
+        else:
+            prefs.active_preset_filter = ""
+            active_preset = ""
 
     keys = []
     for key, rec in db.plugins.items():
+        if preset_member_set is not None and key not in preset_member_set:
+            continue
         groups = db.plugin_groups(key)
         if active_cat == C.DEFAULT_CATEGORY:
             if groups:
@@ -163,6 +182,10 @@ def rebuild_items(prefs) -> list[str]:
         item.category = rec.get("category") or C.DEFAULT_CATEGORY
         if hasattr(item, "groups_text"):
             item.groups_text = " / ".join(db.plugin_groups(key))
+        if hasattr(item, "presets_text"):
+            item.presets_text = " / ".join(db.plugin_presets(key))
+        if hasattr(item, "is_temporary"):
+            item.is_temporary = bool(rec.get("enabled")) and preset_service.is_temporary(key)
         item.enabled = bool(rec.get("enabled"))
         item.update_available = bool(rec.get("update_available"))
         item.missing = bool(rec.get("missing"))
@@ -176,6 +199,18 @@ def rebuild_items(prefs) -> list[str]:
     prefs.selected_key = previous_selection if previous_selection in keys else ""
     _rebuild_categories(prefs, db)
     _rebuild_groups(prefs, db)
+    _rebuild_presets(prefs, db)
+    if hasattr(prefs, "manual_prompt_key"):
+        prompt_rec = preset_service.pending_prompt(db)
+        if prompt_rec:
+            prefs.manual_prompt_key = prompt_rec.get("key", "")
+            prefs.manual_prompt_name = (
+                prompt_rec.get("display_name") or prompt_rec.get("name")
+                or prompt_rec.get("folder_name") or prompt_rec.get("key", "")
+            )
+        else:
+            prefs.manual_prompt_key = ""
+            prefs.manual_prompt_name = ""
     native_names.invalidate_cache()
     _LAST["sig"] = _signature(prefs)
     return keys
@@ -221,8 +256,9 @@ def prune_selection_to_visible(prefs) -> list[str]:
     return [it.key for it in prefs.plugin_items if it.selected]
 
 
-# 供操作符枚举使用：不依赖 context 的分组/分类缓存
+# 供操作符枚举使用：不依赖 context 的分类/预设缓存
 CATEGORY_CACHE: list[str] = [C.DEFAULT_CATEGORY]
+PRESET_CACHE: list[str] = []
 
 
 def _rebuild_categories(prefs, db: LibraryDB) -> None:
@@ -234,6 +270,30 @@ def _rebuild_categories(prefs, db: LibraryDB) -> None:
         item = prefs.category_items.add()
         item.name = name
     CATEGORY_CACHE = [C.DEFAULT_CATEGORY] + [n for n in db.categories if n != C.DEFAULT_CATEGORY]
+
+
+def _rebuild_presets(prefs, db: LibraryDB) -> None:
+    global PRESET_CACHE
+    infos = preset_service.list_presets(db)
+    PRESET_CACHE = [info["name"] for info in infos]
+    if not hasattr(prefs, "preset_items"):
+        return
+    prefs.preset_items.clear()
+    for info in infos:
+        p = prefs.preset_items.add()
+        p.name = info["name"]
+        p.state = info["state"]
+        p.active = bool(info["active"])
+        p.startup = bool(info["startup"])
+        p.pinned = bool(info["pinned"])
+        p.total = int(info["total"])
+        p.enabled = int(info["enabled"])
+        p.broken = int(info["broken"])
+    if hasattr(prefs, "active_preset_index"):
+        if not len(prefs.preset_items):
+            prefs.active_preset_index = 0
+        elif prefs.active_preset_index >= len(prefs.preset_items):
+            prefs.active_preset_index = len(prefs.preset_items) - 1
 
 
 def _rebuild_groups(prefs, db: LibraryDB) -> None:
@@ -288,13 +348,18 @@ def category_options() -> list[str]:
 
 
 def group_options() -> list[str]:
-    """当前可用工作分组（不含未分类）。"""
+    """当前可用分类（不含未分类）。"""
     return [n for n in CATEGORY_CACHE if n != C.DEFAULT_CATEGORY]
 
 
+def preset_options() -> list[str]:
+    """当前可用工作预设列表。"""
+    return list(PRESET_CACHE)
+
+
 def refresh_cache(prefs=None) -> list[str]:
-    """从库文件重新读取分组到缓存，保证任何入口都能拿到最新列表。"""
-    global CATEGORY_CACHE
+    """从库文件重新读取分类与预设到缓存，保证任何入口都能拿到最新列表。"""
+    global CATEGORY_CACHE, PRESET_CACHE
     path = getattr(prefs, "library_path", "") if prefs is not None else ""
     if path:
         try:
@@ -302,6 +367,7 @@ def refresh_cache(prefs=None) -> list[str]:
             CATEGORY_CACHE = [C.DEFAULT_CATEGORY] + [
                 n for n in db.categories if n != C.DEFAULT_CATEGORY
             ]
+            PRESET_CACHE = list(db.preset_names())
         except Exception:
             pass
     return CATEGORY_CACHE

@@ -8,7 +8,7 @@
 bl_info = {
     "name": "插件库管理器 (Plugin Library Manager)",
     "author": "ZCode",
-    "version": (2, 4, 4),
+    "version": (2, 5, 0),
     "blender": (4, 2, 0),
     "location": "3D 视图 > 侧边栏 (N) > 插件库",
     "description": "集中管理所有 Blender 插件：分类、备注、启停、更新检测、自动收编",
@@ -85,6 +85,9 @@ else:
             if (local.get("management_enabled") and root and bridge.managed_library_root() == root
                     and os.path.isdir(root)):
                 scoped_management.sync_to_profile(root)
+                prefs = bridge.get_prefs()
+                if prefs is not None:
+                    items.maybe_rebuild(prefs)
         except Exception as exc:
             print("[插件库] 同步原生配置失败:", exc)
         return 2.0
@@ -102,6 +105,7 @@ else:
                 preferences._LOADING_MACHINE_PATH = True
                 try:
                     prefs.device_name = local.get("device_name", "")
+                    prefs.startup_mode = local.get("startup_mode", "remember")
                     if path:
                         prefs.library_path = path
                 finally:
@@ -117,9 +121,11 @@ else:
 
 
     def _apply_launch_sync():
-        """仅当偏好开启时，按库内「自启」标记同步一次插件启用状态。"""
+        """兼容入口：干净启动已集成进 library_jobs 启动激活，避免双次覆盖。"""
         prefs = bridge.get_prefs()
-        if not prefs or not prefs.sync_startup_on_launch or not prefs.library_path:
+        if not prefs or not prefs.library_path:
+            return
+        if not (prefs.startup_mode == "clean" or prefs.sync_startup_on_launch):
             return
         if library_jobs.running():
             return 0.2
@@ -130,9 +136,10 @@ else:
             return
         try:
             from .db import LibraryDB
+            disable_unmarked = (prefs.startup_mode == "clean") or bool(prefs.startup_disable_unmarked)
             library.apply_startup(prefs.library_path, LibraryDB(prefs.library_path),
                                   enable_marked=True,
-                                  disable_unmarked=prefs.startup_disable_unmarked)
+                                  disable_unmarked=disable_unmarked)
             from . import items
             items.rebuild_items(prefs)
         except Exception as exc:
@@ -162,22 +169,13 @@ else:
                     pass
             _registered.clear()
             raise
-        # 启动同步：延迟执行，等 Blender 初始化完成（仅当偏好开启时生效）
+        # 同步原生偏好设置变化（2 秒轮询，不再另启延迟覆盖自启的冲突计时器）
         try:
             bpy.app.timers.unregister(_sync_manager_state)
         except Exception:
             pass
         try:
             bpy.app.timers.register(_sync_manager_state, first_interval=2.0, persistent=True)
-        except Exception:
-            pass
-        # 启动同步策略：等 Blender 与库加载就绪后执行一次（仅当偏好开启时生效）
-        try:
-            bpy.app.timers.unregister(_apply_launch_sync)
-        except Exception:
-            pass
-        try:
-            bpy.app.timers.register(_apply_launch_sync, first_interval=2.5)
         except Exception:
             pass
         print(f"[插件库] 已启用 v{C.ADDON_VERSION_STR}（投放区为手动扫描）")

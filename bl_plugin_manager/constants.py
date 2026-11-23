@@ -7,8 +7,8 @@ import os
 # --- 身份标识 -------------------------------------------------------------
 ADDON_ID = "bl_plugin_manager"
 ADDON_NAME = "插件库管理器"
-ADDON_VERSION = (2, 4, 4)
-ADDON_VERSION_STR = "2.4.4"
+ADDON_VERSION = (2, 5, 0)
+ADDON_VERSION_STR = "2.5.0"
 
 # Blender 侧扩展仓库标识（必须是合法的 Python 标识符）
 REPO_MODULE = "pmlib"

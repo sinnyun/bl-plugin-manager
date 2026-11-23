@@ -93,6 +93,7 @@ def _empty_view() -> dict:
         "library_id": "",
         "revision": 0,
         "categories": [dict(catalog_store.DEFAULT_CATEGORY)],
+        "presets": [],
         "plugins": {},
     }
 
@@ -206,6 +207,7 @@ class LibraryDB:
         self._bindings: dict[str, str] = {}
         self._runtime: dict[str, dict] = {}
         self._group_state: dict[str, dict] = {}
+        self._preset_state: dict[str, dict] = {}
         # 最近一次 merge_scan 的统计（added/updated/missing/renamed…）与
         # 本次扫描的 rel -> plugin_id 映射。
         self.scan_stats: dict = {}
@@ -218,7 +220,7 @@ class LibraryDB:
         status = self.catalog.load()
         self._catalog_baseline = deepcopy(self.catalog.plugins) if status == "OK" else {}
         legacy_status = self.catalog.legacy_status() if status != "OK" else "MISSING"
-        self._bindings, self._runtime, self._group_state = {}, {}, {}
+        self._bindings, self._runtime, self._group_state, self._preset_state = {}, {}, {}, {}
         if status == "OK":
             self.status = "OK"
         elif status in {"CORRUPT", "UNSUPPORTED"} or legacy_status in {"CORRUPT", "UNSUPPORTED"}:
@@ -238,7 +240,7 @@ class LibraryDB:
             return
 
         library_id = str(self.catalog.data.get("library_id") or "")
-        self._bindings, self._runtime, self._group_state = self._load_local(library_id)
+        self._bindings, self._runtime, self._group_state, self._preset_state = self._load_local(library_id)
 
         plugins: dict[str, dict] = {}
         for plugin_id, portable in self.catalog.plugins.items():
@@ -268,16 +270,24 @@ class LibraryDB:
             "library_id": library_id,
             "revision": int(self.catalog.data.get("revision", 0)),
             "categories": [dict(item) for item in self.catalog.categories],
+            "presets": [dict(item) for item in self.catalog.presets],
             "plugins": plugins,
         }
-        _split_shared, split_bindings, split_runtime, split_groups = self._split()
+        _split_shared, split_bindings, split_runtime, split_groups, split_presets = self._split()
         raw_shared = {
             "plugins": deepcopy(self.catalog.plugins),
             "categories": {item["id"]: dict(item) for item in self.catalog.categories},
+            "presets": {item["id"]: dict(item) for item in self.catalog.presets},
         }
-        self._baseline = (raw_shared, deepcopy(split_bindings), deepcopy(split_runtime), deepcopy(split_groups))
+        self._baseline = (
+            raw_shared,
+            deepcopy(split_bindings),
+            deepcopy(split_runtime),
+            deepcopy(split_groups),
+            deepcopy(split_presets),
+        )
 
-    def _load_local(self, library_id: str) -> tuple[dict, dict, dict]:
+    def _load_local(self, library_id: str) -> tuple[dict, dict, dict, dict]:
         state = self._state_store(library_id).load()
         raw_bindings = state.get("bindings")
         bindings = ({str(k): str(v) for k, v in raw_bindings.items()
@@ -295,7 +305,15 @@ class LibraryDB:
                         "active": bool(cfg.get("active", False)),
                         "startup": bool(cfg.get("startup", False)),
                     }
-        return bindings, runtime, groups
+        raw_presets = state.get("presets")
+        presets = {}
+        if isinstance(raw_presets, dict):
+            for name, cfg in raw_presets.items():
+                if isinstance(name, str) and name and isinstance(cfg, dict):
+                    presets[name] = {
+                        "startup": bool(cfg.get("startup", False)),
+                    }
+        return bindings, runtime, groups, presets
 
     def _state_store(self, library_id: str) -> StateStore:
         return StateStore(library_id or "unknown", _environment())
@@ -325,10 +343,13 @@ class LibraryDB:
         if previous_id and previous_id != library_id:
             raise catalog_store.CatalogConflictError("库标识已变更，请重新打开插件库后再保存")
         current = self._split()
-        old_shared, old_bindings, old_runtime, old_groups = self._baseline
-        shared, bindings, runtime, groups = current
-        existing = {"plugins": self.catalog.plugins,
-                    "categories": {item["id"]: item for item in self.catalog.categories}}
+        old_shared, old_bindings, old_runtime, old_groups, old_presets = self._baseline
+        shared, bindings, runtime, groups, presets = current
+        existing = {
+            "plugins": self.catalog.plugins,
+            "categories": {item["id"]: item for item in self.catalog.categories},
+            "presets": {item["id"]: item for item in self.catalog.presets},
+        }
         conflicts = []
         # 本机解绑只影响本机状态。共享记录仅在调用方实际修改字段时写回。
         merged = _merge_changes(old_shared, shared, existing, conflicts)
@@ -345,22 +366,28 @@ class LibraryDB:
         if merged != existing:
             self.catalog.data["plugins"] = merged["plugins"]
             self.catalog.data["categories"] = list(merged["categories"].values())
+            self.catalog.data["presets"] = sorted(
+                merged["presets"].values(), key=lambda p: p.get("order", 0)
+            )
             try:
                 self.catalog.save()
             except catalog_store.CatalogConflictError:
                 self.catalog.load()
                 raise
 
-        if bindings != old_bindings or runtime != old_runtime or groups != old_groups:
-            latest_bindings, latest_runtime, latest_groups = self._load_local(library_id)
+        if (bindings != old_bindings or runtime != old_runtime
+                or groups != old_groups or presets != old_presets):
+            latest_bindings, latest_runtime, latest_groups, latest_presets = self._load_local(library_id)
             self._bindings = _merge_changes(old_bindings, bindings, latest_bindings)
             self._runtime = _merge_changes(old_runtime, runtime, latest_runtime)
             self._group_state = _merge_changes(old_groups, groups, latest_groups)
+            self._preset_state = _merge_changes(old_presets, presets, latest_presets)
             self._state_store(library_id).save({
                 "schema": 2,
                 "bindings": self._bindings,
                 "plugins": self._runtime,
                 "groups": self._group_state,
+                "presets": self._preset_state,
             })
         self._baseline = deepcopy(current)
         self._catalog_baseline = deepcopy(shared["plugins"])
@@ -369,8 +396,8 @@ class LibraryDB:
         self.data["library_id"] = library_id
         self.data["revision"] = int(self.catalog.data.get("revision", 0))
 
-    def _split(self) -> tuple[dict, dict, dict, dict]:
-        """把视图记录按归属拆成 总资料库 / 绑定 / 运行状态 / 分组状态。
+    def _split(self) -> tuple[dict, dict, dict, dict, dict]:
+        """把视图记录按归属拆成 总资料库 / 绑定 / 运行状态 / 分组状态 / 预设状态。
 
         以资料库既有条目为底，保证本机未安装的条目不会被这次写入抹掉。
         """
@@ -408,11 +435,18 @@ class LibraryDB:
             if fields:
                 runtime[plugin_id] = fields
         categories = {item["id"]: dict(item) for item in self._category_records()}
+        presets_shared = {item["id"]: dict(item) for item in self._preset_records()}
         groups = {name: {"active": bool(cfg.get("active", False)),
                          "startup": bool(cfg.get("startup", False))}
                   for name, cfg in self._group_state.items()
                   if isinstance(name, str) and name and isinstance(cfg, dict)}
-        return {"plugins": catalog_plugins, "categories": categories}, bindings, runtime, groups
+        preset_state = {name: {"startup": bool(cfg.get("startup", False))}
+                        for name, cfg in self._preset_state.items()
+                        if isinstance(name, str) and name and isinstance(cfg, dict)}
+        return (
+            {"plugins": catalog_plugins, "categories": categories, "presets": presets_shared},
+            bindings, runtime, groups, preset_state,
+        )
 
     # -- 初始化与迁移 ------------------------------------------------------
     def prepare(self) -> str:
@@ -784,6 +818,179 @@ class LibraryDB:
         name = (group_name or "").strip()
         groups = [g for g in self.plugin_groups(key) if g != name]
         return self.set_plugin_groups(key, groups)
+
+    # -- 工作方案 / 预设（共享定义 + 本机自启标记；无死 active 布尔） --------
+    def _preset_records(self) -> list[dict]:
+        raw = self.data.setdefault("presets", [])
+        out: list[dict] = []
+        seen: set[str] = set()
+        for idx, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            plugins = []
+            pseen: set[str] = set()
+            for pid in item.get("plugins") or []:
+                s = str(pid or "").strip()
+                if s and s not in pseen:
+                    pseen.add(s)
+                    plugins.append(s)
+            out.append({
+                "id": str(item.get("id") or name),
+                "name": name,
+                "order": int(item.get("order", idx)),
+                "plugins": plugins,
+                "pinned": bool(item.get("pinned", False)),
+                "description": str(item.get("description") or ""),
+            })
+        self.data["presets"] = out
+        return out
+
+    def preset_records(self) -> list[dict]:
+        """Return all curated presets merged with machine-local startup flag."""
+        out: list[dict] = []
+        for item in self._preset_records():
+            name = item["name"]
+            state = self._preset_state.get(name) or {}
+            out.append({
+                "id": item["id"],
+                "name": name,
+                "order": item["order"],
+                "plugins": list(item["plugins"]),
+                "pinned": bool(item.get("pinned", False)),
+                "description": item.get("description", ""),
+                "startup": bool(state.get("startup", False)),
+            })
+        return out
+
+    def preset_names(self) -> list[str]:
+        return [p["name"] for p in self.preset_records()]
+
+    def get_preset(self, name: str) -> dict | None:
+        target = (name or "").strip()
+        for p in self.preset_records():
+            if p["name"] == target:
+                return p
+        return None
+
+    def add_preset(self, name: str, plugins: list[str] | None = None, *,
+                   pinned: bool = False, description: str = "") -> bool:
+        clean = (name or "").strip()
+        if not clean or clean in self.preset_names():
+            return False
+        records = self._preset_records()
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for pid in plugins or []:
+            s = str(pid or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                dedup.append(s)
+        records.append({
+            "id": clean,
+            "name": clean,
+            "order": len(records),
+            "plugins": dedup,
+            "pinned": bool(pinned),
+            "description": str(description or ""),
+        })
+        return True
+
+    def rename_preset(self, old: str, new: str) -> bool:
+        old_n, new_n = (old or "").strip(), (new or "").strip()
+        if not old_n or not new_n or old_n == new_n or new_n in self.preset_names():
+            return False
+        found = False
+        for item in self._preset_records():
+            if item["name"] == old_n:
+                item["name"] = new_n
+                item["id"] = new_n
+                found = True
+                break
+        if found and old_n in self._preset_state:
+            state = self._preset_state.pop(old_n)
+            self._preset_state.setdefault(new_n, state)
+        return found
+
+    def delete_preset(self, name: str) -> bool:
+        target = (name or "").strip()
+        before = len(self._preset_records())
+        self.data["presets"] = [item for item in self._preset_records() if item["name"] != target]
+        self._preset_state.pop(target, None)
+        return len(self.data["presets"]) < before
+
+    def set_preset_plugins(self, name: str, plugin_keys: list[str]) -> list[str]:
+        target = (name or "").strip()
+        if not target:
+            return []
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for pid in plugin_keys or []:
+            s = str(pid or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                dedup.append(s)
+        for item in self._preset_records():
+            if item["name"] == target:
+                item["plugins"] = dedup
+                return list(dedup)
+        self.add_preset(target, dedup)
+        return list(dedup)
+
+    def add_plugin_to_preset(self, key: str, preset_name: str) -> bool:
+        target = (preset_name or "").strip()
+        pid = (key or "").strip()
+        if not target or not pid:
+            return False
+        for item in self._preset_records():
+            if item["name"] == target:
+                if pid not in item["plugins"]:
+                    item["plugins"].append(pid)
+                    return True
+                return False
+        self.add_preset(target, [pid])
+        return True
+
+    def remove_plugin_from_preset(self, key: str, preset_name: str) -> bool:
+        target = (preset_name or "").strip()
+        pid = (key or "").strip()
+        for item in self._preset_records():
+            if item["name"] == target:
+                if pid in item["plugins"]:
+                    item["plugins"] = [p for p in item["plugins"] if p != pid]
+                    return True
+                return False
+        return False
+
+    def plugin_presets(self, key: str) -> list[str]:
+        pid = (key or "").strip()
+        if not pid:
+            return []
+        return [item["name"] for item in self._preset_records() if pid in item["plugins"]]
+
+    def set_preset_pinned(self, name: str, pinned: bool) -> None:
+        target = (name or "").strip()
+        for item in self._preset_records():
+            if item["name"] == target:
+                item["pinned"] = bool(pinned)
+                break
+
+    def get_preset_state(self, name: str) -> dict:
+        state = self._preset_state.get((name or "").strip()) or {}
+        return {"startup": bool(state.get("startup", False))}
+
+    def set_preset_state(self, name: str, *, startup: bool | None = None) -> dict:
+        target = (name or "").strip()
+        if not target:
+            return {"startup": False}
+        cur = self.get_preset_state(target)
+        if startup is not None:
+            cur["startup"] = bool(startup)
+        self._preset_state[target] = cur
+        return dict(cur)
 
     # -- 统计 --------------------------------------------------------------
     def startup_stats(self) -> dict:

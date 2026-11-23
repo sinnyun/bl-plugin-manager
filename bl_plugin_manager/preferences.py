@@ -46,7 +46,9 @@ class PM_PluginItem(PropertyGroup):
     module: StringProperty(default="")
     note: StringProperty(default="")
     category: StringProperty(default="")
-    groups_text: StringProperty(default="")       # 所属分组摘要
+    groups_text: StringProperty(default="")       # 所属分类摘要
+    presets_text: StringProperty(default="")      # 所属预设摘要
+    is_temporary: BoolProperty(default=False)     # 本次会话临时启用
     enabled: BoolProperty(default=False)
     update_available: BoolProperty(default=False)
     missing: BoolProperty(default=False)
@@ -62,7 +64,7 @@ class PM_CategoryItem(PropertyGroup):
 
 
 class PM_GroupItem(PropertyGroup):
-    """工作分组列表项（含默认「全部插件」行，以及用户工作分组的开关、自启、常驻与计数）。"""
+    """分类筛选列表项（含默认「全部插件」行，仅用于整理与筛选，不带开关）。"""
 
     name: StringProperty(default="")
     is_all: BoolProperty(default=False)
@@ -71,6 +73,19 @@ class PM_GroupItem(PropertyGroup):
     pinned: BoolProperty(default=False)
     total: IntProperty(default=0)
     enabled: IntProperty(default=0)
+
+
+class PM_PresetItem(PropertyGroup):
+    """工作预设列表项（状态由成员真实启用情况实时推导，绝不存过期开关）。"""
+
+    name: StringProperty(default="")
+    state: StringProperty(default="off")  # "all" | "partial" | "off"
+    active: BoolProperty(default=False)
+    startup: BoolProperty(default=False)
+    pinned: BoolProperty(default=False)
+    total: IntProperty(default=0)
+    enabled: IntProperty(default=0)
+    broken: IntProperty(default=0)
 
 
 class PM_ReportItem(PropertyGroup):
@@ -172,6 +187,23 @@ def _on_library_path_update(self, context):
     items.maybe_rebuild(self, force=True)
 
 
+def _on_startup_mode_update(self, context):
+    if _LOADING_MACHINE_PATH:
+        return
+    try:
+        from .storage import machine_config
+
+        machine_config.save({"startup_mode": self.startup_mode})
+    except Exception as exc:
+        print("[插件库] 保存启动模式失败:", exc)
+    try:
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                area.tag_redraw()
+    except Exception:
+        pass
+
+
 def _on_device_name_update(self, context):
     if _LOADING_MACHINE_PATH or not self.device_name.strip():
         return
@@ -201,6 +233,12 @@ _KIND_FILTER_ITEMS = (
     (C.KIND_EXTENSION, "扩展插件", "仅显示库内扩展插件"),
     (C.KIND_ADDON, "传统插件", "仅显示库内传统插件"),
     (C.KIND_BUILTIN, "内置插件", "仅显示虚拟链接管理的 Blender 自带基础插件"),
+)
+
+
+_STARTUP_MODE_ITEMS = (
+    ("remember", "记住上次状态", "下次打开 Blender 自动恢复退出前启用的全部插件"),
+    ("clean", "干净启动", "下次打开 Blender 仅启动标记为「自启」的预设与插件，临时开启的插件重启后自动恢复清爽"),
 )
 
 
@@ -235,6 +273,10 @@ class PMAddonPreferences(AddonPreferences):
     selected_key: StringProperty(default="")
     active_index: IntProperty(default=0, update=_on_index_update)
     active_group_index: IntProperty(default=0, update=_on_group_index_update)
+    active_preset_index: IntProperty(default=0)
+    active_preset_filter: StringProperty(default="", options={"SKIP_SAVE"}, update=_on_filter_update)
+    manual_prompt_key: StringProperty(default="", options={"SKIP_SAVE"})
+    manual_prompt_name: StringProperty(default="", options={"SKIP_SAVE"})
     active_category: StringProperty(default="全部", update=_on_filter_update)
     kind_filter: EnumProperty(
         name="来源",
@@ -305,21 +347,31 @@ class PMAddonPreferences(AddonPreferences):
     store_only_compatible: BoolProperty(name="仅兼容版本", default=True,
                                         description="只显示与当前 Blender 版本兼容的扩展")
 
-    # 启动控制
+    # 启动控制（二选一明确策略；实际持久化到本机 machine.json）
+    startup_mode: EnumProperty(
+        name="启动模式",
+        description="决定下次打开 Blender 时如何恢复插件启用状态",
+        items=_STARTUP_MODE_ITEMS,
+        default="remember",
+        options={"SKIP_SAVE"},
+        update=_on_startup_mode_update,
+    )
+    # 兼容旧版脚本/测试的布尔字段（不再单独触发二次冲突覆盖）
     sync_startup_on_launch: BoolProperty(
-        name="启动时同步自启分组与插件",
-        description="Blender 启动时自动启用所有标记为「自启」的分组及插件",
+        name="启动时同步自启预设与插件",
+        description="兼容选项：推荐直接使用上方「启动模式」选择记住上次或干净启动",
         default=False,
     )
     startup_disable_unmarked: BoolProperty(
         name="同时停用未标记自启的库内插件",
-        description="启动同步时停用未标记自启的库内插件（不会停用 Blender 内置插件）",
+        description="兼容选项：干净启动模式默认自动停用未标记自启的库内插件（不强关内置插件）",
         default=False,
     )
 
     plugin_items: CollectionProperty(type=PM_PluginItem)
     category_items: CollectionProperty(type=PM_CategoryItem)
     group_items: CollectionProperty(type=PM_GroupItem)
+    preset_items: CollectionProperty(type=PM_PresetItem)
 
     def draw(self, context):
         layout = self.layout
@@ -397,11 +449,24 @@ class PMAddonPreferences(AddonPreferences):
         box.prop(self, "manage_builtin_addons")
 
         box.separator()
-        box.prop(self, "sync_startup_on_launch")
-        row = box.row()
-        row.enabled = self.sync_startup_on_launch
-        row.prop(self, "startup_disable_unmarked")
-        box.operator("plugin_manager.apply_startup", icon="PLAY", text="立即应用自启分组与插件")
+        row = box.row(align=True)
+        row.label(text="启动模式：", icon="TIME")
+        row.prop(self, "startup_mode", expand=True)
+        if self.startup_mode == "clean":
+            startup_presets = sum(1 for p in self.preset_items if p.startup)
+            box.label(
+                text=f"下次打开 Blender 仅启动自启预设（{startup_presets} 个）与自启插件，临时启用的插件重启后自动归零",
+                icon="INFO",
+            )
+            op = box.operator("plugin_manager.apply_startup", icon="PLAY", text="立即按干净启动清单重置")
+            op.disable_unmarked = True
+        else:
+            box.label(
+                text="下次打开 Blender 自动恢复退出前启用的全部插件（与 Blender 原生习惯一致）",
+                icon="INFO",
+            )
+            op = box.operator("plugin_manager.apply_startup", icon="PLAY", text="手动应用自启预设与插件…")
+            op.disable_unmarked = False
 
         # --- 3. 外部收编与官方商店 ---
         box = layout.box()
@@ -441,4 +506,11 @@ class PMAddonPreferences(AddonPreferences):
             box.label(text=message, icon="INFO")
 
 
-classes = (PM_PluginItem, PM_CategoryItem, PM_GroupItem, PM_ReportItem, PMAddonPreferences)
+classes = (
+    PM_PluginItem,
+    PM_CategoryItem,
+    PM_GroupItem,
+    PM_PresetItem,
+    PM_ReportItem,
+    PMAddonPreferences,
+)

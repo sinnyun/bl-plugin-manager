@@ -368,6 +368,16 @@ class PM_OT_toggle(_PMBase):
         rec["last_error"] = "" if ok else (err or "未知错误")
         db.save()
         if ok:
+            from . import items
+            from .services import presets as preset_service
+
+            if self.enable:
+                preset_service.note_manual_enable(db, key)
+            else:
+                preset_service.note_manual_disable(key)
+            if prefs:
+                items.rebuild_items(prefs)
+            _redraw()
             verb = "已启用" if self.enable else "已停用"
             return _report(self, True, f"{verb}: {library.effective_name(rec)}")
         return _report(self, False, f"操作失败: {err}")
@@ -696,6 +706,8 @@ class PM_OT_apply_startup(_PMBase):
         msg = f"已启用 {stats['enabled']}"
         if self.disable_unmarked:
             msg += f"，已停用 {stats['disabled']}"
+        if stats.get("skipped_broken"):
+            msg += f"，跳过不兼容/失败 {stats['skipped_broken']} 个"
         if stats["failed"]:
             bpy.ops.plugin_manager.show_report()
             msg += f"，{len(stats['failed'])} 个失败（见报告）"
@@ -916,11 +928,11 @@ class PM_OT_batch_set_startup(_PMBase):
         return _report(self, True, f"已批量{verb} {len(keys)} 个")
 
 
-def _apply_group_plan_op(op, prefs, db, plan: dict, label: str):
+def _apply_preset_plan_op(op, prefs, db, plan: dict, label: str):
     from . import items
-    from .services import groups as group_service
+    from .services import presets as preset_service
 
-    stats = group_service.apply_group_plan(
+    stats = preset_service.apply_preset_plan(
         db, plan,
         set_enabled_fn=bridge.set_enabled,
         is_enabled_fn=bridge.is_module_enabled,
@@ -940,6 +952,10 @@ def _apply_group_plan_op(op, prefs, db, plan: dict, label: str):
         parts.append(f"停用 {stats['disabled']} 个")
     if stats["kept_shared"]:
         parts.append(f"共有保留 {stats['kept_shared']} 个")
+    if stats["kept_manual"]:
+        parts.append(f"保留临时 {stats['kept_manual']} 个")
+    if stats["skipped_broken"]:
+        parts.append(f"跳过不兼容/失败 {stats['skipped_broken']} 个")
     if stats["failed"]:
         parts.append(f"失败 {len(stats['failed'])} 个")
     return _report(op, not stats["failed"], " · ".join(parts))
@@ -947,27 +963,36 @@ def _apply_group_plan_op(op, prefs, db, plan: dict, label: str):
 
 class PM_OT_enable_pack(_PMBase):
     bl_idname = "plugin_manager.enable_pack"
-    bl_label = "启用整组"
-    bl_description = "启用当前分组下的全部插件"
+    bl_label = "启用当前分类全部"
+    bl_description = "一次性启用当前分类下所有兼容插件（自动跳过已知不兼容或失败插件）"
 
     def execute(self, context):
         prefs = _prefs(context)
         db = _db(context)
         if not db:
             return _report(self, False, "插件库未就绪")
+        from .services import presets as preset_service
+
         target = prefs.active_category
         if target and target not in ("", "全部", C.DEFAULT_CATEGORY):
-            from .services import groups as group_service
-            plan = group_service.plan_group_toggle(db, target, True)
-            return _apply_group_plan_op(self, prefs, db, plan, f"已开启分组「{target}」")
-        records = [rec for key, rec in db.plugins.items() if not db.plugin_groups(key)]
-        return _set_plugins_enabled(self, prefs, db, records, True)
+            records = [rec for key, rec in db.plugins.items() if target in db.plugin_groups(key)]
+        else:
+            records = [rec for key, rec in db.plugins.items() if not db.plugin_groups(key)]
+        runnable = [r for r in records if not preset_service.is_known_broken(r)]
+        skipped_broken = len(records) - len(runnable)
+        if not runnable:
+            msg = f"没有可启用的插件（跳过不兼容/失败 {skipped_broken} 个）" if skipped_broken else "没有可操作的插件"
+            return _report(self, False, msg)
+        res = _set_plugins_enabled(self, prefs, db, runnable, True)
+        if skipped_broken:
+            self.report({"INFO"}, f"已自动跳过 {skipped_broken} 个不兼容/失败插件")
+        return res
 
 
 class PM_OT_disable_pack(_PMBase):
     bl_idname = "plugin_manager.disable_pack"
-    bl_label = "停用整组"
-    bl_description = "停用当前分组下的全部插件（保留其他开启分组共有的插件）"
+    bl_label = "停用当前分类全部"
+    bl_description = "一次性停用当前分类下的全部插件"
 
     def execute(self, context):
         prefs = _prefs(context)
@@ -976,124 +1001,445 @@ class PM_OT_disable_pack(_PMBase):
             return _report(self, False, "插件库未就绪")
         target = prefs.active_category
         if target and target not in ("", "全部", C.DEFAULT_CATEGORY):
-            from .services import groups as group_service
-            plan = group_service.plan_group_toggle(db, target, False)
-            return _apply_group_plan_op(self, prefs, db, plan, f"已关闭分组「{target}」")
-        records = [rec for key, rec in db.plugins.items() if not db.plugin_groups(key)]
+            records = [rec for key, rec in db.plugins.items() if target in db.plugin_groups(key)]
+        else:
+            records = [rec for key, rec in db.plugins.items() if not db.plugin_groups(key)]
         return _set_plugins_enabled(self, prefs, db, records, False)
 
 
-class PM_OT_group_toggle(_PMBase):
-    bl_idname = "plugin_manager.group_toggle"
-    bl_label = "开关分组"
-    bl_description = "开启或关闭指定分组（支持多组叠加；关闭时自动保留与其他开启分组共有的插件）"
+# ---------------------------------------------------------------------------
+# 工作方案 / 预设（精选插件一键启停，与分类筛选完全解耦）
+# ---------------------------------------------------------------------------
+def _preset_enum(self, context):
+    from . import items as _items
 
-    name: StringProperty(default="")
-    active: BoolProperty(default=True)
-
-    def execute(self, context):
-        prefs = _prefs(context)
-        db = _db(context)
-        if not db or not self.name:
-            return _report(self, False, "插件库未就绪")
-        from .services import groups as group_service
-
-        plan = group_service.plan_group_toggle(db, self.name, self.active)
-        verb = "已开启" if self.active else "已关闭"
-        return _apply_group_plan_op(self, prefs, db, plan, f"{verb}分组「{self.name}」")
+    _items.refresh_cache(bridge.get_prefs())
+    opts = _items.preset_options()
+    return [(p, p, "") for p in opts] or [("__NONE__", "（暂无预设，可在下方输入新名称）", "")]
 
 
-class PM_OT_group_solo(_PMBase):
-    bl_idname = "plugin_manager.group_solo"
-    bl_label = "独占切换分组"
-    bl_description = "切换到此分组并关闭其他非常驻分组（常驻基础组保持开启）"
+def _seed_category_enum(self, context):
+    from . import items as _items
 
-    name: StringProperty(default="")
-    keep_pinned: BoolProperty(default=True)
-
-    def execute(self, context):
-        prefs = _prefs(context)
-        db = _db(context)
-        if not db or not self.name:
-            return _report(self, False, "插件库未就绪")
-        from .services import groups as group_service
-
-        plan = group_service.plan_group_solo(db, self.name, keep_pinned=self.keep_pinned)
-        return _apply_group_plan_op(self, prefs, db, plan, f"已切换至分组「{self.name}」")
+    _items.refresh_cache(bridge.get_prefs())
+    opts = [("", "不导入（创建空白预设）", "")]
+    for name in _items.group_options():
+        opts.append((name, f"从分类「{name}」导入成员", ""))
+    return opts
 
 
-class PM_OT_group_set_startup(_PMBase):
-    bl_idname = "plugin_manager.group_set_startup"
-    bl_label = "分组自启开关"
-    bl_description = "标记该分组在 Blender 启动同步时自动开启"
+class PM_OT_preset_add(_PMBase):
+    bl_idname = "plugin_manager.preset_add"
+    bl_label = "新建工作预设"
+    bl_description = "创建一个精选工作预设（可空白创建，或从现有分类导入成员）"
 
-    name: StringProperty(default="")
-    value: BoolProperty(default=True)
+    name: StringProperty(name="预设名称", default="")
+    from_category: EnumProperty(name="初始成员", items=_seed_category_enum)
+    pinned: BoolProperty(name="设为常驻预设", description="切换其他预设时始终保留开启", default=False)
+    add_plugin_key: StringProperty(default="", options={"HIDDEN"})
 
-    def execute(self, context):
-        prefs = _prefs(context)
-        db = _db(context)
-        if not db or not self.name:
-            return _report(self, False, "插件库未就绪")
-        db.set_group_state(self.name, startup=bool(self.value))
-        db.save()
-        from . import items
+    def invoke(self, context, event):
+        from . import items as _items
 
-        if prefs:
-            items.rebuild_items(prefs)
-        _redraw()
-        verb = "已设为自启" if self.value else "已取消自启"
-        return _report(self, True, f"分组「{self.name}」{verb}")
-
-
-class PM_OT_group_set_pinned(_PMBase):
-    bl_idname = "plugin_manager.group_set_pinned"
-    bl_label = "常驻分组开关"
-    bl_description = "常驻分组在独占切换其他工作分组或全部关闭时保持开启"
-
-    name: StringProperty(default="")
-    value: BoolProperty(default=True)
-
-    def execute(self, context):
-        prefs = _prefs(context)
-        db = _db(context)
-        if not db or not self.name:
-            return _report(self, False, "插件库未就绪")
-        db.set_group_pinned(self.name, bool(self.value))
-        db.save()
-        from . import items
-
-        if prefs:
-            items.rebuild_items(prefs)
-        _redraw()
-        verb = "已设为常驻组" if self.value else "已取消常驻"
-        return _report(self, True, f"分组「{self.name}」{verb}")
-
-
-class PM_OT_group_deactivate_all(_PMBase):
-    bl_idname = "plugin_manager.group_deactivate_all"
-    bl_label = "关闭全部工作分组"
-    bl_description = "关闭所有已开启的工作分组（默认保留常驻组）"
-
-    include_pinned: BoolProperty(default=False)
+        _items.refresh_cache(_prefs(context))
+        return context.window_manager.invoke_props_dialog(self, width=360)
 
     def execute(self, context):
         prefs = _prefs(context)
         db = _db(context)
         if not db:
             return _report(self, False, "插件库未就绪")
-        from .services import groups as group_service
+        clean = self.name.strip()
+        if not clean:
+            return _report(self, False, "请输入预设名称")
+        members: list[str] = []
+        if self.from_category:
+            members = [key for key in db.plugins if self.from_category in db.plugin_groups(key)]
+        if self.add_plugin_key and self.add_plugin_key not in members and db.get(self.add_plugin_key):
+            members.append(self.add_plugin_key)
+        if not db.add_preset(clean, members, pinned=self.pinned):
+            return _report(self, False, f"预设「{clean}」已存在")
+        db.save()
+        if self.add_plugin_key:
+            from .services import presets as preset_service
 
-        plan = group_service.plan_deactivate_all(db, include_pinned=self.include_pinned)
-        if not plan["deactivated"]:
-            return _report(self, True, "当前没有已开启的工作分组")
-        return _apply_group_plan_op(self, prefs, db, plan, "已关闭全部工作分组")
+            preset_service.note_assigned_to_preset(self.add_plugin_key)
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, f"已新建预设「{clean}」（含 {len(members)} 个插件）")
+
+
+class PM_OT_preset_capture(_PMBase):
+    bl_idname = "plugin_manager.preset_capture"
+    bl_label = "从当前已启保存预设"
+    bl_description = "把当前 Blender 中已启用的插件一键保存为工作预设"
+
+    name: StringProperty(name="预设名称", default="当前工作流")
+    include_builtins: BoolProperty(name="包含已启用的内置插件", default=True)
+    overwrite: BoolProperty(name="若同名预设已存在则更新其成员", default=True)
+    pinned: BoolProperty(name="设为常驻预设", default=False)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db:
+            return _report(self, False, "插件库未就绪")
+        clean = self.name.strip()
+        if not clean:
+            return _report(self, False, "请输入预设名称")
+        enabled_set = bridge.enabled_modules()
+        members: list[str] = []
+        for key, rec in db.plugins.items():
+            module = rec.get("module") or ""
+            if not module or rec.get("missing") or module == C.ADDON_ID:
+                continue
+            if not self.include_builtins and rec.get("kind") == C.KIND_BUILTIN:
+                continue
+            if module in enabled_set:
+                members.append(key)
+        if not members:
+            return _report(self, False, "当前没有已启用的库内插件可保存")
+        exists = db.get_preset(clean) is not None
+        if exists and not self.overwrite:
+            return _report(self, False, f"预设「{clean}」已存在，请更换名称或勾选更新")
+        if exists:
+            db.set_preset_plugins(clean, members)
+            if self.pinned:
+                db.set_preset_pinned(clean, True)
+            msg = f"已更新预设「{clean}」（{len(members)} 个插件）"
+        else:
+            db.add_preset(clean, members, pinned=self.pinned)
+            msg = f"已保存预设「{clean}」（{len(members)} 个插件）"
+        db.save()
+        from . import items
+        from .services import presets as preset_service
+
+        for k in members:
+            preset_service.note_assigned_to_preset(k)
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, msg)
+
+
+class PM_OT_preset_rename(_PMBase):
+    bl_idname = "plugin_manager.preset_rename"
+    bl_label = "重命名预设"
+    bl_description = "重命名指定工作预设"
+
+    old: StringProperty(default="")
+    new: StringProperty(name="新名称", default="")
+
+    def invoke(self, context, event):
+        self.new = self.old
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.old:
+            return _report(self, False, "未指定预设")
+        new_name = self.new.strip()
+        if not new_name:
+            return _report(self, False, "名称不能为空")
+        if not db.rename_preset(self.old, new_name):
+            return _report(self, False, "重命名失败（可能与已有预设重名）")
+        db.save()
+        if prefs and prefs.active_preset_filter == self.old:
+            prefs.active_preset_filter = new_name
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, f"已将预设「{self.old}」重命名为「{new_name}」")
+
+
+class PM_OT_preset_delete(_PMBase):
+    bl_idname = "plugin_manager.preset_delete"
+    bl_label = "删除预设"
+    bl_description = "删除该工作预设（不会删除或卸载任何插件）"
+
+    name: StringProperty(default="")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "未指定预设")
+        if not db.delete_preset(self.name):
+            return _report(self, False, f"未找到预设「{self.name}」")
+        db.save()
+        if prefs and prefs.active_preset_filter == self.name:
+            prefs.active_preset_filter = ""
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, f"已删除预设「{self.name}」")
+
+
+class PM_OT_preset_toggle(_PMBase):
+    bl_idname = "plugin_manager.preset_toggle"
+    bl_label = "开关预设"
+    bl_description = "开启或关闭工作预设（自动跳过不兼容/失败项，关闭时保留其他已开预设共有项与临时插件）"
+
+    name: StringProperty(default="")
+    enable: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        from .services import presets as preset_service
+
+        plan = preset_service.plan_preset_toggle(db, self.name, self.enable)
+        verb = "已开启" if self.enable else "已关闭"
+        return _apply_preset_plan_op(self, prefs, db, plan, f"{verb}预设「{self.name}」")
+
+
+class PM_OT_preset_switch(_PMBase):
+    bl_idname = "plugin_manager.preset_switch"
+    bl_label = "切换至此预设"
+    bl_description = "启用此预设并关闭其他非常驻预设（保留常驻预设与你手动临时启用的插件）"
+
+    name: StringProperty(default="")
+    keep_pinned: BoolProperty(default=True)
+    keep_manual: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        from .services import presets as preset_service
+
+        plan = preset_service.plan_preset_switch(
+            db, self.name, keep_pinned=self.keep_pinned, keep_manual=self.keep_manual,
+        )
+        return _apply_preset_plan_op(self, prefs, db, plan, f"已切换至预设「{self.name}」")
+
+
+class PM_OT_preset_set_pinned(_PMBase):
+    bl_idname = "plugin_manager.preset_set_pinned"
+    bl_label = "常驻预设开关"
+    bl_description = "常驻预设在切换其他工作预设或全部关闭时保持开启"
+
+    name: StringProperty(default="")
+    value: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        db.set_preset_pinned(self.name, bool(self.value))
+        db.save()
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        verb = "已设为常驻预设" if self.value else "已取消常驻"
+        return _report(self, True, f"预设「{self.name}」{verb}")
+
+
+class PM_OT_preset_set_startup(_PMBase):
+    bl_idname = "plugin_manager.preset_set_startup"
+    bl_label = "预设自启开关"
+    bl_description = "在「干净启动」模式下，Blender 启动时自动加载该预设"
+
+    name: StringProperty(default="")
+    value: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db or not self.name:
+            return _report(self, False, "插件库未就绪")
+        db.set_preset_state(self.name, startup=bool(self.value))
+        db.save()
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        verb = "已设为干净启动自启" if self.value else "已取消自启"
+        return _report(self, True, f"预设「{self.name}」{verb}")
+
+
+class PM_OT_preset_deactivate_all(_PMBase):
+    bl_idname = "plugin_manager.preset_deactivate_all"
+    bl_label = "关闭非常驻预设"
+    bl_description = "关闭所有非常驻工作预设的插件（保留常驻预设与手动临时启用的插件）"
+
+    include_pinned: BoolProperty(default=False)
+    keep_manual: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not db:
+            return _report(self, False, "插件库未就绪")
+        from .services import presets as preset_service
+
+        plan = preset_service.plan_deactivate_all_presets(
+            db, include_pinned=self.include_pinned, keep_manual=self.keep_manual,
+        )
+        if not plan["disable"]:
+            return _report(self, True, "当前没有需要关闭的非常驻预设插件")
+        return _apply_preset_plan_op(self, prefs, db, plan, "已关闭非常驻预设")
+
+
+class PM_OT_preset_filter(_PMBase):
+    bl_idname = "plugin_manager.preset_filter"
+    bl_label = "按预设筛选列表"
+    bl_description = "只显示该预设包含的插件（再次点击恢复全部）"
+
+    name: StringProperty(default="")
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        if not prefs:
+            return _report(self, False, "插件库未启用")
+        if not self.name or prefs.active_preset_filter == self.name:
+            prefs.active_preset_filter = ""
+        else:
+            prefs.active_preset_filter = self.name
+        _redraw()
+        return {"FINISHED"}
+
+
+class PM_OT_plugin_toggle_preset(Operator):
+    bl_idname = "plugin_manager.plugin_toggle_preset"
+    bl_label = "加入/移出预设"
+    bl_description = "把该插件加入或移出指定工作预设（一个插件可同时属于多个预设）"
+
+    key: StringProperty(default="")
+    preset: StringProperty(default="")
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        key = self.key or (prefs.selected_key if prefs else "")
+        if not db or not key or not self.preset:
+            return _report(self, False, "未找到插件或预设")
+        from .services import presets as preset_service
+
+        current = db.plugin_presets(key)
+        if self.preset in current:
+            db.remove_plugin_from_preset(key, self.preset)
+            msg = f"已移出预设「{self.preset}」"
+        else:
+            db.add_plugin_to_preset(key, self.preset)
+            preset_service.note_assigned_to_preset(key)
+            msg = f"已加入预设「{self.preset}」"
+        db.save()
+        from . import items
+
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, msg)
+
+
+class PM_OT_batch_add_preset(_PMBase):
+    bl_idname = "plugin_manager.batch_add_preset"
+    bl_label = "批量加入/移出预设"
+    bl_description = "把当前筛选中勾选的插件批量加入或移出工作预设"
+
+    preset: EnumProperty(name="目标预设", items=_preset_enum)
+    new_name: StringProperty(name="或新建预设名", default="",
+                             description="填写新名称时将直接创建该预设并加入所选插件")
+    remove: BoolProperty(name="移出该预设", default=False)
+
+    def invoke(self, context, event):
+        prefs = _prefs(context)
+        if not prefs:
+            return _report(self, False, "插件库未启用")
+        from . import items as _items
+
+        _items.refresh_cache(prefs)
+        if not _items.selected_keys(prefs):
+            return _report(self, False, "请先在当前筛选结果中勾选要操作的插件")
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        db = _db(context)
+        if not prefs or not db:
+            return _report(self, False, "插件库未就绪")
+        keys = _target_keys(prefs, "", True)
+        if not keys:
+            return _report(self, False, "请先勾选要操作的插件")
+        target = self.new_name.strip() or ("" if self.preset == "__NONE__" else self.preset)
+        if not target:
+            return _report(self, False, "请选择预设或输入新预设名称")
+        if self.new_name.strip() and not self.remove:
+            db.add_preset(target, [])
+        from .services import presets as preset_service
+
+        for k in keys:
+            if not db.get(k):
+                continue
+            if self.remove:
+                db.remove_plugin_from_preset(k, target)
+            else:
+                db.add_plugin_to_preset(k, target)
+                preset_service.note_assigned_to_preset(k)
+        db.save()
+        from . import items
+
+        items.rebuild_items(prefs)
+        _redraw()
+        verb = "移出" if self.remove else "加入"
+        return _report(self, True, f"已将 {len(keys)} 个插件{verb}预设「{target}」")
+
+
+class PM_OT_manual_prompt_action(_PMBase):
+    bl_idname = "plugin_manager.manual_prompt_action"
+    bl_label = "处理手动启用的插件"
+    bl_description = "将手动启用的插件标记为本次临时使用，或收起提示"
+
+    key: StringProperty(default="")
+    action: StringProperty(default="temp")  # "temp" | "untemp" | "dismiss"
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        from . import items
+        from .services import presets as preset_service
+
+        target_key = self.key or (prefs.manual_prompt_key if prefs else "")
+        if self.action == "temp" and target_key:
+            preset_service.mark_temporary(target_key)
+            msg = "已标记为本次临时使用（切换/关闭预设时自动保留）"
+        elif self.action == "untemp" and target_key:
+            preset_service.unmark_temporary(target_key)
+            msg = "已取消临时标记"
+        else:
+            preset_service.dismiss_prompt(target_key)
+            msg = "已收起提示"
+        if prefs:
+            items.rebuild_items(prefs)
+        _redraw()
+        return _report(self, True, msg)
 
 
 class PM_OT_plugin_toggle_group(Operator):
     bl_idname = "plugin_manager.plugin_toggle_group"
-    bl_label = "加入/移出分组"
-    bl_description = "把当前插件加入或移出指定分组（一个插件可同时属于多个分组）"
+    bl_label = "加入/移出分类"
+    bl_description = "把当前插件加入或移出指定分类（仅用于整理筛选，不影响启停）"
 
     key: StringProperty(default="")
     group: StringProperty(default="")
@@ -1103,14 +1449,14 @@ class PM_OT_plugin_toggle_group(Operator):
         db = _db(context)
         key = self.key or (prefs.selected_key if prefs else "")
         if not db or not key or not self.group:
-            return _report(self, False, "未找到插件或分组")
+            return _report(self, False, "未找到插件或分类")
         groups = db.plugin_groups(key)
         if self.group in groups:
             db.remove_plugin_from_group(key, self.group)
-            msg = f"已移出分组「{self.group}」"
+            msg = f"已移出分类「{self.group}」"
         else:
             db.add_plugin_to_group(key, self.group)
-            msg = f"已加入分组「{self.group}」"
+            msg = f"已加入分类「{self.group}」"
         db.save()
         from . import items
 
@@ -2276,14 +2622,22 @@ classes = (
     PM_OT_batch_enable,
     PM_OT_batch_set_category,
     PM_OT_batch_add_group,
+    PM_OT_batch_add_preset,
     PM_OT_batch_set_startup,
     PM_OT_enable_pack,
     PM_OT_disable_pack,
-    PM_OT_group_toggle,
-    PM_OT_group_solo,
-    PM_OT_group_set_startup,
-    PM_OT_group_set_pinned,
-    PM_OT_group_deactivate_all,
+    PM_OT_preset_add,
+    PM_OT_preset_capture,
+    PM_OT_preset_rename,
+    PM_OT_preset_delete,
+    PM_OT_preset_toggle,
+    PM_OT_preset_switch,
+    PM_OT_preset_set_pinned,
+    PM_OT_preset_set_startup,
+    PM_OT_preset_deactivate_all,
+    PM_OT_preset_filter,
+    PM_OT_plugin_toggle_preset,
+    PM_OT_manual_prompt_action,
     PM_OT_plugin_toggle_group,
     PM_OT_import,
     PM_OT_import_zip,

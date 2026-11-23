@@ -32,19 +32,29 @@ def _records(root: str) -> list[dict]:
     return LibraryDB(root).all()
 
 
-def _current_intent(root: str, existing: set[str] | None = None) -> set[str]:
+def _current_intent(root: str, existing: set[str] | None = None, *,
+                    detect_manual: bool = False) -> set[str]:
+    from .services import presets as preset_service
+
     api = _bridge()
     intent = set(existing or ())
     db = LibraryDB(root)
     changed = False
+    has_presets = hasattr(db, "preset_records")
     for record in db.all():
         key, module = record.get("key", ""), record.get("module", "")
         if not key or not module or record.get("missing"):
             continue
         enabled = api.is_module_enabled(module)
-        if enabled != bool(record.get("enabled")):
+        prev_enabled = bool(record.get("enabled"))
+        if enabled != prev_enabled:
             record["enabled"] = enabled
             changed = True
+            if detect_manual and has_presets and module != C.ADDON_ID:
+                if enabled:
+                    preset_service.note_manual_enable(db, key)
+                else:
+                    preset_service.note_manual_disable(key)
         if "startup_override" in record:
             if enabled == record["startup_override"]:
                 continue
@@ -107,7 +117,7 @@ def sync_to_profile(root: str) -> dict:
     config = _ensure_library_bindings(root, captured)
     if captured != config:
         api.apply_scoped_configuration(config)
-    enabled = _current_intent(root, set(current["enabled_plugins"]))
+    enabled = _current_intent(root, set(current["enabled_plugins"]), detect_manual=True)
     if (set(current["enabled_plugins"]) == enabled
             and current["repositories"] == config["repositories"]
             and current["script_directories"] == config["script_directories"]
@@ -147,7 +157,11 @@ def transfer_activation(root: str, origin: str, target: str) -> None:
                    script_directories=profile["script_directories"])
 
 
-def _apply_activation(root: str, desired: set[str], *, skip_builtins: bool = False) -> list[dict]:
+def _apply_activation(root: str, desired: set[str], *, skip_builtins: bool = False,
+                      skip_builtins_on_disable: bool = False,
+                      skip_incompatible_on_enable: bool = False) -> list[dict]:
+    from .services import presets as preset_service
+
     api = _bridge()
     failures = []
     db = LibraryDB(root)
@@ -159,7 +173,14 @@ def _apply_activation(root: str, desired: set[str], *, skip_builtins: bool = Fal
         if skip_builtins and record.get("kind") == C.KIND_BUILTIN:
             continue
         target = key in desired
+        if not target and skip_builtins_on_disable and record.get("kind") == C.KIND_BUILTIN:
+            continue
+        if target and skip_incompatible_on_enable and preset_service.is_known_broken(record):
+            continue
         if api.is_module_enabled(module) == target:
+            if bool(record.get("enabled")) != target:
+                record["enabled"] = target
+                changed = True
             continue
         ok, error = api.set_enabled(module, target)
         if not ok:
@@ -172,13 +193,17 @@ def _apply_activation(root: str, desired: set[str], *, skip_builtins: bool = Fal
     return failures
 
 
-def activate(root: str, after_mount=None) -> dict:
-    """Apply this device profile, creating it from current scoped state once."""
+def activate(root: str, after_mount=None, *, startup_mode: str | None = None) -> dict:
+    """Apply this device profile or clean startup set, creating profile once if absent."""
+    from .services import presets as preset_service
+
     root = os.path.abspath(root)
-    device_id, device_name, _local = _identity()
+    device_id, device_name, local = _identity()
+    mode = startup_mode or local.get("startup_mode", "remember")
     store = DeviceProfileStore(root)
     try:
-        if store.exists(device_id):
+        existed = store.exists(device_id)
+        if existed:
             profile = store.load(device_id)
             config = _ensure_library_bindings(root, profile)
             if (config["repositories"] != profile["repositories"]
@@ -198,7 +223,20 @@ def activate(root: str, after_mount=None) -> dict:
         _bridge().apply_scoped_configuration(profile)
         if after_mount is not None:
             after_mount()
-        failures = _apply_activation(root, set(profile["enabled_plugins"]))
+        preset_service.reset_session()
+        if mode == "clean" and existed:
+            db = LibraryDB(root)
+            if hasattr(db, "preset_records"):
+                desired, _startup_presets = preset_service.effective_startup_targets(db)
+            else:
+                desired = set()
+            failures = _apply_activation(
+                root, desired,
+                skip_builtins_on_disable=True,
+                skip_incompatible_on_enable=True,
+            )
+        else:
+            failures = _apply_activation(root, set(profile["enabled_plugins"]))
         setter = getattr(_bridge(), "set_managed_library_root", None)
         if setter:
             setter(root)
@@ -294,9 +332,12 @@ def activate_prepared_library(prepared: PreparedLibrary) -> dict:
 
 def deactivate(root: str) -> dict:
     """Persist current intent, disable managed add-ons, and reset only owned scopes."""
+    from .services import presets as preset_service
+
     root = os.path.abspath(root)
     failures = []
     try:
+        preset_service.reset_session()
         if os.path.isdir(root):
             sync_to_profile(root)
             failures.extend(_apply_activation(root, set(), skip_builtins=True))
